@@ -1,2 +1,2 @@
 # JULES-IA
-Script para processar teses de CSV usando IA
+Script para processar CSV usando IA do Gemini
