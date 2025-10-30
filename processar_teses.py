@@ -127,6 +127,15 @@ def analisar_lote_com_gemini(model, lote_json: str) -> list | None:
             time.sleep(PAUSA_ENTRE_CHAMADAS_SEG)
     return None
 
+def processar_dataframe(df: pd.DataFrame, model) -> pd.DataFrame:
+    """Função compatível para evitar NameError: retorna o DataFrame recebido.
+    
+    Observação: os resultados já foram mesclados ao DataFrame antes desta chamada,
+    portanto aqui fazemos apenas uma passagem que permite estender a lógica no futuro.
+    """
+    # Nenhum processamento adicional é necessário no momento; apenas devolve o DataFrame.
+    return df
+
 def main():
     """Função principal que orquestra todo o processo."""
     print("Iniciando o script de processamento de teses em lote...")
