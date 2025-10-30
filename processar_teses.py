@@ -9,6 +9,17 @@ import json
 MODELO_API = "gemini-2.5-flash"
 PAUSA_ENTRE_CHAMADAS_SEG = 6.1
 TAMANHO_LOTE = 20
+# --- Configuração Inicial ---
+def configurar_api():
+    """
+    Carrega as variáveis de ambiente e configura a API do Google Gemini.
+    """
+    load_dotenv()
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("A variável de ambiente GOOGLE_API_KEY não foi encontrada. Crie um arquivo .env ou defina a variável de ambiente.")
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel('gemini-2.5-flash')
 
 # --- 2. PROMPT PARA PROCESSAMENTO EM LOTE ---
 PROMPT_LOTE = """
@@ -194,6 +205,21 @@ def main():
         df.loc[res_df.index, 'Tese'] = res_df['Tese']
         df.loc[res_df.index, 'Justificativa'] = res_df['Justificativa']
         df.loc[res_df.index, 'Resultado'] = res_df['Resultado']
+        # --- ADICIONE ESTAS LINHAS AQUI (PARA CORRIGIR O AVISO) ---
+        print("Garantindo que as colunas de saída sejam do tipo 'texto'...")
+        df['Tese'] = df['Tese'].astype(object)         # Garante que a Coluna G (Tese) aceite texto
+        df['Resultado'] = df['Resultado'].astype(object)   # Garante que a Coluna F (Resultado) aceite texto
+        df['Justificativa'] = pd.Series(dtype=object)  # Cria a Coluna M (Justificativa) como texto
+        # --- FIM DA ADIÇÃO ---
+
+        # Mapeamento de colunas (H -> Ementa, G -> Tese, F -> Resultado, M -> Justificativa)
+        # O script assume que as colunas já existem ou as cria.
+        # A lógica de manipulação de colunas específicas por letra (F, G, H, M) é mais
+        # segura se feita pelo nome da coluna. O código está adaptado para usar nomes.
+
+        # 3. Processar o DataFrame
+        print("Iniciando a análise com a API do Gemini...")
+        df_processado = processar_dataframe(df, model)
 
         caminho_saida = 'teses_processadas.csv'
         df.to_csv(caminho_saida, index=False, encoding='utf-8-sig')
