@@ -14,7 +14,7 @@ def configurar_api():
     if not api_key:
         raise ValueError("A variável de ambiente GOOGLE_API_KEY não foi encontrada. Crie um arquivo .env ou defina a variável de ambiente.")
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel('gemini-pro')
+    return genai.GenerativeModel('gemini-2.5-flash')
 
 # --- Prompts para a IA ---
 PROMPT_EXTRACAO_TESE = """
@@ -131,6 +131,13 @@ def main():
         caminho_csv = 'copia_RG.csv'
         print(f"Lendo o arquivo '{caminho_csv}'...")
         df = pd.read_csv(caminho_csv)
+
+        # --- ADICIONE ESTAS LINHAS AQUI (PARA CORRIGIR O AVISO) ---
+        print("Garantindo que as colunas de saída sejam do tipo 'texto'...")
+        df['Tese'] = df['Tese'].astype(object)         # Garante que a Coluna G (Tese) aceite texto
+        df['Resultado'] = df['Resultado'].astype(object)   # Garante que a Coluna F (Resultado) aceite texto
+        df['Justificativa'] = pd.Series(dtype=object)  # Cria a Coluna M (Justificativa) como texto
+        # --- FIM DA ADIÇÃO ---
 
         # Mapeamento de colunas (H -> Ementa, G -> Tese, F -> Resultado, M -> Justificativa)
         # O script assume que as colunas já existem ou as cria.
