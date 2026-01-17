@@ -35,7 +35,7 @@ except ImportError as exc:
 
 
 DEFAULT_INPUT = "sessoes_all_2024_2025.csv"
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.0-flash"
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-1.5-flash"
 
 NEWS_COLUMNS = ["noticia_TSE", "noticia_TRE", "noticia_geral"]
 
@@ -160,6 +160,20 @@ def _call_gemini_with_web_search(
             return text
         except (errors.ClientError, errors.ServerError) as exc:
             last_err = exc
+
+            # Check for 429 Resource Exhausted
+            code = getattr(exc, 'code', None)
+
+            if isinstance(exc, errors.ClientError) and code == 429:
+                logging.warning("Limite de cota atingido (429). Aguardando 60 segundos...")
+                time.sleep(60)
+                continue
+
+            # Check for 401/403 (Fatal)
+            if isinstance(exc, errors.ClientError) and code in (401, 403):
+                 logging.error("Erro de autenticacao ou permissao (Fatal): %s", exc)
+                 raise exc
+
             logging.warning("Erro da API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
             # Exponential backoff with jitter
             sleep_time = (2 ** attempt) + random.uniform(0, 1)
@@ -304,7 +318,7 @@ def main() -> None:
     parser.add_argument("--output", default="", help="Caminho do CSV de saida.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini (opcional).")
     parser.add_argument("--limit", type=int, default=0, help="Processa apenas as primeiras N linhas.")
-    parser.add_argument("--sleep", type=float, default=0.0, help="Pausa entre chamadas da API (segundos).")
+    parser.add_argument("--sleep", type=float, default=5.0, help="Pausa entre chamadas da API (segundos).")
     parser.add_argument("--max-retries", type=int, default=3, help="Maximo de tentativas da API.")
     parser.add_argument(
         "--resume",
@@ -324,6 +338,11 @@ def main() -> None:
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise SystemExit("ERRO: GEMINI_API_KEY ou GOOGLE_API_KEY nao definido no ambiente.")
+
+    # Privacy warning for Free Tier
+    logging.info("ATENCAO: Se estiver usando o modo gratuito (Free Tier), seus dados podem ser usados para treinamento.")
+    logging.info("Nao insira dados confidenciais ou segredos de justica.")
+
     client = genai.Client(api_key=api_key)
 
     search_tools = _build_search_tools()
