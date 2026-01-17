@@ -226,22 +226,25 @@ def main() -> None:
     parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV de entrada.")
     parser.add_argument("--output", default="", help="CSV de saida.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
-    parser.add_argument("--limit", type=int, default=0, help="Limite de linhas.")
+    parser.add_argument("--limit", type=int, default=0, help="Limite de linhas (0 = todos).")
     parser.add_argument("--sleep", type=float, default=5.0, help="Pausa (segundos) entre chamadas.")
+    parser.add_argument("--batch-size", type=int, default=5, help="Salva no disco a cada N registros.")
+    parser.add_argument("--dry-run", action="store_true", help="Executa sem chamar a API (teste).")
     
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+    # API Key check (skip if dry-run)
     api_key = _get_api_key_securely()
-    if not api_key:
+    if not args.dry_run and not api_key:
         logging.error("ERRO FATAL: Chave API não encontrada.")
         logging.error("Certifique-se de que o arquivo .env existe e contem GEMINI_API_KEY=...")
         return
 
     logging.info(f"Iniciando com o modelo: {args.model}")
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key) if not args.dry_run else None
 
     if not os.path.exists(args.input):
         logging.error(f"Arquivo não encontrado: {args.input}")
@@ -252,9 +255,9 @@ def main() -> None:
         base, ext = os.path.splitext(args.input)
         output_path = f"{base}_noticias{ext}"
 
+    # Ler cabeçalho primeiro
     with open(args.input, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        rows = list(reader)
         fieldnames = reader.fieldnames or []
 
     output_fields = list(fieldnames)
@@ -265,53 +268,75 @@ def main() -> None:
     processed_count = 0
     write_mode = "w"
     
+    # Contagem eficiente de linhas para retomada
     if os.path.exists(output_path):
-        with open(output_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            if len(lines) > 1:
-                processed_count = len(lines) - 1
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                # Conta LINHAS LÓGICAS (registros) usando o parser CSV para suportar quebras de linha em campos
+                rows_count = sum(1 for _ in csv.reader(f))
+
+            if rows_count > 0:
+                processed_count = rows_count - 1 # subtrai header
                 write_mode = "a"
-                logging.info(f"Retomando processamento. {processed_count} linhas já existem.")
+                print(f"\n[INFO] Retomando processamento. {processed_count} linhas já existem no arquivo de saída.\n")
+        except Exception:
+            logging.warning("Erro ao ler arquivo de saída. Iniciando sobrescrita.")
+            processed_count = 0
 
-    total_to_process = len(rows) if args.limit == 0 else min(len(rows), args.limit)
-
-    with open(output_path, write_mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=output_fields)
+    with open(output_path, write_mode, newline="", encoding="utf-8") as f_out:
+        writer = csv.DictWriter(f_out, fieldnames=output_fields)
         if write_mode == "w":
             writer.writeheader()
 
-        for idx, row in enumerate(rows):
-            if idx >= total_to_process:
-                break
+        # Abre o arquivo de entrada para leitura sequencial (memória eficiente)
+        with open(args.input, newline="", encoding="utf-8") as f_in:
+            reader = csv.DictReader(f_in)
             
-            if idx < processed_count:
-                continue
+            for idx, row in enumerate(reader):
+                # Pula linhas já processadas
+                if idx < processed_count:
+                    continue
 
-            logging.info(f"Processando linha {idx+1}/{total_to_process}...")
-            
-            context = _build_context(row)
-            
-            if context:
-                raw_text = _call_gemini_with_web_search(
-                    client=client, 
-                    model=args.model, 
-                    prompt=USER_PROMPT_TEMPLATE.format(context=context), 
-                    max_retries=3
-                )
-                noticia_tse, noticia_tre, noticia_geral = _process_response_text(raw_text)
-            else:
-                noticia_tse, noticia_tre, noticia_geral = "", "", ""
+                # Verifica limite
+                if args.limit > 0 and idx >= args.limit:
+                    print(f"\n[INFO] Limite global de {args.limit} registros atingido.")
+                    break
 
-            row["noticia_TSE"] = noticia_tse
-            row["noticia_TRE"] = noticia_tre
-            row["noticia_geral"] = noticia_geral
-            
-            writer.writerow(row)
-            f.flush()
-            
-            time.sleep(args.sleep)
+                # Verbose Output
+                print(f"Processando linha {idx+1}... (Tema: {row.get('tema', '')[:40]}...)")
 
-    logging.info(f"Concluído! Arquivo salvo em: {output_path}")
+                context = _build_context(row)
+
+                if args.dry_run:
+                    # Simulação para testes
+                    noticia_tse, noticia_tre, noticia_geral = "http://tse.jus.br/mock", "http://tre-sp.jus.br/mock", ""
+                    time.sleep(0.1) # Simula latência mínima
+                elif context:
+                    raw_text = _call_gemini_with_web_search(
+                        client=client,
+                        model=args.model,
+                        prompt=USER_PROMPT_TEMPLATE.format(context=context),
+                        max_retries=3
+                    )
+                    noticia_tse, noticia_tre, noticia_geral = _process_response_text(raw_text)
+                else:
+                    noticia_tse, noticia_tre, noticia_geral = "", "", ""
+
+                row["noticia_TSE"] = noticia_tse
+                row["noticia_TRE"] = noticia_tre
+                row["noticia_geral"] = noticia_geral
+
+                writer.writerow(row)
+
+                # Batch flush logic
+                if (idx + 1) % args.batch_size == 0:
+                    f_out.flush()
+                    print(f"  -> Lote de {args.batch_size} salvo (Linha {idx+1}).")
+
+                if not args.dry_run:
+                    time.sleep(args.sleep)
+
+    print(f"\n[SUCESSO] Concluído! Arquivo salvo em: {output_path}")
 
 if __name__ == "__main__":
     main()
