@@ -130,5 +130,64 @@ class TestSessoesTSENoticias(unittest.TestCase):
         self.assertEqual(result, '{"success": true}')
         self.assertEqual(mock_client.models.generate_content.call_count, 2)
 
+    @patch('SESSOES_TSE_noticias_viaAPI.genai.Client')
+    @patch('time.sleep')
+    def test_429_retry_logic(self, mock_sleep, mock_client_cls):
+        if not hasattr(script, 'genai') or not hasattr(script, 'errors'):
+             return
+
+        from google.genai import errors
+
+        mock_client = mock_client_cls.return_value
+
+        # Create a 429 error
+        # We assume errors.ClientError is available
+        err_429 = errors.ClientError(code=429, response_json={})
+
+        mock_response = MagicMock()
+        mock_response.text = '{"success": true}'
+
+        # Fail once with 429, then succeed
+        mock_client.models.generate_content.side_effect = [err_429, mock_response]
+
+        result = script._call_gemini_with_web_search(
+            client=mock_client,
+            model="gemini-test",
+            prompt="test",
+            max_retries=3,
+            search_tools=None
+        )
+
+        self.assertEqual(result, '{"success": true}')
+        # Check that sleep(60) was called
+        mock_sleep.assert_any_call(60)
+
+    @patch('SESSOES_TSE_noticias_viaAPI.genai.Client')
+    @patch('time.sleep')
+    def test_403_fatal_logic(self, mock_sleep, mock_client_cls):
+        if not hasattr(script, 'genai') or not hasattr(script, 'errors'):
+             return
+
+        from google.genai import errors
+
+        mock_client = mock_client_cls.return_value
+
+        # Create a 403 error
+        err_403 = errors.ClientError(code=403, response_json={})
+
+        mock_client.models.generate_content.side_effect = err_403
+
+        with self.assertRaises(errors.ClientError):
+            script._call_gemini_with_web_search(
+                client=mock_client,
+                model="gemini-test",
+                prompt="test",
+                max_retries=3,
+                search_tools=None
+            )
+
+        # Should verify no retries happened (call count 1)
+        self.assertEqual(mock_client.models.generate_content.call_count, 1)
+
 if __name__ == '__main__':
     unittest.main()
