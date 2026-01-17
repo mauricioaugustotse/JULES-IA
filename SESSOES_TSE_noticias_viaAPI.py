@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Enrich sessoes_all_2024_2025.csv with news links using an API call.
+Enrich sessoes_all_2024_2025.csv with news links using the Gemini API.
 
 Usage:
   python3 SESSOES_TSE_noticias_viaAPI.py
   python3 SESSOES_TSE_noticias_viaAPI.py --input sessoes_all_2024_2025.csv --output sessoes_all_2024_2025_noticias.csv
 
-Defaults:
-  Model: "jules" (override with --model or OPENAI_MODEL)
 """
 
 from __future__ import annotations
@@ -29,13 +27,14 @@ except ImportError:
     pass
 
 try:
-    from openai import OpenAI, APIError, RateLimitError, APITimeoutError, APIConnectionError
+    from google import genai
+    from google.genai import types
 except ImportError as exc:
-    raise SystemExit("ERRO: openai nao encontrado. Execute: pip install openai") from exc
+    raise SystemExit("ERRO: google-genai nao encontrado. Execute: pip install google-genai") from exc
 
 
 DEFAULT_INPUT = "sessoes_all_2024_2025.csv"
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "jules")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-flash-latest"
 
 NEWS_COLUMNS = ["noticia_TSE", "noticia_TRE", "noticia_geral"]
 
@@ -52,7 +51,7 @@ CONTEXT_FIELDS = [
 ]
 
 SYSTEM_PROMPT = (
-    "You are a research assistant. Use web search. "
+    "You are a research assistant. Use web search when available. "
     "Return JSON only, without any extra text."
 )
 
@@ -64,7 +63,8 @@ USER_PROMPT_TEMPLATE = (
     "- noticia_TSE: list of URLs from domains that end with tse.jus.br\n"
     "- noticia_TRE: list of URLs from domains that match tre-XX.jus.br (any subdomain)\n"
     "- noticia_geral: list of URLs from Folha (folha.uol.com.br), Estadao (estadao.com.br), "
-    "Gazeta do Povo (gazetadopovo.com.br), CNN (cnnbrasil.com.br or cnn.com)\n\n"
+    "Gazeta do Povo (gazetadopovo.com.br), CNN (cnnbrasil.com.br or cnn.com), "
+    "ConJur (conjur.com.br), Migalhas (migalhas.com.br)\n\n"
     "Context:\n{context}\n"
 )
 
@@ -77,6 +77,8 @@ GENERAL_DOMAINS = [
     "gazetadopovo.com.br",
     "cnnbrasil.com.br",
     "cnn.com",
+    "conjur.com.br",
+    "migalhas.com.br",
 ]
 
 
@@ -93,52 +95,67 @@ def _build_context(row: Dict[str, str], max_len: int = 240) -> str:
 
 
 def _output_text_from_response(response) -> str:
-    text = getattr(response, "output_text", None)
+    text = getattr(response, "text", None)
     if text:
-        return text
-    # Fallback for older response shapes
+        return text.strip()
     try:
-        parts: List[str] = []
-        for item in response.output or []:
-            if getattr(item, "type", "") != "message":
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if not content:
                 continue
-            for content in item.content or []:
-                if getattr(content, "type", "") == "output_text":
-                    parts.append(content.text)
-        return "\n".join(parts).strip()
+            parts = getattr(content, "parts", None) or []
+            texts = []
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if part_text:
+                    texts.append(part_text)
+            if texts:
+                return "\n".join(texts).strip()
     except Exception:
         return ""
+    return ""
 
 
-def _call_openai_with_web_search(
-    client: OpenAI,
+def _build_search_tools() -> Optional[List[types.Tool]]:
+    if types is None:
+        return None
+    for cls_name in ("GoogleSearchRetrieval", "GoogleSearch"):
+        tool_cls = getattr(types, cls_name, None)
+        if not tool_cls:
+            continue
+        try:
+            return [types.Tool(google_search=tool_cls())]
+        except Exception:
+            continue
+    return None
+
+
+def _call_gemini_with_web_search(
+    client: genai.Client,
     model: str,
     prompt: str,
     max_retries: int,
+    search_tools: Optional[List[types.Tool]],
 ) -> str:
     last_err: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
-            response = client.responses.create(
+            config_kwargs = {"system_instruction": SYSTEM_PROMPT}
+            if search_tools:
+                config_kwargs["tools"] = search_tools
+            response = client.models.generate_content(
                 model=model,
-                tools=[{"type": "web_search_preview"}],
-                input=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
+                contents=prompt,
+                config=types.GenerateContentConfig(**config_kwargs),
             )
             text = _output_text_from_response(response)
             if not text:
                 raise ValueError("Resposta vazia da API.")
             return text
-        except (APIError, RateLimitError, APITimeoutError, APIConnectionError, ValueError) as exc:
-            last_err = exc
-            wait = 2 ** attempt
-            logging.warning("Erro na API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
-            time.sleep(wait)
         except Exception as exc:
             last_err = exc
-            logging.warning("Erro inesperado na API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
+            logging.warning("Erro na API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
             time.sleep(2 ** attempt)
     raise RuntimeError(f"Falha na chamada da API apos {max_retries} tentativas: {last_err}")
 
@@ -269,7 +286,7 @@ def main() -> None:
     )
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Caminho do CSV de entrada.")
     parser.add_argument("--output", default="", help="Caminho do CSV de saida.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo OpenAI com web search.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini (opcional).")
     parser.add_argument("--limit", type=int, default=0, help="Processa apenas as primeiras N linhas.")
     parser.add_argument("--sleep", type=float, default=0.0, help="Pausa entre chamadas da API (segundos).")
     parser.add_argument("--max-retries", type=int, default=3, help="Maximo de tentativas da API.")
@@ -288,10 +305,14 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise SystemExit("ERRO: OPENAI_API_KEY nao definido no ambiente.")
-    client = OpenAI(api_key=api_key)
+        raise SystemExit("ERRO: GEMINI_API_KEY ou GOOGLE_API_KEY nao definido no ambiente.")
+    client = genai.Client(api_key=api_key)
+
+    search_tools = _build_search_tools()
+    if search_tools is None:
+        logging.warning("Ferramenta de web search indisponivel; seguindo sem busca.")
 
     input_path = args.input
     output_path = args.output or _derive_output_path(input_path)
@@ -356,11 +377,12 @@ def main() -> None:
             else:
                 prompt = USER_PROMPT_TEMPLATE.format(context=context)
                 try:
-                    raw_text = _call_openai_with_web_search(
+                    raw_text = _call_gemini_with_web_search(
                         client=client,
                         model=args.model,
                         prompt=prompt,
                         max_retries=args.max_retries,
+                        search_tools=search_tools,
                     )
                     tse_urls, tre_urls, geral_urls = _combine_urls_from_response(raw_text)
                     cache[cache_key] = (tse_urls, tre_urls, geral_urls)
