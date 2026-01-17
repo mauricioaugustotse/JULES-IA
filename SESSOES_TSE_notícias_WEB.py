@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Enriquece o arquivo sessoes_all_2024_2025.csv com links de notícias usando a API Gemini (Google GenAI SDK).
+Enriquece o arquivo com links de notícias usando a API Gemini (Google GenAI SDK).
 Lê a chave de API do arquivo .env para segurança.
 
-Uso:
-  python SESSOES_TSE_noticias_viaAPI.py
 """
 
 from __future__ import annotations
@@ -36,7 +34,7 @@ except ImportError as exc:
     raise SystemExit("ERRO CRÍTICO: Biblioteca 'google-genai' não encontrada.\nExecute: pip install google-genai") from exc
 
 # Configurações Padrão
-DEFAULT_INPUT = "sessoes_all_2024_2025.csv"
+DEFAULT_INPUT = ""
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
 
 NEWS_COLUMNS = ["noticia_TSE", "noticia_TRE", "noticia_geral"]
@@ -91,7 +89,8 @@ def _call_gemini_with_web_search(
     client: genai.Client,
     model: str,
     prompt: str,
-    max_retries: int
+    max_retries: int,
+    verbose: bool = False
 ) -> str:
     """Chama a API com suporte a Google Search e tratamento de erro."""
     
@@ -103,6 +102,15 @@ def _call_gemini_with_web_search(
     last_err: Optional[Exception] = None
 
     for attempt in range(max_retries):
+        if verbose:
+            logging.info(
+                "Chamando API Gemini (modelo=%s, tentativa %d/%d)...",
+                model,
+                attempt + 1,
+                max_retries,
+            )
+            logging.info("Prompt enviado (chars=%d).", len(prompt))
+        call_started_at = time.monotonic()
         try:
             # CORREÇÃO: Removemos response_mime_type="application/json" pois conflita com Tools
             response = client.models.generate_content(
@@ -116,6 +124,13 @@ def _call_gemini_with_web_search(
             )
             
             if response.text:
+                if verbose:
+                    elapsed = time.monotonic() - call_started_at
+                    logging.info(
+                        "Resposta recebida em %.2fs (chars=%d).",
+                        elapsed,
+                        len(response.text),
+                    )
                 return response.text
             else:
                 logging.warning("Resposta vazia (possível bloqueio de segurança).")
@@ -124,6 +139,9 @@ def _call_gemini_with_web_search(
         except Exception as exc:
             last_err = exc
             error_msg = str(exc)
+            if verbose:
+                elapsed = time.monotonic() - call_started_at
+                logging.warning("Falha na chamada (%.2fs): %s", elapsed, exc)
 
             # Tratamento para Cota Excedida (Erro 429)
             if "429" in error_msg or "ResourceExhausted" in error_msg:
@@ -200,7 +218,7 @@ def _classify_urls(urls: Iterable[str]) -> Tuple[List[str], List[str], List[str]
         seen.add(normalized)
     return tse, tre, geral
 
-def _process_response_text(text: str) -> Tuple[str, str, str]:
+def _process_response_text(text: str) -> Tuple[str, str, List[str]]:
     data = _extract_json(text)
     
     urls = []
@@ -213,7 +231,61 @@ def _process_response_text(text: str) -> Tuple[str, str, str]:
         urls = URL_RE.findall(text)
 
     tse_list, tre_list, geral_list = _classify_urls(urls)
-    return ", ".join(tse_list), ", ".join(tre_list), ", ".join(geral_list)
+    return ", ".join(tse_list), ", ".join(tre_list), geral_list
+
+def _apply_geral_links(row: Dict[str, str], geral_links: List[str]) -> List[str]:
+    for key in list(row.keys()):
+        if re.match(r"^noticia_geral_\d+$", key):
+            row.pop(key, None)
+
+    row["noticia_geral"] = geral_links[0] if geral_links else ""
+    new_columns: List[str] = []
+    for idx, link in enumerate(geral_links[1:], start=1):
+        col_name = f"noticia_geral_{idx}"
+        row[col_name] = link
+        new_columns.append(col_name)
+
+    return new_columns
+
+def _rewrite_output_file(output_path: str, fieldnames: List[str]) -> None:
+    temp_path = f"{output_path}.tmp"
+    with open(output_path, "r", newline="", encoding="utf-8") as src, open(
+        temp_path, "w", newline="", encoding="utf-8"
+    ) as dst:
+        reader = csv.DictReader(src)
+        writer = csv.DictWriter(dst, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in reader:
+            writer.writerow(row)
+    os.replace(temp_path, output_path)
+
+def _open_output_writer(output_path: str, fieldnames: List[str], mode: str):
+    f = open(output_path, mode, newline="", encoding="utf-8")
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    if mode == "w":
+        writer.writeheader()
+    return f, writer
+
+def _select_input_file() -> str:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        logging.error("Falha ao abrir caixa de seleção (tkinter): %s", exc)
+        return ""
+
+    root = tk.Tk()
+    root.withdraw()
+    root.update()
+    try:
+        file_path = filedialog.askopenfilename(
+            title="Selecione o arquivo CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+    finally:
+        root.destroy()
+
+    return file_path or ""
 
 def _get_api_key_securely():
     key = os.getenv("GEMINI_API_KEY")
@@ -223,15 +295,19 @@ def _get_api_key_securely():
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Busca noticias TSE via Gemini API (google-genai).")
-    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV de entrada.")
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV de entrada. Se omitido, abre caixa de seleção.")
     parser.add_argument("--output", default="", help="CSV de saida.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
     parser.add_argument("--limit", type=int, default=0, help="Limite de linhas.")
     parser.add_argument("--sleep", type=float, default=5.0, help="Pausa (segundos) entre chamadas.")
+    parser.add_argument("--verbose", action="store_true", help="Exibe detalhes do chamamento à API.")
     
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
 
     api_key = _get_api_key_securely()
     if not api_key:
@@ -243,24 +319,48 @@ def main() -> None:
 
     client = genai.Client(api_key=api_key)
 
-    if not os.path.exists(args.input):
-        logging.error(f"Arquivo não encontrado: {args.input}")
+    input_path = (args.input or "").strip()
+    if not input_path:
+        logging.info("Selecione o arquivo CSV de entrada.")
+        input_path = _select_input_file()
+        if not input_path:
+            logging.error("Nenhum arquivo selecionado.")
+            return
+
+    if not os.path.exists(input_path):
+        logging.error(f"Arquivo não encontrado: {input_path}")
         return
 
     output_path = args.output
     if not output_path:
-        base, ext = os.path.splitext(args.input)
-        output_path = f"{base}_noticias{ext}"
+        base, ext = os.path.splitext(input_path)
+        suffix = " - com notícias da WEB"
+        output_path = f"{base}{suffix}{ext}"
 
-    with open(args.input, newline="", encoding="utf-8") as f:
+    with open(input_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
         fieldnames = reader.fieldnames or []
 
-    output_fields = list(fieldnames)
+    existing_header = None
+    if os.path.exists(output_path):
+        with open(output_path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            existing_header = next(reader, None)
+
+    output_fields = list(existing_header) if existing_header else list(fieldnames)
+    header_changed = False
+    for col in fieldnames:
+        if col not in output_fields:
+            output_fields.append(col)
+            header_changed = True
     for col in NEWS_COLUMNS:
         if col not in output_fields:
             output_fields.append(col)
+            header_changed = True
+
+    if existing_header and header_changed:
+        _rewrite_output_file(output_path, output_fields)
 
     processed_count = 0
     write_mode = "w"
@@ -275,11 +375,8 @@ def main() -> None:
 
     total_to_process = len(rows) if args.limit == 0 else min(len(rows), args.limit)
 
-    with open(output_path, write_mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=output_fields)
-        if write_mode == "w":
-            writer.writeheader()
-
+    f, writer = _open_output_writer(output_path, output_fields, write_mode)
+    try:
         for idx, row in enumerate(rows):
             if idx >= total_to_process:
                 break
@@ -296,20 +393,35 @@ def main() -> None:
                     client=client, 
                     model=args.model, 
                     prompt=USER_PROMPT_TEMPLATE.format(context=context), 
-                    max_retries=3
+                    max_retries=3,
+                    verbose=args.verbose
                 )
-                noticia_tse, noticia_tre, noticia_geral = _process_response_text(raw_text)
+                noticia_tse, noticia_tre, noticia_geral_links = _process_response_text(raw_text)
             else:
-                noticia_tse, noticia_tre, noticia_geral = "", "", ""
+                noticia_tse, noticia_tre, noticia_geral_links = "", "", []
 
             row["noticia_TSE"] = noticia_tse
             row["noticia_TRE"] = noticia_tre
-            row["noticia_geral"] = noticia_geral
+            new_columns = _apply_geral_links(row, noticia_geral_links)
+
+            if new_columns:
+                header_updated = False
+                for col in new_columns:
+                    if col not in output_fields:
+                        output_fields.append(col)
+                        header_updated = True
+                if header_updated:
+                    f.flush()
+                    f.close()
+                    _rewrite_output_file(output_path, output_fields)
+                    f, writer = _open_output_writer(output_path, output_fields, "a")
             
             writer.writerow(row)
             f.flush()
             
             time.sleep(args.sleep)
+    finally:
+        f.close()
 
     logging.info(f"Concluído! Arquivo salvo em: {output_path}")
 
