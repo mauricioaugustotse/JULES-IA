@@ -36,6 +36,8 @@ except ImportError as exc:
 
 DEFAULT_INPUT = "sessoes_all_2024_2025.csv"
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.0-flash"
+# Fallback hardcoded API key if env vars are missing
+HARDCODED_API_KEY = ""
 
 NEWS_COLUMNS = ["noticia_TSE", "noticia_TRE", "noticia_geral"]
 
@@ -142,6 +144,7 @@ def _call_gemini_with_web_search(
 ) -> str:
     last_err: Optional[Exception] = None
     for attempt in range(max_retries):
+        sleep_time = 0
         try:
             config_kwargs = {
                 "system_instruction": SYSTEM_PROMPT,
@@ -160,6 +163,14 @@ def _call_gemini_with_web_search(
             return text
         except (errors.ClientError, errors.ServerError) as exc:
             last_err = exc
+            # Check for permission denied / unauthenticated
+            if hasattr(exc, "code") and exc.code in (401, 403):
+                logging.error("ERRO FATAL DE PERMISSAO (Code %s): %s", exc.code, exc)
+                logging.error("Verifique sua API KEY. Abortando.")
+                raise SystemExit(
+                    f"ERRO: Permissao negada ({exc.code}). Verifique sua chave de API."
+                ) from exc
+
             logging.warning("Erro da API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
             # Exponential backoff with jitter
             sleep_time = (2 ** attempt) + random.uniform(0, 1)
@@ -323,7 +334,14 @@ def main() -> None:
 
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise SystemExit("ERRO: GEMINI_API_KEY ou GOOGLE_API_KEY nao definido no ambiente.")
+        if HARDCODED_API_KEY:
+            logging.warning("Usando API KEY hardcoded (fallback).")
+            api_key = HARDCODED_API_KEY
+        else:
+            raise SystemExit(
+                "ERRO: GEMINI_API_KEY ou GOOGLE_API_KEY nao definido no ambiente, "
+                "e HARDCODED_API_KEY esta vazia."
+            )
     client = genai.Client(api_key=api_key)
 
     search_tools = _build_search_tools()
