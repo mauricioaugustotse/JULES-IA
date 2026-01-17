@@ -15,6 +15,7 @@ import csv
 import json
 import logging
 import os
+import random
 import re
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -28,13 +29,13 @@ except ImportError:
 
 try:
     from google import genai
-    from google.genai import types
+    from google.genai import types, errors
 except ImportError as exc:
     raise SystemExit("ERRO: google-genai nao encontrado. Execute: pip install google-genai") from exc
 
 
 DEFAULT_INPUT = "sessoes_all_2024_2025.csv"
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-flash-latest"
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.0-flash"
 
 NEWS_COLUMNS = ["noticia_TSE", "noticia_TRE", "noticia_geral"]
 
@@ -52,7 +53,8 @@ CONTEXT_FIELDS = [
 
 SYSTEM_PROMPT = (
     "You are a research assistant. Use web search when available. "
-    "Return JSON only, without any extra text."
+    "Return JSON only, without any extra text. "
+    "Strictly adhere to the requested JSON schema."
 )
 
 USER_PROMPT_TEMPLATE = (
@@ -141,7 +143,10 @@ def _call_gemini_with_web_search(
     last_err: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
-            config_kwargs = {"system_instruction": SYSTEM_PROMPT}
+            config_kwargs = {
+                "system_instruction": SYSTEM_PROMPT,
+                "response_mime_type": "application/json",
+            }
             if search_tools:
                 config_kwargs["tools"] = search_tools
             response = client.models.generate_content(
@@ -153,14 +158,25 @@ def _call_gemini_with_web_search(
             if not text:
                 raise ValueError("Resposta vazia da API.")
             return text
+        except (errors.ClientError, errors.ServerError) as exc:
+            last_err = exc
+            logging.warning("Erro da API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
+            # Exponential backoff with jitter
+            sleep_time = (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(sleep_time)
         except Exception as exc:
             last_err = exc
-            logging.warning("Erro na API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
+            logging.warning("Erro inesperado na API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
             time.sleep(2 ** attempt)
     raise RuntimeError(f"Falha na chamada da API apos {max_retries} tentativas: {last_err}")
 
 
 def _extract_json(text: str) -> Dict[str, object]:
+    # Remove markdown code blocks if present
+    text = re.sub(r"^```json\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^```\s*", "", text, flags=re.MULTILINE)
+    text = text.strip()
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
