@@ -124,14 +124,13 @@ def _output_text_from_response(response) -> str:
 def _build_search_tools() -> Optional[List[types.Tool]]:
     if types is None:
         return None
-    for cls_name in ("GoogleSearchRetrieval", "GoogleSearch"):
-        tool_cls = getattr(types, cls_name, None)
-        if not tool_cls:
-            continue
-        try:
-            return [types.Tool(google_search=tool_cls())]
-        except Exception:
-            continue
+    # Prioritize GoogleSearch which is the correct type for google_search param
+    if hasattr(types, "GoogleSearch"):
+        return [types.Tool(google_search=types.GoogleSearch())]
+    # Fallback if only Retrieval is available (unlikely given sdk version)
+    if hasattr(types, "GoogleSearchRetrieval"):
+        # Note: older SDKs might have used google_search_retrieval param
+        return [types.Tool(google_search_retrieval=types.GoogleSearchRetrieval())]
     return None
 
 
@@ -172,8 +171,16 @@ def _call_gemini_with_web_search(
                 ) from exc
 
             logging.warning("Erro da API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
-            # Exponential backoff with jitter
+
+            # Check for Retry-After in error message for 429
             sleep_time = (2 ** attempt) + random.uniform(0, 1)
+            if hasattr(exc, "code") and exc.code == 429:
+                match = re.search(r"Please retry in (\d+(\.\d+)?)s", str(exc))
+                if match:
+                    wait_s = float(match.group(1))
+                    logging.info("Rate limit hit. Waiting %f seconds as requested by API.", wait_s)
+                    sleep_time = wait_s + 1.0 # Add small buffer
+
             time.sleep(sleep_time)
         except Exception as exc:
             last_err = exc
