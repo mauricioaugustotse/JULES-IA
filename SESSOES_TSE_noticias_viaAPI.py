@@ -175,11 +175,20 @@ def _call_gemini_with_web_search(
             # Check for Retry-After in error message for 429
             sleep_time = (2 ** attempt) + random.uniform(0, 1)
             if hasattr(exc, "code") and exc.code == 429:
-                match = re.search(r"Please retry in (\d+(\.\d+)?)s", str(exc))
-                if match:
-                    wait_s = float(match.group(1))
+                # Search in all potential message sources
+                sources = [str(exc), getattr(exc, "message", ""), str(getattr(exc, "details", ""))]
+                wait_s = None
+                for source in sources:
+                    match = re.search(r"Please retry in (\d+(\.\d+)?)s", source)
+                    if match:
+                        wait_s = float(match.group(1))
+                        break
+
+                if wait_s is not None:
                     logging.info("Rate limit hit. Waiting %f seconds as requested by API.", wait_s)
-                    sleep_time = wait_s + 1.0 # Add small buffer
+                    sleep_time = wait_s + 2.0 # Add slightly larger buffer to be safe
+                else:
+                    logging.debug("Could not parse retry time from 429 error.")
 
             time.sleep(sleep_time)
         except Exception as exc:
@@ -323,7 +332,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini (opcional).")
     parser.add_argument("--limit", type=int, default=0, help="Processa apenas as primeiras N linhas.")
     parser.add_argument("--sleep", type=float, default=0.0, help="Pausa entre chamadas da API (segundos).")
-    parser.add_argument("--max-retries", type=int, default=3, help="Maximo de tentativas da API.")
+    parser.add_argument("--max-retries", type=int, default=10, help="Maximo de tentativas da API.")
     parser.add_argument(
         "--resume",
         action="store_true",
