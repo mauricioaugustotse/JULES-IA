@@ -8,12 +8,14 @@ Lê a chave de API do arquivo .env para segurança.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import logging
 import os
 import random
 import re
+import sys
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -96,14 +98,14 @@ def _build_context(row: Dict[str, str], max_len: int = 300) -> str:
                 lines.append(prefix + raw)
     return "\n".join(lines)
 
-def _call_gemini_with_web_search(
+async def _call_gemini_with_web_search(
     client: genai.Client,
     model: str,
     prompt: str,
     max_retries: int,
     verbose: bool = False
 ) -> str:
-    """Chama a API com suporte a Google Search e tratamento de erro."""
+    """Chama a API com suporte a Google Search e tratamento de erro (Async)."""
     
     # Configuração da ferramenta de busca
     google_search_tool = types.Tool(
@@ -120,11 +122,11 @@ def _call_gemini_with_web_search(
                 attempt + 1,
                 max_retries,
             )
-            logging.info("Prompt enviado (chars=%d).", len(prompt))
+            # logging.info("Prompt enviado (chars=%d).", len(prompt))
         call_started_at = time.monotonic()
         try:
-            # CORREÇÃO: Removemos response_mime_type="application/json" pois conflita com Tools
-            response = client.models.generate_content(
+            # CHAMADA ASYNC
+            response = await client.aio.models.generate_content(
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -165,12 +167,12 @@ def _call_gemini_with_web_search(
             if "429" in error_msg or "ResourceExhausted" in error_msg:
                 wait_time = 60
                 logging.warning(f"Cota atingida (429). Aguardando {wait_time}s... (Tentativa {attempt+1}/{max_retries})")
-                time.sleep(wait_time)
+                await asyncio.sleep(wait_time)
                 continue
             
             # Outros erros
             logging.warning(f"Erro na API (tentativa {attempt+1}): {exc}")
-            time.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** attempt)
 
     logging.error(f"Falha definitiva após {max_retries} tentativas.")
     return "{}"
@@ -348,8 +350,32 @@ def main() -> None:
     parser.add_argument("--sleep", type=float, default=5.0, help="Intervalo alvo (segundos) entre requisições (controle de taxa).")
     parser.add_argument("--verbose", action="store_true", help="Exibe detalhes do chamamento à API.")
     
-    args = parser.parse_args()
+    context = _build_context(row)
+    if not context:
+        return idx, row, []
 
+    async with semaphore:
+        logging.info(f"Processando linha {idx+1} (Iniciando API)...")
+        raw_text = await _call_gemini_with_web_search(
+            client=client,
+            model=model,
+            prompt=USER_PROMPT_TEMPLATE.format(context=context),
+            max_retries=3,
+            verbose=verbose
+        )
+        # Sleep to respect rate limits per worker/task
+        if sleep_time > 0:
+            await asyncio.sleep(sleep_time)
+
+    noticia_tse, noticia_tre, noticia_geral_links = _process_response_text(raw_text)
+
+    row["noticia_TSE"] = noticia_tse
+    row["noticia_TRE"] = noticia_tre
+
+    # Returning the modifed row and extra info needed for main loop
+    return idx, row, noticia_geral_links
+
+async def async_main(args: argparse.Namespace) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -429,11 +455,32 @@ def main() -> None:
 
     total_to_process = len(rows) if args.limit == 0 else min(len(rows), args.limit)
 
+    # Async setup
+    semaphore = asyncio.Semaphore(3) # Limit concurrency
+
+    skipped_count = 0
+    rows_to_process = []
+
+    for idx, row in enumerate(rows):
+        if idx >= total_to_process:
+            break
+        if idx < processed_count:
+            skipped_count += 1
+            continue
+        rows_to_process.append((idx, row))
+
+    logging.info(f"Total rows: {len(rows)}. Limit: {args.limit}. Skipped: {skipped_count}. To process: {len(rows_to_process)}.")
+
     f, writer = _open_output_writer(output_path, output_fields, write_mode)
+
     try:
-        for idx, row in enumerate(rows):
-            if idx >= total_to_process:
-                break
+        # Create task objects
+        task_objects = []
+        for idx, row in rows_to_process:
+            task = asyncio.create_task(
+                process_row(idx, row, client, args.model, args.verbose, args.sleep, semaphore)
+            )
+            task_objects.append(task)
             
             if idx < processed_count:
                 continue
@@ -441,24 +488,8 @@ def main() -> None:
             logging.info(f"Processando linha {idx+1}/{total_to_process}...")
             loop_start = time.monotonic()
             
-            context = _build_context(row)
+            new_columns = _apply_geral_links(updated_row, noticia_geral_links)
             
-            if context:
-                raw_text = _call_gemini_with_web_search(
-                    client=client, 
-                    model=args.model, 
-                    prompt=USER_PROMPT_TEMPLATE.format(context=context), 
-                    max_retries=3,
-                    verbose=args.verbose
-                )
-                noticia_tse, noticia_tre, noticia_geral_links = _process_response_text(raw_text)
-            else:
-                noticia_tse, noticia_tre, noticia_geral_links = "", "", []
-
-            row["noticia_TSE"] = noticia_tse
-            row["noticia_TRE"] = noticia_tre
-            new_columns = _apply_geral_links(row, noticia_geral_links)
-
             if new_columns:
                 header_updated = False
                 for col in new_columns:
@@ -471,8 +502,9 @@ def main() -> None:
                     _rewrite_output_file(output_path, output_fields)
                     f, writer = _open_output_writer(output_path, output_fields, "a")
             
-            writer.writerow(row)
+            writer.writerow(updated_row)
             f.flush()
+            logging.info(f"Linha {idx+1} concluída e salva.")
             
             # Otimização: Sleep adaptativo para manter a cadência (Rate Limit) sem desperdício
             elapsed = time.monotonic() - loop_start
@@ -482,6 +514,26 @@ def main() -> None:
         f.close()
 
     logging.info(f"Concluído! Arquivo salvo em: {output_path}")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Busca noticias TSE via Gemini API (google-genai).")
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV de entrada. Se omitido, abre caixa de seleção.")
+    parser.add_argument("--output", default="", help="CSV de saida.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
+    parser.add_argument("--limit", type=int, default=0, help="Limite de linhas.")
+    parser.add_argument("--sleep", type=float, default=5.0, help="Pausa (segundos) entre chamadas.")
+    parser.add_argument("--verbose", action="store_true", help="Exibe detalhes do chamamento à API.")
+
+    args = parser.parse_args()
+
+    # Windows compatibility for asyncio loop
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    try:
+        asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        logging.info("Interrompido pelo usuário.")
 
 if __name__ == "__main__":
     main()
