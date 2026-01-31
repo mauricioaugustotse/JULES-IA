@@ -299,7 +299,7 @@ def main() -> None:
     parser.add_argument("--output", default="", help="CSV de saida.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
     parser.add_argument("--limit", type=int, default=0, help="Limite de linhas.")
-    parser.add_argument("--sleep", type=float, default=5.0, help="Pausa (segundos) entre chamadas.")
+    parser.add_argument("--sleep", type=float, default=5.0, help="Intervalo alvo (segundos) entre requisições (controle de taxa).")
     parser.add_argument("--verbose", action="store_true", help="Exibe detalhes do chamamento à API.")
     
     args = parser.parse_args()
@@ -385,6 +385,7 @@ def main() -> None:
                 continue
 
             logging.info(f"Processando linha {idx+1}/{total_to_process}...")
+            loop_start = time.monotonic()
             
             context = _build_context(row)
             
@@ -419,7 +420,10 @@ def main() -> None:
             writer.writerow(row)
             f.flush()
             
-            time.sleep(args.sleep)
+            # Otimização: Sleep adaptativo para manter a cadência (Rate Limit) sem desperdício
+            elapsed = time.monotonic() - loop_start
+            sleep_time = max(0.0, args.sleep - elapsed)
+            time.sleep(sleep_time)
     finally:
         f.close()
 
