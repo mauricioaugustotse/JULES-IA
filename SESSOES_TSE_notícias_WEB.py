@@ -359,6 +359,14 @@ def main() -> None:
             output_fields.append(col)
             header_changed = True
 
+    # PERFORMANCE OPTIMIZATION: Pre-allocate extra columns to avoid expensive file rewrites inside the loop.
+    # We anticipate up to 50 extra news links.
+    for i in range(1, 51):
+        col = f"noticia_geral_{i}"
+        if col not in output_fields:
+            output_fields.append(col)
+            header_changed = True
+
     if existing_header and header_changed:
         _rewrite_output_file(output_path, output_fields)
 
