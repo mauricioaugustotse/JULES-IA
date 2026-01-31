@@ -17,8 +17,7 @@ import random
 import re
 import sys
 import time
-from typing import Dict, Iterable, List, Optional, Tuple, Any
-from urllib.parse import urlparse
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # --- IMPORTAÇÃO SEGURA DE VARIÁVEIS DE AMBIENTE ---
 try:
@@ -46,6 +45,8 @@ CONTEXT_FIELDS = [
     "tribunal", "origem", "data_sessao", "relator", "partes",
 ]
 
+CONTEXT_PREFIXES = [(field, f"{field}: ") for field in CONTEXT_FIELDS]
+
 # Prompt do Sistema (Instrução fixa)
 SYSTEM_PROMPT = (
     "You are a research assistant. Use Google Search to find real news articles. "
@@ -67,6 +68,8 @@ USER_PROMPT_TEMPLATE = (
 
 URL_RE = re.compile(r"https?://[^\s\]\)>,;\"']+", re.IGNORECASE)
 TRE_DOMAIN_RE = re.compile(r"(?:^|\.)tre-[a-z]{2}\.jus\.br$", re.IGNORECASE)
+TSE_DOMAIN_RE = re.compile(r"(?:^|\.)tse\.jus\.br$", re.IGNORECASE)
+NORMALIZE_PROTOCOL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 GENERAL_DOMAINS = [
     "folha.uol.com.br", "estadao.com.br", "gazetadopovo.com.br",
@@ -74,18 +77,26 @@ GENERAL_DOMAINS = [
     "g1.globo.com", "oglobo.globo.com", "poder360.com.br"
 ]
 
+# Compiled regex for general domains optimization
+GENERAL_DOMAINS_RE = re.compile(
+    r"(?:^|\.)(?:" + "|".join(re.escape(d) for d in GENERAL_DOMAINS) + r")$",
+    re.IGNORECASE
+)
+
 def _build_context(row: Dict[str, str], max_len: int = 300) -> str:
     """Cria um resumo do caso para enviar ao Gemini."""
     lines: List[str] = []
-    for field in CONTEXT_FIELDS:
-        raw = (row.get(field) or "").strip()
-        if not raw:
-            continue
-        # Trunca campos muito longos para economizar tokens
-        if len(raw) > max_len:
-            raw = raw[:max_len].rstrip() + "..."
-        lines.append(f"{field}: {raw}")
-    return "\n".join(lines).strip()
+    get_field = row.get
+    for field, prefix in CONTEXT_PREFIXES:
+        raw = get_field(field)
+        if raw:
+            raw = raw.strip()
+            if raw:
+                # Trunca campos muito longos para economizar tokens
+                if len(raw) > max_len:
+                    raw = raw[:max_len].rstrip() + "..."
+                lines.append(prefix + raw)
+    return "\n".join(lines)
 
 async def _call_gemini_with_web_search(
     client: genai.Client,
@@ -141,6 +152,13 @@ async def _call_gemini_with_web_search(
         except Exception as exc:
             last_err = exc
             error_msg = str(exc)
+
+            # Extract status code if possible
+            status_code = getattr(exc, 'code', None)
+            if status_code in (401, 403):
+                logging.error(f"Erro Fatal de Autenticação/Permissão ({status_code}): {exc}")
+                raise exc
+
             if verbose:
                 elapsed = time.monotonic() - call_started_at
                 logging.warning("Falha na chamada (%.2fs): %s", elapsed, exc)
@@ -184,17 +202,26 @@ def _extract_json(text: str) -> Dict[str, object]:
 def _normalize_url(url: str) -> str:
     cleaned = (url or "").strip().strip(".,;)]}>\"'")
     if not cleaned: return ""
-    if not re.match(r"^https?://", cleaned, re.IGNORECASE):
+    if not NORMALIZE_PROTOCOL_RE.match(cleaned):
         cleaned = "https://" + cleaned
     return cleaned
 
 def _domain_from_url(url: str) -> str:
     try:
-        parsed = urlparse(url)
-        host = (parsed.netloc or "").lower()
-        if host.startswith("www."): host = host[4:]
+        # Optimized domain extraction: split string instead of full urlparse
+        # Assumes url is normalized (starts with http:// or https://)
+        part = url.split("://", 1)[1]
+        host = part.split("/", 1)[0]
+        if "@" in host:
+            host = host.split("@", 1)[1]
+        if ":" in host:
+            host = host.split(":", 1)[0]
+        host = host.lower()
+        if host.startswith("www."):
+            host = host[4:]
         return host
-    except Exception: return ""
+    except Exception:
+        return ""
 
 def _classify_urls(urls: Iterable[str]) -> Tuple[List[str], List[str], List[str]]:
     tse, tre, geral = [], [], []
@@ -207,11 +234,11 @@ def _classify_urls(urls: Iterable[str]) -> Tuple[List[str], List[str], List[str]
         domain = _domain_from_url(normalized)
         if not domain: continue
 
-        if domain == "tse.jus.br" or domain.endswith(".tse.jus.br"):
+        if TSE_DOMAIN_RE.search(domain):
             tse.append(normalized)
-        elif bool(TRE_DOMAIN_RE.search(domain)):
+        elif TRE_DOMAIN_RE.search(domain):
             tre.append(normalized)
-        elif any(domain.endswith(gd) for gd in GENERAL_DOMAINS):
+        elif GENERAL_DOMAINS_RE.search(domain):
             geral.append(normalized)
         else:
             if "jus.br" not in domain:
@@ -254,11 +281,30 @@ def _rewrite_output_file(output_path: str, fieldnames: List[str]) -> None:
     with open(output_path, "r", newline="", encoding="utf-8") as src, open(
         temp_path, "w", newline="", encoding="utf-8"
     ) as dst:
-        reader = csv.DictReader(src)
-        writer = csv.DictWriter(dst, fieldnames=fieldnames)
-        writer.writeheader()
+        reader = csv.reader(src)
+        writer = csv.writer(dst)
+
+        try:
+            old_header = next(reader)
+        except StopIteration:
+            writer.writerow(fieldnames)
+            return
+
+        writer.writerow(fieldnames)
+
+        target_len = len(fieldnames)
+        common_len = len(old_header)
+        common_padding = [''] * (target_len - common_len)
+
         for row in reader:
-            writer.writerow(row)
+            if len(row) == common_len:
+                writer.writerow(row + common_padding)
+            else:
+                padding_needed = target_len - len(row)
+                if padding_needed > 0:
+                    writer.writerow(row + [''] * padding_needed)
+                else:
+                    writer.writerow(row)
     os.replace(temp_path, output_path)
 
 def _open_output_writer(output_path: str, fieldnames: List[str], mode: str):
@@ -295,15 +341,14 @@ def _get_api_key_securely():
         key = os.getenv("GOOGLE_API_KEY")
     return key
 
-async def process_row(
-    idx: int,
-    row: Dict[str, str],
-    client: genai.Client,
-    model: str,
-    verbose: bool,
-    sleep_time: float,
-    semaphore: asyncio.Semaphore
-) -> Tuple[int, Dict[str, str], List[str]]:
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Busca noticias TSE via Gemini API (google-genai).")
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV de entrada. Se omitido, abre caixa de seleção.")
+    parser.add_argument("--output", default="", help="CSV de saida.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
+    parser.add_argument("--limit", type=int, default=0, help="Limite de linhas.")
+    parser.add_argument("--sleep", type=float, default=5.0, help="Intervalo alvo (segundos) entre requisições (controle de taxa).")
+    parser.add_argument("--verbose", action="store_true", help="Exibe detalhes do chamamento à API.")
     
     context = _build_context(row)
     if not context:
@@ -386,6 +431,14 @@ async def async_main(args: argparse.Namespace) -> None:
             output_fields.append(col)
             header_changed = True
 
+    # PERFORMANCE OPTIMIZATION: Pre-allocate extra columns to avoid expensive file rewrites inside the loop.
+    # We anticipate up to 50 extra news links.
+    for i in range(1, 51):
+        col = f"noticia_geral_{i}"
+        if col not in output_fields:
+            output_fields.append(col)
+            header_changed = True
+
     if existing_header and header_changed:
         _rewrite_output_file(output_path, output_fields)
 
@@ -429,10 +482,11 @@ async def async_main(args: argparse.Namespace) -> None:
             )
             task_objects.append(task)
             
-        # Iterate tasks in creation order (input order) and await result
-        # This ensures we write in order, while allowing background tasks to proceed
-        for task in task_objects:
-            idx, updated_row, noticia_geral_links = await task
+            if idx < processed_count:
+                continue
+
+            logging.info(f"Processando linha {idx+1}/{total_to_process}...")
+            loop_start = time.monotonic()
             
             new_columns = _apply_geral_links(updated_row, noticia_geral_links)
             
@@ -452,6 +506,10 @@ async def async_main(args: argparse.Namespace) -> None:
             f.flush()
             logging.info(f"Linha {idx+1} concluída e salva.")
             
+            # Otimização: Sleep adaptativo para manter a cadência (Rate Limit) sem desperdício
+            elapsed = time.monotonic() - loop_start
+            sleep_time = max(0.0, args.sleep - elapsed)
+            time.sleep(sleep_time)
     finally:
         f.close()
 
