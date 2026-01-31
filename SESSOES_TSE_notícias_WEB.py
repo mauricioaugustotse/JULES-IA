@@ -143,6 +143,13 @@ def _call_gemini_with_web_search(
         except Exception as exc:
             last_err = exc
             error_msg = str(exc)
+
+            # Extract status code if possible
+            status_code = getattr(exc, 'code', None)
+            if status_code in (401, 403):
+                logging.error(f"Erro Fatal de Autenticação/Permissão ({status_code}): {exc}")
+                raise exc
+
             if verbose:
                 elapsed = time.monotonic() - call_started_at
                 logging.warning("Falha na chamada (%.2fs): %s", elapsed, exc)
@@ -256,11 +263,30 @@ def _rewrite_output_file(output_path: str, fieldnames: List[str]) -> None:
     with open(output_path, "r", newline="", encoding="utf-8") as src, open(
         temp_path, "w", newline="", encoding="utf-8"
     ) as dst:
-        reader = csv.DictReader(src)
-        writer = csv.DictWriter(dst, fieldnames=fieldnames)
-        writer.writeheader()
+        reader = csv.reader(src)
+        writer = csv.writer(dst)
+
+        try:
+            old_header = next(reader)
+        except StopIteration:
+            writer.writerow(fieldnames)
+            return
+
+        writer.writerow(fieldnames)
+
+        target_len = len(fieldnames)
+        common_len = len(old_header)
+        common_padding = [''] * (target_len - common_len)
+
         for row in reader:
-            writer.writerow(row)
+            if len(row) == common_len:
+                writer.writerow(row + common_padding)
+            else:
+                padding_needed = target_len - len(row)
+                if padding_needed > 0:
+                    writer.writerow(row + [''] * padding_needed)
+                else:
+                    writer.writerow(row)
     os.replace(temp_path, output_path)
 
 def _open_output_writer(output_path: str, fieldnames: List[str], mode: str):
