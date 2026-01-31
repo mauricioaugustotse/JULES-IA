@@ -16,7 +16,6 @@ import random
 import re
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
 
 # --- IMPORTAÇÃO SEGURA DE VARIÁVEIS DE AMBIENTE ---
 try:
@@ -65,12 +64,20 @@ USER_PROMPT_TEMPLATE = (
 
 URL_RE = re.compile(r"https?://[^\s\]\)>,;\"']+", re.IGNORECASE)
 TRE_DOMAIN_RE = re.compile(r"(?:^|\.)tre-[a-z]{2}\.jus\.br$", re.IGNORECASE)
+TSE_DOMAIN_RE = re.compile(r"(?:^|\.)tse\.jus\.br$", re.IGNORECASE)
+NORMALIZE_PROTOCOL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 GENERAL_DOMAINS = [
     "folha.uol.com.br", "estadao.com.br", "gazetadopovo.com.br",
     "cnnbrasil.com.br", "cnn.com", "conjur.com.br", "migalhas.com.br",
     "g1.globo.com", "oglobo.globo.com", "poder360.com.br"
 ]
+
+# Compiled regex for general domains optimization
+GENERAL_DOMAINS_RE = re.compile(
+    r"(?:^|\.)(?:" + "|".join(re.escape(d) for d in GENERAL_DOMAINS) + r")$",
+    re.IGNORECASE
+)
 
 def _build_context(row: Dict[str, str], max_len: int = 300) -> str:
     """Cria um resumo do caso para enviar ao Gemini."""
@@ -182,17 +189,26 @@ def _extract_json(text: str) -> Dict[str, object]:
 def _normalize_url(url: str) -> str:
     cleaned = (url or "").strip().strip(".,;)]}>\"'")
     if not cleaned: return ""
-    if not re.match(r"^https?://", cleaned, re.IGNORECASE):
+    if not NORMALIZE_PROTOCOL_RE.match(cleaned):
         cleaned = "https://" + cleaned
     return cleaned
 
 def _domain_from_url(url: str) -> str:
     try:
-        parsed = urlparse(url)
-        host = (parsed.netloc or "").lower()
-        if host.startswith("www."): host = host[4:]
+        # Optimized domain extraction: split string instead of full urlparse
+        # Assumes url is normalized (starts with http:// or https://)
+        part = url.split("://", 1)[1]
+        host = part.split("/", 1)[0]
+        if "@" in host:
+            host = host.split("@", 1)[1]
+        if ":" in host:
+            host = host.split(":", 1)[0]
+        host = host.lower()
+        if host.startswith("www."):
+            host = host[4:]
         return host
-    except Exception: return ""
+    except Exception:
+        return ""
 
 def _classify_urls(urls: Iterable[str]) -> Tuple[List[str], List[str], List[str]]:
     tse, tre, geral = [], [], []
@@ -205,11 +221,11 @@ def _classify_urls(urls: Iterable[str]) -> Tuple[List[str], List[str], List[str]
         domain = _domain_from_url(normalized)
         if not domain: continue
 
-        if domain == "tse.jus.br" or domain.endswith(".tse.jus.br"):
+        if TSE_DOMAIN_RE.search(domain):
             tse.append(normalized)
-        elif bool(TRE_DOMAIN_RE.search(domain)):
+        elif TRE_DOMAIN_RE.search(domain):
             tre.append(normalized)
-        elif any(domain.endswith(gd) for gd in GENERAL_DOMAINS):
+        elif GENERAL_DOMAINS_RE.search(domain):
             geral.append(normalized)
         else:
             if "jus.br" not in domain:
