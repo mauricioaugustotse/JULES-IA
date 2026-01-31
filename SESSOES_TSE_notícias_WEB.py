@@ -44,6 +44,8 @@ CONTEXT_FIELDS = [
     "tribunal", "origem", "data_sessao", "relator", "partes",
 ]
 
+CONTEXT_PREFIXES = [(field, f"{field}: ") for field in CONTEXT_FIELDS]
+
 # Prompt do Sistema (Instrução fixa)
 SYSTEM_PROMPT = (
     "You are a research assistant. Use Google Search to find real news articles. "
@@ -75,15 +77,17 @@ GENERAL_DOMAINS = [
 def _build_context(row: Dict[str, str], max_len: int = 300) -> str:
     """Cria um resumo do caso para enviar ao Gemini."""
     lines: List[str] = []
-    for field in CONTEXT_FIELDS:
-        raw = (row.get(field) or "").strip()
-        if not raw:
-            continue
-        # Trunca campos muito longos para economizar tokens
-        if len(raw) > max_len:
-            raw = raw[:max_len].rstrip() + "..."
-        lines.append(f"{field}: {raw}")
-    return "\n".join(lines).strip()
+    get_field = row.get
+    for field, prefix in CONTEXT_PREFIXES:
+        raw = get_field(field)
+        if raw:
+            raw = raw.strip()
+            if raw:
+                # Trunca campos muito longos para economizar tokens
+                if len(raw) > max_len:
+                    raw = raw[:max_len].rstrip() + "..."
+                lines.append(prefix + raw)
+    return "\n".join(lines)
 
 def _call_gemini_with_web_search(
     client: genai.Client,
