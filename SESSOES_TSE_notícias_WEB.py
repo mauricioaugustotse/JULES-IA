@@ -44,6 +44,8 @@ CONTEXT_FIELDS = [
     "tribunal", "origem", "data_sessao", "relator", "partes",
 ]
 
+CONTEXT_PREFIXES = [(field, f"{field}: ") for field in CONTEXT_FIELDS]
+
 # Prompt do Sistema (Instrução fixa)
 SYSTEM_PROMPT = (
     "You are a research assistant. Use Google Search to find real news articles. "
@@ -75,15 +77,17 @@ GENERAL_DOMAINS = [
 def _build_context(row: Dict[str, str], max_len: int = 300) -> str:
     """Cria um resumo do caso para enviar ao Gemini."""
     lines: List[str] = []
-    for field in CONTEXT_FIELDS:
-        raw = (row.get(field) or "").strip()
-        if not raw:
-            continue
-        # Trunca campos muito longos para economizar tokens
-        if len(raw) > max_len:
-            raw = raw[:max_len].rstrip() + "..."
-        lines.append(f"{field}: {raw}")
-    return "\n".join(lines).strip()
+    get_field = row.get
+    for field, prefix in CONTEXT_PREFIXES:
+        raw = get_field(field)
+        if raw:
+            raw = raw.strip()
+            if raw:
+                # Trunca campos muito longos para economizar tokens
+                if len(raw) > max_len:
+                    raw = raw[:max_len].rstrip() + "..."
+                lines.append(prefix + raw)
+    return "\n".join(lines)
 
 def _call_gemini_with_web_search(
     client: genai.Client,
@@ -325,7 +329,7 @@ def main() -> None:
     parser.add_argument("--output", default="", help="CSV de saida.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
     parser.add_argument("--limit", type=int, default=0, help="Limite de linhas.")
-    parser.add_argument("--sleep", type=float, default=5.0, help="Pausa (segundos) entre chamadas.")
+    parser.add_argument("--sleep", type=float, default=5.0, help="Intervalo alvo (segundos) entre requisições (controle de taxa).")
     parser.add_argument("--verbose", action="store_true", help="Exibe detalhes do chamamento à API.")
     
     args = parser.parse_args()
@@ -385,6 +389,14 @@ def main() -> None:
             output_fields.append(col)
             header_changed = True
 
+    # PERFORMANCE OPTIMIZATION: Pre-allocate extra columns to avoid expensive file rewrites inside the loop.
+    # We anticipate up to 50 extra news links.
+    for i in range(1, 51):
+        col = f"noticia_geral_{i}"
+        if col not in output_fields:
+            output_fields.append(col)
+            header_changed = True
+
     if existing_header and header_changed:
         _rewrite_output_file(output_path, output_fields)
 
@@ -411,6 +423,7 @@ def main() -> None:
                 continue
 
             logging.info(f"Processando linha {idx+1}/{total_to_process}...")
+            loop_start = time.monotonic()
             
             context = _build_context(row)
             
@@ -445,7 +458,10 @@ def main() -> None:
             writer.writerow(row)
             f.flush()
             
-            time.sleep(args.sleep)
+            # Otimização: Sleep adaptativo para manter a cadência (Rate Limit) sem desperdício
+            elapsed = time.monotonic() - loop_start
+            sleep_time = max(0.0, args.sleep - elapsed)
+            time.sleep(sleep_time)
     finally:
         f.close()
 
