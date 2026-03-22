@@ -1,16 +1,23 @@
 import google.generativeai as genai
 import os
-from dotenv import load_dotenv
+from local_secrets import get_secret, load_local_secrets
 
-# 1. Carrega as variáveis do arquivo .env (onde sua senha está guardada)
-load_dotenv()
+# 1. Carrega as variáveis do .env e dos arquivos locais ignorados pelo Git
+load_local_secrets(base_dir=os.path.dirname(os.path.abspath(__file__)))
 
-# 2. Pega a chave pelo nome que você definiu no arquivo .env
-api_key = os.getenv("GEMINI_API_KEY")
+# 2. Pega a chave pelo nome configurado no ambiente ou em arquivo local
+api_key = get_secret(
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    base_dir=os.path.dirname(os.path.abspath(__file__)),
+)
 
 # Verifica se a chave foi carregada corretamente
 if not api_key:
-    print("ERRO: A chave não foi encontrada. Verifique se o arquivo .env está na mesma pasta.")
+    print(
+        "ERRO: A chave não foi encontrada. Verifique o .env ou um arquivo local "
+        "como Chave_Gemini.txt."
+    )
 else:
     # Configura o Gemini com a chave segura
     genai.configure(api_key=api_key)

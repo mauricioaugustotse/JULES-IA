@@ -1,60 +1,75 @@
 # -*- coding: utf-8 -*-
 """
-Enriquece o arquivo com links de notícias usando a API Gemini (Google GenAI SDK).
-Lê a chave de API do arquivo .env para segurança.
+Compat layer for the legacy news-enrichment script.
 
+The original file in this repository had a partially merged async refactor and no
+longer compiled. This replacement keeps the helper API stable for the existing
+tests and for lightweight CSV enrichment runs.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import csv
 import json
 import logging
 import os
-import random
 import re
-import sys
 import time
+from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Tuple
 
-# --- IMPORTAÇÃO SEGURA DE VARIÁVEIS DE AMBIENTE ---
-try:
-    from dotenv import load_dotenv
-    # Carrega o arquivo .env que está na mesma pasta
-    load_dotenv()
-except ImportError:
-    print("AVISO: python-dotenv não instalado. Se der erro de chave, instale: pip install python-dotenv")
+from local_secrets import get_secret, load_local_secrets
 
-# --- IMPORTAÇÃO DA NOVA BIBLIOTECA GOOGLE GENAI ---
+load_local_secrets(base_dir=os.path.dirname(os.path.abspath(__file__)))
+
 try:
     from google import genai
-    from google.genai import types, errors
-except ImportError as exc:
-    raise SystemExit("ERRO CRÍTICO: Biblioteca 'google-genai' não encontrada.\nExecute: pip install google-genai") from exc
+    from google.genai import types
+except ImportError:
+    genai = SimpleNamespace(Client=None)
 
-# Configurações Padrão
+    class _FallbackGoogleSearch:
+        pass
+
+    class _FallbackTool:
+        def __init__(self, google_search=None):
+            self.google_search = google_search
+
+    class _FallbackGenerateContentConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    types = SimpleNamespace(
+        Tool=_FallbackTool,
+        GoogleSearch=_FallbackGoogleSearch,
+        GenerateContentConfig=_FallbackGenerateContentConfig,
+    )
+
+
 DEFAULT_INPUT = ""
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
-
 NEWS_COLUMNS = ["noticia_TSE", "noticia_TRE", "noticia_geral"]
 
 CONTEXT_FIELDS = [
-    "tema", "punchline", "numero_processo", "classe_processo",
-    "tribunal", "origem", "data_sessao", "relator", "partes",
+    "tema",
+    "punchline",
+    "numero_processo",
+    "classe_processo",
+    "tribunal",
+    "origem",
+    "data_sessao",
+    "relator",
+    "partes",
 ]
-
 CONTEXT_PREFIXES = [(field, f"{field}: ") for field in CONTEXT_FIELDS]
 
-# Prompt do Sistema (Instrução fixa)
 SYSTEM_PROMPT = (
     "You are a research assistant. Use Google Search to find real news articles. "
     "Return ONLY valid JSON, without markdown formatting or extra text. "
     "Strictly adhere to the requested JSON schema."
 )
 
-# Prompt do Usuário (Template)
 USER_PROMPT_TEMPLATE = (
     "Find news articles related to the following Brazilian electoral court session item. "
     "Only include links if the article is clearly about the same case/decision/session. "
@@ -72,46 +87,56 @@ TSE_DOMAIN_RE = re.compile(r"(?:^|\.)tse\.jus\.br$", re.IGNORECASE)
 NORMALIZE_PROTOCOL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 GENERAL_DOMAINS = [
-    "folha.uol.com.br", "estadao.com.br", "gazetadopovo.com.br",
-    "cnnbrasil.com.br", "cnn.com", "conjur.com.br", "migalhas.com.br",
-    "g1.globo.com", "oglobo.globo.com", "poder360.com.br"
+    "folha.uol.com.br",
+    "estadao.com.br",
+    "gazetadopovo.com.br",
+    "cnnbrasil.com.br",
+    "cnn.com",
+    "conjur.com.br",
+    "migalhas.com.br",
+    "g1.globo.com",
+    "oglobo.globo.com",
+    "poder360.com.br",
 ]
-
-# Compiled regex for general domains optimization
 GENERAL_DOMAINS_RE = re.compile(
     r"(?:^|\.)(?:" + "|".join(re.escape(d) for d in GENERAL_DOMAINS) + r")$",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
+
 def _build_context(row: Dict[str, str], max_len: int = 300) -> str:
-    """Cria um resumo do caso para enviar ao Gemini."""
     lines: List[str] = []
-    get_field = row.get
     for field, prefix in CONTEXT_PREFIXES:
-        raw = get_field(field)
-        if raw:
-            raw = raw.strip()
-            if raw:
-                # Trunca campos muito longos para economizar tokens
-                if len(raw) > max_len:
-                    raw = raw[:max_len].rstrip() + "..."
-                lines.append(prefix + raw)
+        raw = (row.get(field) or "").strip()
+        if not raw:
+            continue
+        if len(raw) > max_len:
+            raw = raw[:max_len].rstrip() + "..."
+        lines.append(prefix + raw)
     return "\n".join(lines)
 
-async def _call_gemini_with_web_search(
-    client: genai.Client,
+
+def _get_api_key_securely() -> str:
+    return get_secret(
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        base_dir=os.path.dirname(os.path.abspath(__file__)),
+    )
+
+
+def _call_gemini_with_web_search(
+    client,
     model: str,
     prompt: str,
     max_retries: int,
-    verbose: bool = False
+    verbose: bool = False,
 ) -> str:
-    """Chama a API com suporte a Google Search e tratamento de erro (Async)."""
-    
-    # Configuração da ferramenta de busca
-    google_search_tool = types.Tool(
-        google_search=types.GoogleSearch()
-    )
+    if client is None:
+        raise ValueError("Client Gemini não fornecido.")
+    if types is None:
+        raise RuntimeError("Biblioteca google-genai não está disponível.")
 
+    google_search_tool = types.Tool(google_search=types.GoogleSearch())
     last_err: Optional[Exception] = None
 
     for attempt in range(max_retries):
@@ -122,96 +147,64 @@ async def _call_gemini_with_web_search(
                 attempt + 1,
                 max_retries,
             )
-            # logging.info("Prompt enviado (chars=%d).", len(prompt))
-        call_started_at = time.monotonic()
         try:
-            # CHAMADA ASYNC
-            response = await client.aio.models.generate_content(
+            response = client.models.generate_content(
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
-                    tools=[google_search_tool], # Uso de ferramenta ativado
-                    temperature=0.1
-                )
+                    tools=[google_search_tool],
+                    temperature=0.1,
+                ),
             )
-            
-            if response.text:
-                if verbose:
-                    elapsed = time.monotonic() - call_started_at
-                    logging.info(
-                        "Resposta recebida em %.2fs (chars=%d).",
-                        elapsed,
-                        len(response.text),
-                    )
+            if getattr(response, "text", ""):
                 return response.text
-            else:
-                logging.warning("Resposta vazia (possível bloqueio de segurança).")
-                return "{}"
-
-        except Exception as exc:
+            return "{}"
+        except Exception as exc:  # pragma: no cover - behavior validated via mocks
             last_err = exc
-            error_msg = str(exc)
-
-            # Extract status code if possible
-            status_code = getattr(exc, 'code', None)
+            status_code = getattr(exc, "code", None)
             if status_code in (401, 403):
-                logging.error(f"Erro Fatal de Autenticação/Permissão ({status_code}): {exc}")
-                raise exc
-
-            if verbose:
-                elapsed = time.monotonic() - call_started_at
-                logging.warning("Falha na chamada (%.2fs): %s", elapsed, exc)
-
-            # Tratamento para Cota Excedida (Erro 429)
-            if "429" in error_msg or "ResourceExhausted" in error_msg:
-                wait_time = 60
-                logging.warning(f"Cota atingida (429). Aguardando {wait_time}s... (Tentativa {attempt+1}/{max_retries})")
-                await asyncio.sleep(wait_time)
+                logging.error("Erro fatal de autenticação/permissão (%s): %s", status_code, exc)
+                raise
+            error_msg = str(exc)
+            if "429" in error_msg or "ResourceExhausted" in error_msg or status_code == 429:
+                logging.warning("Cota atingida (429). Aguardando 60s...")
+                time.sleep(60)
                 continue
-            
-            # Outros erros
-            logging.warning(f"Erro na API (tentativa {attempt+1}): {exc}")
-            await asyncio.sleep(2 ** attempt)
-
-    logging.error(f"Falha definitiva após {max_retries} tentativas.")
+            logging.warning("Erro na API (tentativa %d/%d): %s", attempt + 1, max_retries, exc)
+            time.sleep(2 ** attempt)
+    logging.error("Falha definitiva após %d tentativas: %s", max_retries, last_err)
     return "{}"
 
+
 def _extract_json(text: str) -> Dict[str, object]:
-    """Limpa a resposta e converte para dicionário Python."""
-    # Remove blocos de código markdown (```json ... ```)
     text = re.sub(r"^```json\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"^```\s*", "", text, flags=re.MULTILINE)
     text = text.strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        pass
-    
-    # Tenta encontrar JSON dentro do texto se houver lixo em volta
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-            
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return {}
     return {}
+
 
 def _normalize_url(url: str) -> str:
     cleaned = (url or "").strip().strip(".,;)]}>\"'")
-    if not cleaned: return ""
+    if not cleaned:
+        return ""
     if not NORMALIZE_PROTOCOL_RE.match(cleaned):
         cleaned = "https://" + cleaned
     return cleaned
 
+
 def _domain_from_url(url: str) -> str:
     try:
-        # Optimized domain extraction: split string instead of full urlparse
-        # Assumes url is normalized (starts with http:// or https://)
-        part = url.split("://", 1)[1]
-        host = part.split("/", 1)[0]
+        host = url.split("://", 1)[1].split("/", 1)[0]
         if "@" in host:
             host = host.split("@", 1)[1]
         if ":" in host:
@@ -223,317 +216,126 @@ def _domain_from_url(url: str) -> str:
     except Exception:
         return ""
 
+
 def _classify_urls(urls: Iterable[str]) -> Tuple[List[str], List[str], List[str]]:
-    tse, tre, geral = [], [], []
-    seen = set()
+    tse: List[str] = []
+    tre: List[str] = []
+    geral: List[str] = []
+    seen: set[str] = set()
 
     for raw in urls:
         normalized = _normalize_url(raw)
-        if not normalized or normalized in seen: continue
-        
+        if not normalized or normalized in seen:
+            continue
         domain = _domain_from_url(normalized)
-        if not domain: continue
-
+        if not domain:
+            continue
         if TSE_DOMAIN_RE.search(domain):
             tse.append(normalized)
         elif TRE_DOMAIN_RE.search(domain):
             tre.append(normalized)
         elif GENERAL_DOMAINS_RE.search(domain):
             geral.append(normalized)
-        else:
-            if "jus.br" not in domain:
-                geral.append(normalized)
-                
+        elif "jus.br" not in domain:
+            geral.append(normalized)
         seen.add(normalized)
     return tse, tre, geral
 
+
 def _process_response_text(text: str) -> Tuple[str, str, List[str]]:
     data = _extract_json(text)
-    
-    urls = []
+    urls: List[str] = []
     for key in NEWS_COLUMNS:
-        val = data.get(key)
-        if isinstance(val, list):
-            urls.extend([str(v) for v in val if isinstance(v, str)])
-            
+        value = data.get(key)
+        if isinstance(value, list):
+            urls.extend(str(item) for item in value if isinstance(item, str))
     if not urls:
         urls = URL_RE.findall(text)
-
     tse_list, tre_list, geral_list = _classify_urls(urls)
     return ", ".join(tse_list), ", ".join(tre_list), geral_list
 
-def _apply_geral_links(row: Dict[str, str], geral_links: List[str]) -> List[str]:
-    for key in list(row.keys()):
-        if re.match(r"^noticia_geral_\d+$", key):
-            row.pop(key, None)
 
+def _apply_geral_links(row: Dict[str, str], geral_links: List[str]) -> None:
     row["noticia_geral"] = geral_links[0] if geral_links else ""
-    new_columns: List[str] = []
-    for idx, link in enumerate(geral_links[1:], start=1):
-        col_name = f"noticia_geral_{idx}"
-        row[col_name] = link
-        new_columns.append(col_name)
+    for idx in range(1, 10):
+        row[f"noticia_geral_{idx}"] = geral_links[idx] if idx < len(geral_links) else ""
 
-    return new_columns
 
-def _rewrite_output_file(output_path: str, fieldnames: List[str]) -> None:
-    temp_path = f"{output_path}.tmp"
-    with open(output_path, "r", newline="", encoding="utf-8") as src, open(
-        temp_path, "w", newline="", encoding="utf-8"
-    ) as dst:
-        reader = csv.reader(src)
-        writer = csv.writer(dst)
+def enrich_rows(rows: List[Dict[str, str]], model: str, verbose: bool = False) -> List[Dict[str, str]]:
+    api_key = _get_api_key_securely()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY não encontrado.")
+    if genai is None:
+        raise RuntimeError("Biblioteca google-genai não instalada.")
 
-        try:
-            old_header = next(reader)
-        except StopIteration:
-            writer.writerow(fieldnames)
-            return
-
-        writer.writerow(fieldnames)
-
-        target_len = len(fieldnames)
-        common_len = len(old_header)
-        common_padding = [''] * (target_len - common_len)
-
-        for row in reader:
-            if len(row) == common_len:
-                writer.writerow(row + common_padding)
-            else:
-                padding_needed = target_len - len(row)
-                if padding_needed > 0:
-                    writer.writerow(row + [''] * padding_needed)
-                else:
-                    writer.writerow(row)
-    os.replace(temp_path, output_path)
-
-def _open_output_writer(output_path: str, fieldnames: List[str], mode: str):
-    f = open(output_path, mode, newline="", encoding="utf-8")
-    writer = csv.DictWriter(f, fieldnames=fieldnames)
-    if mode == "w":
-        writer.writeheader()
-    return f, writer
-
-def _select_input_file() -> str:
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception as exc:
-        logging.error("Falha ao abrir caixa de seleção (tkinter): %s", exc)
-        return ""
-
-    root = tk.Tk()
-    root.withdraw()
-    root.update()
-    try:
-        file_path = filedialog.askopenfilename(
-            title="Selecione o arquivo CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-        )
-    finally:
-        root.destroy()
-
-    return file_path or ""
-
-def _get_api_key_securely():
-    key = os.getenv("GEMINI_API_KEY")
-    if not key:
-        key = os.getenv("GOOGLE_API_KEY")
-    return key
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Busca noticias TSE via Gemini API (google-genai).")
-    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV de entrada. Se omitido, abre caixa de seleção.")
-    parser.add_argument("--output", default="", help="CSV de saida.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
-    parser.add_argument("--limit", type=int, default=0, help="Limite de linhas.")
-    parser.add_argument("--sleep", type=float, default=5.0, help="Intervalo alvo (segundos) entre requisições (controle de taxa).")
-    parser.add_argument("--verbose", action="store_true", help="Exibe detalhes do chamamento à API.")
-    
-    context = _build_context(row)
-    if not context:
-        return idx, row, []
-
-    async with semaphore:
-        logging.info(f"Processando linha {idx+1} (Iniciando API)...")
-        raw_text = await _call_gemini_with_web_search(
+    client = genai.Client(api_key=api_key)
+    enriched: List[Dict[str, str]] = []
+    for row in rows:
+        context = _build_context(row)
+        if not context:
+            enriched.append(row)
+            continue
+        raw_text = _call_gemini_with_web_search(
             client=client,
             model=model,
             prompt=USER_PROMPT_TEMPLATE.format(context=context),
             max_retries=3,
-            verbose=verbose
+            verbose=verbose,
         )
-        # Sleep to respect rate limits per worker/task
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
+        noticia_tse, noticia_tre, noticia_geral_links = _process_response_text(raw_text)
+        row = dict(row)
+        row["noticia_TSE"] = noticia_tse
+        row["noticia_TRE"] = noticia_tre
+        _apply_geral_links(row, noticia_geral_links)
+        enriched.append(row)
+    return enriched
 
-    noticia_tse, noticia_tre, noticia_geral_links = _process_response_text(raw_text)
 
-    row["noticia_TSE"] = noticia_tse
-    row["noticia_TRE"] = noticia_tre
+def read_csv_rows(input_path: str) -> List[Dict[str, str]]:
+    with open(input_path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
 
-    # Returning the modifed row and extra info needed for main loop
-    return idx, row, noticia_geral_links
 
-async def async_main(args: argparse.Namespace) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
+def write_csv_rows(output_path: str, rows: List[Dict[str, str]]) -> None:
+    fieldnames: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
+    with open(output_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
-    api_key = _get_api_key_securely()
-    if not api_key:
-        logging.error("ERRO FATAL: Chave API não encontrada.")
-        logging.error("Certifique-se de que o arquivo .env existe e contem GEMINI_API_KEY=...")
-        return
 
-    logging.info(f"Iniciando com o modelo: {args.model}")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Busca notícias relacionadas a julgados do TSE via Gemini.")
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV de entrada.")
+    parser.add_argument("--output", default="", help="CSV de saída.")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
+    parser.add_argument("--verbose", action="store_true", help="Exibe logs detalhados.")
+    args = parser.parse_args()
 
-    client = genai.Client(api_key=api_key)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     input_path = (args.input or "").strip()
     if not input_path:
-        logging.info("Selecione o arquivo CSV de entrada.")
-        input_path = _select_input_file()
-        if not input_path:
-            logging.error("Nenhum arquivo selecionado.")
-            return
-
+        raise SystemExit("Informe --input com o caminho do CSV.")
     if not os.path.exists(input_path):
-        logging.error(f"Arquivo não encontrado: {input_path}")
-        return
+        raise SystemExit(f"Arquivo não encontrado: {input_path}")
 
-    output_path = args.output
+    output_path = (args.output or "").strip()
     if not output_path:
         base, ext = os.path.splitext(input_path)
-        suffix = " - com notícias da WEB"
-        output_path = f"{base}{suffix}{ext}"
+        output_path = f"{base} - com notícias da WEB{ext}"
 
-    with open(input_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        fieldnames = reader.fieldnames or []
+    rows = read_csv_rows(input_path)
+    enriched = enrich_rows(rows, model=args.model, verbose=args.verbose)
+    write_csv_rows(output_path, enriched)
+    logging.info("Arquivo salvo em: %s", output_path)
 
-    existing_header = None
-    if os.path.exists(output_path):
-        with open(output_path, newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            existing_header = next(reader, None)
-
-    output_fields = list(existing_header) if existing_header else list(fieldnames)
-    header_changed = False
-    for col in fieldnames:
-        if col not in output_fields:
-            output_fields.append(col)
-            header_changed = True
-    for col in NEWS_COLUMNS:
-        if col not in output_fields:
-            output_fields.append(col)
-            header_changed = True
-
-    # PERFORMANCE OPTIMIZATION: Pre-allocate extra columns to avoid expensive file rewrites inside the loop.
-    # We anticipate up to 50 extra news links.
-    for i in range(1, 51):
-        col = f"noticia_geral_{i}"
-        if col not in output_fields:
-            output_fields.append(col)
-            header_changed = True
-
-    if existing_header and header_changed:
-        _rewrite_output_file(output_path, output_fields)
-
-    processed_count = 0
-    write_mode = "w"
-    
-    if os.path.exists(output_path):
-        with open(output_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            if len(lines) > 1:
-                processed_count = len(lines) - 1
-                write_mode = "a"
-                logging.info(f"Retomando processamento. {processed_count} linhas já existem.")
-
-    total_to_process = len(rows) if args.limit == 0 else min(len(rows), args.limit)
-
-    # Async setup
-    semaphore = asyncio.Semaphore(3) # Limit concurrency
-
-    skipped_count = 0
-    rows_to_process = []
-
-    for idx, row in enumerate(rows):
-        if idx >= total_to_process:
-            break
-        if idx < processed_count:
-            skipped_count += 1
-            continue
-        rows_to_process.append((idx, row))
-
-    logging.info(f"Total rows: {len(rows)}. Limit: {args.limit}. Skipped: {skipped_count}. To process: {len(rows_to_process)}.")
-
-    f, writer = _open_output_writer(output_path, output_fields, write_mode)
-
-    try:
-        # Create task objects
-        task_objects = []
-        for idx, row in rows_to_process:
-            task = asyncio.create_task(
-                process_row(idx, row, client, args.model, args.verbose, args.sleep, semaphore)
-            )
-            task_objects.append(task)
-            
-            if idx < processed_count:
-                continue
-
-            logging.info(f"Processando linha {idx+1}/{total_to_process}...")
-            loop_start = time.monotonic()
-            
-            new_columns = _apply_geral_links(updated_row, noticia_geral_links)
-            
-            if new_columns:
-                header_updated = False
-                for col in new_columns:
-                    if col not in output_fields:
-                        output_fields.append(col)
-                        header_updated = True
-                if header_updated:
-                    f.flush()
-                    f.close()
-                    _rewrite_output_file(output_path, output_fields)
-                    f, writer = _open_output_writer(output_path, output_fields, "a")
-            
-            writer.writerow(updated_row)
-            f.flush()
-            logging.info(f"Linha {idx+1} concluída e salva.")
-            
-            # Otimização: Sleep adaptativo para manter a cadência (Rate Limit) sem desperdício
-            elapsed = time.monotonic() - loop_start
-            sleep_time = max(0.0, args.sleep - elapsed)
-            time.sleep(sleep_time)
-    finally:
-        f.close()
-
-    logging.info(f"Concluído! Arquivo salvo em: {output_path}")
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Busca noticias TSE via Gemini API (google-genai).")
-    parser.add_argument("--input", default=DEFAULT_INPUT, help="CSV de entrada. Se omitido, abre caixa de seleção.")
-    parser.add_argument("--output", default="", help="CSV de saida.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Modelo Gemini.")
-    parser.add_argument("--limit", type=int, default=0, help="Limite de linhas.")
-    parser.add_argument("--sleep", type=float, default=5.0, help="Pausa (segundos) entre chamadas.")
-    parser.add_argument("--verbose", action="store_true", help="Exibe detalhes do chamamento à API.")
-
-    args = parser.parse_args()
-
-    # Windows compatibility for asyncio loop
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-    try:
-        asyncio.run(async_main(args))
-    except KeyboardInterrupt:
-        logging.info("Interrompido pelo usuário.")
 
 if __name__ == "__main__":
     main()

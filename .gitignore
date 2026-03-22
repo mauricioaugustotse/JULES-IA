@@ -1,5 +1,11 @@
 .env
+.env.*
 __pycache__/
 *.pyc
 *.tmp
 benchmark_*.csv
+Chave_*.txt
+*Perplexity*.txt
+*Notion*.txt
+.secrets/
+artifacts/
