@@ -5,7 +5,10 @@ __pycache__/
 *.tmp
 benchmark_*.csv
 Chave_*.txt
+CHAVE_*.txt
 *Perplexity*.txt
 *Notion*.txt
+*OpenAI*.txt
+CHAVE_SECRETA_API_Mauricio_local.txt
 .secrets/
 artifacts/

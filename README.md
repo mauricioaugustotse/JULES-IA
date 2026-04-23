@@ -87,5 +87,5 @@ No Windows com o `.venv` do projeto:
 Observações:
 
 - o backfill principal continua sem notícias por padrão;
-- o grounding para `origem` isoladamente fica desligado por padrão para economizar;
-- o grounding continua ativo quando falta o número CNJ integral.
+- não existe mais grounding isolado para `origem`; esse campo hoje é tratado por inferência local, reparo retroativo e `super_auditor.py`;
+- o grounding de metadata continua ativo quando falta o número CNJ integral.

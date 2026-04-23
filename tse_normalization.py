@@ -13,6 +13,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 CNJ_REGEX = r"\b\d{6,7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b"
 SHORT_PROCESSO_REGEX = r"\b\d{3,7}-\d{2}\b"
 LABELED_PROCESSO_REGEX = r"(?i)\bn(?:[º°]|\.)\s*(\d{3,7})\b"
+SPECIAL_PROCESSO_REGEX = r"(?i)\b(?P<label>ADI|ADO)\s*(?P<number>\d{1,5})\b"
+LABELED_SHORT_PROCESSO_REGEX = r"(?i)\b(?:re?sp(?:e)?|arespe|aresp|rhc|rms|ms|ro|pc)\s*(\d{5,9})\b"
 
 CANON_CSV_FILENAME = "padrões para canonizar.csv"
 CANON_DATA: Optional[dict[str, Any]] = None
@@ -38,10 +40,13 @@ CLASSE_PROCESSO_MAP = [
     (r"\btutela cautelar antecedente\b|\btutcautant\b", "TutCautAnt"),
     (r"\blista triplice\b|\blt\b", "Lista Tríplice"),
     (r"\bprocesso administrativo\b|\bpa\b", "PA"),
+    (r"\b(?:requisi[cç][aã]o|homologa[cç][aã]o).*for[cç]a federal\b|\bfor[cç]a federal\b", "PA"),
     (r"\bprestacao de contas\b|\bpc\b", "PC"),
     (r"\bconsulta\b|\bcta\b", "CTA"),
     (r"\bquestao de ordem\b|\bqo\b", "QO"),
     (r"\bpeticao civel\b|\bpetciv\b", "PetCiv"),
+    (r"\ba[cç][aã]o direta de inconstitucionalidade por omiss[aã]o\b|\bado\b", "ADO"),
+    (r"\ba[cç][aã]o direta de inconstitucionalidade\b|\badi\b", "ADI"),
     (r"\brecurso especial eleitoral\b|\brespe\b", "REspe"),
     (r"\bagravo em recurso especial eleitoral\b|\barespe\b", "AREspe"),
     (r"\brecurso ordinario\b|\bro\b", "RO"),
@@ -96,21 +101,84 @@ STATE_UF = {
     "sergipe": "SE",
     "tocantins": "TO",
 }
+STATE_NAME_KEYS = set(STATE_UF.keys())
 
 MINISTRO_ALIAS_MAP = {
     "antonio carlos ferreira": "Min. Antônio Carlos Ferreira",
+    "alexandre de moraes": "Min. Alexandre de Moraes",
+    "andre mendonca": "Min. André Mendonça",
     "maria isabel gallotti": "Min. Isabel Gallotti",
     "isabel gallotti": "Min. Isabel Gallotti",
+    "benedito goncalves": "Min. Benedito Gonçalves",
     "andre ramos tavares": "Min. Ramos Tavares",
     "ramos tavares": "Min. Ramos Tavares",
+    "carlos bastide horbach": "Min. Carlos Horbach",
+    "carlos horbach": "Min. Carlos Horbach",
     "carmen lucia": "Min. Cármen Lúcia",
+    "dias toffoli": "Min. Dias Toffoli",
+    "edson fachin": "Min. Edson Fachin",
+    "estela aranha": "Min. Estela Aranha",
+    "floriano de azevedo marques": "Min. Floriano de Azevedo Marques",
+    "floriano marques": "Min. Floriano de Azevedo Marques",
+    "luis felipe salomao": "Min. Luís Felipe Salomão",
+    "luiz felipe salomao": "Min. Luís Felipe Salomão",
+    "luis roberto barroso": "Min. Luís Roberto Barroso",
+    "luiz roberto barroso": "Min. Luís Roberto Barroso",
+    "mauro campbell": "Min. Mauro Campbell Marques",
+    "mauro campbell marques": "Min. Mauro Campbell Marques",
+    "nunes marques": "Min. Nunes Marques",
+    "raul araujo": "Min. Raul Araújo",
+    "raul araujo filho": "Min. Raul Araújo",
+    "ricardo lewandowski": "Min. Ricardo Lewandowski",
     "vera lucia": "Min. Vera Lúcia Santana Araújo",
     "vera lucia santana araujo": "Min. Vera Lúcia Santana Araújo",
     "edilene lobo": "Min. Edilene Lôbo",
     "ricardo villas boas cueva": "Min. Ricardo Villas Bôas Cueva",
     "villas boas cueva": "Min. Ricardo Villas Bôas Cueva",
     "vilas boas cueva": "Min. Ricardo Villas Bôas Cueva",
+    "sergio banhos": "Min. Sérgio Banhos",
+    "sergio silveira banhos": "Min. Sérgio Banhos",
+    "sebastiao reis junior": "Min. Sebastião Reis Júnior",
+    "tarcisio vieira": "Min. Tarcísio Vieira de Carvalho Neto",
+    "tarcisio vieira de carvalho neto": "Min. Tarcísio Vieira de Carvalho Neto",
 }
+MINISTRO_INVALID_NAME_TERMS = {
+    "acompanhado",
+    "aplicacao",
+    "apresentou",
+    "apresenta",
+    "aprovacao",
+    "aprovou",
+    "arguiu",
+    "caso",
+    "colegiado",
+    "conclusao",
+    "concluiu",
+    "desconhecido",
+    "encaminhamento",
+    "entendeu",
+    "foi",
+    "julgamento",
+    "julgou",
+    "lista",
+    "manteve",
+    "ministro",
+    "ministra",
+    "negou",
+    "pedido",
+    "poder",
+    "presidente",
+    "processo",
+    "provimento",
+    "relator",
+    "relatora",
+    "recurso",
+    "sobre",
+    "submeteu",
+    "vista",
+    "voto",
+}
+MINISTRO_NAME_PARTICLES = {"de", "da", "do", "dos", "das", "e"}
 
 EMPTY_ADVOGADOS_REGEX = re.compile(
     r"(?i)\b("
@@ -287,6 +355,28 @@ def dedupe_preserve_order(values: Iterable[str]) -> list[str]:
     return unique
 
 
+def extract_chunk_judgment_process_values(judgment: Any) -> list[str]:
+    if not isinstance(judgment, dict):
+        return []
+    values: list[str] = []
+    for field_name in ("processo", "processos"):
+        raw_value = judgment.get(field_name)
+        raw_values: list[Any]
+        if isinstance(raw_value, str):
+            raw_values = split_csv_like_text(raw_value) or [raw_value]
+        elif isinstance(raw_value, Iterable) and not isinstance(raw_value, (str, bytes, dict)):
+            raw_values = list(raw_value)
+        elif raw_value in {None, ""}:
+            raw_values = []
+        else:
+            raw_values = [raw_value]
+        for candidate in raw_values:
+            text = str(candidate or "").strip()
+            if text:
+                values.append(text)
+    return dedupe_preserve_order(values)
+
+
 def get_canonization_data() -> dict[str, Any]:
     global CANON_DATA
     if CANON_DATA is not None:
@@ -408,6 +498,128 @@ def normalize_party_entry(value: str) -> str:
     return cleaned
 
 
+PARTY_SPLIT_ORGANIZATION_REGEX = re.compile(
+    r"(?i)\b(coliga(?:ção|cao)?|partido|federa(?:ção|cao)?|frente|minist[eé]rio|prefeitura|c[aâ]mara|munic[ií]pio|tribunal|uni[aã]o|governo)\b"
+)
+PARTY_NAME_CONNECTORS = {"e", "de", "da", "do", "das", "dos"}
+TRAILING_PAREN_GROUP_REGEX = re.compile(r"\s*\(([^()]*)\)\s*$")
+
+
+def _split_top_level_text(text: str, *, delimiters: str = "", split_conjunction: bool = False) -> list[str]:
+    parts: list[str] = []
+    buffer = ""
+    depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth > 0:
+            depth -= 1
+        if depth == 0 and split_conjunction and text[index:index + 3].lower() == " e ":
+            if buffer.strip():
+                parts.append(buffer.strip())
+            buffer = ""
+            index += 3
+            continue
+        if depth == 0 and delimiters and char in delimiters:
+            if buffer.strip():
+                parts.append(buffer.strip())
+            buffer = ""
+            index += 1
+            continue
+        buffer += char
+        index += 1
+    if buffer.strip():
+        parts.append(buffer.strip())
+    return parts
+
+
+def _strip_trailing_parenthetical_groups(text: str) -> tuple[str, list[str]]:
+    remaining = text.strip()
+    groups: list[str] = []
+    while True:
+        match = TRAILING_PAREN_GROUP_REGEX.search(remaining)
+        if not match:
+            break
+        groups.insert(0, match.group(1).strip())
+        remaining = remaining[:match.start()].rstrip()
+    return remaining, groups
+
+
+def _rebuild_with_parenthetical_groups(base: str, groups: list[str]) -> str:
+    result = base.strip()
+    for group in groups:
+        if group:
+            result = f"{result} ({group})" if result else f"({group})"
+    return result.strip()
+
+
+def _looks_like_person_name_segment(value: str) -> bool:
+    candidate = normalize_text(str(value or "")).strip()
+    if not candidate or PARTY_SPLIT_ORGANIZATION_REGEX.search(candidate):
+        return False
+    candidate, _groups = _strip_trailing_parenthetical_groups(candidate)
+    candidate = re.sub(r"(?i)^(dr\.?|dra\.?|doutor(?:a)?|advogad[oa]s?)\s+", "", candidate).strip()
+    words = [word.strip(".,;:") for word in candidate.split() if word.strip(".,;:")]
+    if len(words) < 2:
+        return False
+    non_connectors = [word for word in words if normalize_token(word) not in PARTY_NAME_CONNECTORS]
+    if len(non_connectors) < 2:
+        return False
+    return all(
+        normalize_token(word) in PARTY_NAME_CONNECTORS or bool(re.match(r"^[A-ZÀ-Ý]", word))
+        for word in words
+    )
+
+
+def _extract_party_role_suffix(value: str) -> tuple[str, str]:
+    base, groups = _strip_trailing_parenthetical_groups(value)
+    for index in range(len(groups) - 1, -1, -1):
+        label = groups[index]
+        if normalize_token(label) in PARTY_PROCESSUAL_ROLE_MAP:
+            role = _normalize_party_role_label(label)
+            remaining_groups = [group for group_index, group in enumerate(groups) if group_index != index]
+            return _rebuild_with_parenthetical_groups(base, remaining_groups), role
+    return value.strip(), ""
+
+
+def _extract_advogado_shared_suffix(value: str) -> tuple[str, str]:
+    base, groups = _strip_trailing_parenthetical_groups(value)
+    for index in range(len(groups) - 1, -1, -1):
+        normalized_label = _normalize_advogado_label_hint(groups[index])
+        if normalized_label:
+            remaining_groups = [group for group_index, group in enumerate(groups) if group_index != index]
+            return _rebuild_with_parenthetical_groups(base, remaining_groups), normalized_label
+    return value.strip(), ""
+
+
+def split_conjoined_person_party_entry(value: str) -> list[str]:
+    text = normalize_text(str(value or "")).strip()
+    if not text:
+        return []
+    if PARTY_SPLIT_ORGANIZATION_REGEX.search(text):
+        return [text]
+    parts = [part.strip(" ,;") for part in _split_top_level_text(text, split_conjunction=True) if part.strip(" ,;")]
+    if len(parts) < 2:
+        return [text]
+    split_parts = [list(_extract_party_role_suffix(part)) for part in parts]
+    distinct_roles = {role for _base, role in split_parts if role}
+    shared_role = next(iter(distinct_roles)) if len(distinct_roles) == 1 and sum(1 for _base, role in split_parts if role) == 1 else ""
+    normalized_parts: list[str] = []
+    for base, own_role in split_parts:
+        candidate = base.strip()
+        if not _looks_like_person_name_segment(candidate):
+            return [text]
+        effective_role = own_role or shared_role
+        if effective_role:
+            candidate = f"{candidate} ({effective_role})"
+        normalized_parts.append(candidate)
+    if normalized_parts:
+        return normalized_parts
+    return [text]
+
+
 def _flatten_structured_party_payload(value: Any, label_hint: str = "") -> list[str]:
     if isinstance(value, dict):
         flattened: list[str] = []
@@ -493,10 +705,13 @@ def normalize_partes_list(value: str | list[str]) -> str:
     seen: set[str] = set()
     for part in raw_parts:
         entry = normalize_party_entry(part)
-        if not entry or entry in seen:
+        if not entry:
             continue
-        seen.add(entry)
-        normalized.append(entry)
+        for split_entry in split_conjoined_person_party_entry(entry):
+            if not split_entry or split_entry in seen:
+                continue
+            seen.add(split_entry)
+            normalized.append(split_entry)
     return ", ".join(normalized)
 
 
@@ -518,6 +733,130 @@ def infer_advogado_prefix(name: str, label_hint: str = "") -> str:
     return "Dr."
 
 
+def _looks_like_advogado_label(value: str) -> bool:
+    cleaned = normalize_text(str(value or "")).strip().strip("'\"")
+    if not cleaned:
+        return False
+    normalized = normalize_token(cleaned.replace("-", " ").replace("_", " "))
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in PARTY_PROCESSUAL_ROLE_MAP:
+        return True
+    return normalized.startswith((
+        "pelo ",
+        "pela ",
+        "advogado do ",
+        "advogada do ",
+        "advogado da ",
+        "advogada da ",
+        "advogado dos ",
+        "advogada dos ",
+        "advogado das ",
+        "advogada das ",
+        "representante do ",
+        "representante da ",
+        "representante dos ",
+        "representante das ",
+    ))
+
+
+def _normalize_advogado_label_hint(value: str) -> str:
+    cleaned = normalize_text(str(value or "")).strip().strip("'\"")
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"[_\-]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+    normalized = normalize_token(cleaned)
+    if normalized in PARTY_PROCESSUAL_ROLE_MAP:
+        role = PARTY_PROCESSUAL_ROLE_MAP[normalized].lower()
+        article = "pela" if role.endswith("a") or role == "ré" else "pelo"
+        return f"{article} {role}"
+    if _looks_like_advogado_label(cleaned):
+        return cleaned
+    return ""
+
+
+def _cleanup_structured_advogado_text(value: str) -> str:
+    text = normalize_text(str(value or "")).strip()
+    if not text:
+        return ""
+    if "{" in text and not text.lstrip().startswith(("{", "[")):
+        text = text[text.index("{"):]
+    text = re.sub(r"(?i)^\s*(dr\.?|dra\.?)\s+(?=[{\[])", "", text)
+    text = re.sub(r"(?i)([{,]\s*)(dr\.?|dra\.?)\s+(?=['\"])", r"\1", text)
+    return text.strip().rstrip(",")
+
+
+def _flatten_structured_advogado_payload(value: Any, label_hint: str = "") -> list[tuple[str, str]]:
+    if isinstance(value, dict):
+        flattened: list[tuple[str, str]] = []
+        for key, nested in value.items():
+            key_text = str(key or "").strip().strip("'\"")
+            next_label = "" if normalize_token(key_text) in {"advogado", "advogados"} else key_text
+            flattened.extend(_flatten_structured_advogado_payload(nested, next_label or label_hint))
+        return flattened
+    if isinstance(value, (list, tuple, set)):
+        flattened: list[tuple[str, str]] = []
+        for item in value:
+            flattened.extend(_flatten_structured_advogado_payload(item, label_hint))
+        return flattened
+    text = str(value or "").strip().strip("'\"")
+    if not text:
+        return []
+    return [(text, label_hint)]
+
+
+def _looks_like_structured_advogado_fragment(value: str) -> bool:
+    text = normalize_text(str(value or "")).strip()
+    if not text:
+        return False
+    if text.startswith(("{", "[")) or "{" in text:
+        return True
+    match = re.match(r"""^\s*['"]?(?P<label>[^'":{}\[\],]+)['"]?\s*:\s*""", text)
+    return bool(match and _looks_like_advogado_label(match.group("label")))
+
+
+def _parse_structured_advogados_payload(value: str) -> list[tuple[str, str]]:
+    text = _cleanup_structured_advogado_text(value)
+    if not text:
+        return []
+    if not text.startswith(("{", "[")):
+        label_match = re.match(r"""^\s*['"]?(?P<label>[^'":{}\[\],]+)['"]?\s*:\s*(?P<raw>.+?)\s*$""", text)
+        if not label_match:
+            return []
+        label = label_match.group("label").strip()
+        if not _looks_like_advogado_label(label):
+            return []
+        raw_value = label_match.group("raw").strip().rstrip("}").strip()
+        if not raw_value:
+            return []
+        parsed_value: Any
+        try:
+            parsed_value = ast.literal_eval(raw_value)
+        except Exception:
+            cleaned = raw_value.strip().strip("'\"")
+            if not cleaned:
+                return []
+            values = [item.strip().strip("'\"") for item in cleaned.split(",") if item.strip().strip("'\"")]
+            parsed_value = values if len(values) > 1 else cleaned
+        return _flatten_structured_advogado_payload({label: parsed_value})
+    try:
+        payload = ast.literal_eval(text)
+    except Exception:
+        return []
+    return _flatten_structured_advogado_payload(payload)
+
+
+def _extract_advogado_label_and_name(value: str) -> tuple[str, str]:
+    text = normalize_text(str(value or "")).strip()
+    match = re.match(r"""^\s*['"]?(?P<label>[^'":{}\[\],]+)['"]?\s*:\s*(?P<name>.+?)\s*$""", text)
+    if not match:
+        return "", text
+    label = match.group("label").strip()
+    if not _looks_like_advogado_label(label):
+        return "", text
+    return label, match.group("name").strip()
+
+
 def normalize_advogado_name(name: str, label_hint: str = "") -> str:
     name = name.strip()
     if not name or is_mpe_noise_entry(name) or is_empty_advogados_value(name):
@@ -527,6 +866,8 @@ def normalize_advogado_name(name: str, label_hint: str = "") -> str:
         base, extra = name.split("(", 1)
         name = base.strip()
         suffix = " (" + extra.strip()
+    name = name.strip().strip("{}[]")
+    name = name.strip().strip("'\"")
     name = name.rstrip(".;:,").strip()
     if not name or is_empty_advogados_value(name):
         return ""
@@ -553,54 +894,75 @@ def normalize_advogado_name(name: str, label_hint: str = "") -> str:
         return ""
     if not prefix:
         prefix = infer_advogado_prefix(name, label_hint)
+    label_suffix = _normalize_advogado_label_hint(label_hint)
+    if label_suffix:
+        normalized_suffix = normalize_token(suffix)
+        if normalize_token(label_suffix) not in normalized_suffix:
+            suffix = f"{suffix} ({label_suffix})" if suffix else f" ({label_suffix})"
     return f"{prefix} {name}{suffix}".strip()
 
 
 def split_advogados_entries(text: str) -> list[str]:
+    normalized_text = normalize_text(str(text or "")).strip()
+    if not normalized_text:
+        return []
+    comma_split_parts = [part.strip() for part in _split_top_level_text(normalized_text, delimiters=",;") if part.strip()]
     parts: list[str] = []
-    buffer = ""
-    depth = 0
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char == "(":
-            depth += 1
-        elif char == ")" and depth > 0:
-            depth -= 1
-        if depth == 0:
-            if text[index:index + 3].lower() == " e ":
-                if buffer.strip():
-                    parts.append(buffer.strip())
-                buffer = ""
-                index += 3
-                continue
-            if char in ",;":
-                if buffer.strip():
-                    parts.append(buffer.strip())
-                buffer = ""
-                index += 1
-                continue
-        buffer += char
-        index += 1
-    if buffer.strip():
-        parts.append(buffer.strip())
+    for raw_part in comma_split_parts:
+        if PARTY_SPLIT_ORGANIZATION_REGEX.search(raw_part) and not PARTY_ATTORNEY_MARKER_REGEX.search(raw_part):
+            parts.append(raw_part)
+            continue
+        and_split_parts = [part.strip() for part in _split_top_level_text(raw_part, split_conjunction=True) if part.strip()]
+        if len(and_split_parts) >= 2 and all(_looks_like_person_name_segment(part) for part in and_split_parts):
+            shared_suffix_parts = [list(_extract_advogado_shared_suffix(part)) for part in and_split_parts]
+            distinct_labels = {label for _base, label in shared_suffix_parts if label}
+            shared_label = (
+                next(iter(distinct_labels))
+                if len(distinct_labels) == 1 and sum(1 for _base, label in shared_suffix_parts if label) == 1
+                else ""
+            )
+            for base, own_label in shared_suffix_parts:
+                candidate = base.strip()
+                effective_label = own_label or shared_label
+                if effective_label:
+                    candidate = f"{candidate} ({effective_label})"
+                parts.append(candidate)
+            continue
+        parts.append(raw_part)
     return parts
 
 
-def normalize_advogados_list(value: str, label_hint: str = "") -> str:
+def normalize_advogados_list(value: str | list[str], label_hint: str = "") -> str:
     if not value:
         return ""
-    if is_empty_advogados_value(value) and not re.search(r"(?i)[,;]|\bdr\.|\bdra\.|\be\b", value):
-        return ""
-    text = normalize_text(value)
+    raw_pairs: list[tuple[str, str]] = []
+    if isinstance(value, list):
+        raw_parts = [normalize_text(str(item or "")).strip() for item in value if normalize_text(str(item or "")).strip()]
+        if raw_parts and any(_looks_like_structured_advogado_fragment(part) for part in raw_parts):
+            for part in raw_parts:
+                raw_pairs.extend(_parse_structured_advogados_payload(part))
+            if not raw_pairs:
+                raw_pairs = _parse_structured_advogados_payload(", ".join(raw_parts))
+        if not raw_pairs:
+            raw_pairs = [(part, label_hint) for part in raw_parts]
+    else:
+        if is_empty_advogados_value(value) and not re.search(r"(?i)[,;]|\bdr\.|\bdra\.|\be\b", value):
+            return ""
+        structured_pairs = _parse_structured_advogados_payload(str(value or ""))
+        if structured_pairs:
+            raw_pairs = structured_pairs
+        else:
+            raw_pairs = [(normalize_text(str(value or "")), label_hint)]
     normalized: list[str] = []
-    for part in split_advogados_entries(text):
-        part = re.sub(r"(?i)^(advogad[oa]s?|defensor[oa]s?)\s*:?\s*", "", part).strip()
-        if not part or is_mpe_noise_entry(part) or is_empty_advogados_value(part):
-            continue
-        normalized_name = normalize_advogado_name(part, label_hint)
-        if normalized_name:
-            normalized.append(normalized_name)
+    for raw_text, raw_label in raw_pairs:
+        for part in split_advogados_entries(raw_text):
+            part = re.sub(r"(?i)^(advogad[oa]s?|defensor[oa]s?)\s*:?\s*", "", part).strip()
+            if not part or is_mpe_noise_entry(part) or is_empty_advogados_value(part):
+                continue
+            entry_label, entry_name = _extract_advogado_label_and_name(part)
+            normalized_name = normalize_advogado_name(entry_name, entry_label or raw_label or label_hint)
+            if normalized_name:
+                normalized.append(normalized_name)
     return ", ".join(dedupe_preserve_order(normalized))
 
 
@@ -619,44 +981,97 @@ def extract_labeled_short_processo(text: str) -> str:
     return match.group(1) if match else ""
 
 
+def extract_special_processo(text: str) -> str:
+    match = re.search(SPECIAL_PROCESSO_REGEX, normalize_text(text))
+    if not match:
+        return ""
+    label = match.group("label").upper()
+    number = match.group("number").lstrip("0") or "0"
+    return f"{label} {number}"
+
+
+def extract_labeled_short_processo_with_class(text: str) -> str:
+    match = re.search(LABELED_SHORT_PROCESSO_REGEX, normalize_text(text))
+    if not match:
+        return ""
+    return format_short_process_number_from_digits(match.group(1))
+
+
 def format_short_process_number_from_digits(value: str) -> str:
     digits = re.sub(r"\D", "", normalize_text(value))
-    if len(digits) in {8, 9}:
+    if 5 <= len(digits) <= 7:
         return f"{digits[:-2]}-{digits[-2:]}"
+    if len(digits) == 8:
+        # Some extractions drop the fourth digit of the electoral short number,
+        # e.g. 06007196 instead of 060007196. We only repair this pattern for
+        # the common 060-prefix family; other 8-digit shorts like 60350714 are
+        # left untouched because they are already valid in the dataset.
+        prefix = digits[:-2]
+        if digits.startswith("060"):
+            prefix = f"{prefix[:3]}0{prefix[3:]}"
+        return f"{prefix}-{digits[-2:]}"
+    if len(digits) == 9:
+        return f"{digits[:-2]}-{digits[-2:]}"
+    if 10 <= len(digits) <= 12:
+        # Some model outputs leak extra leading digits while preserving a valid
+        # short process number in the final 9-digit suffix, e.g. 060061316874.
+        suffix = digits[-9:]
+        if suffix.startswith("0"):
+            return f"{suffix[:-2]}-{suffix[-2:]}"
     return ""
 
 
 def normalize_numero_processo_display(value: str) -> str:
     if not value:
         return ""
+    special = extract_special_processo(value)
+    if special:
+        return special
     full_cnj = extract_full_cnj(value)
     if full_cnj:
         return full_cnj
     short = extract_short_processo(value)
     if short:
-        return short
+        normalized_short = format_short_process_number_from_digits(short)
+        return normalized_short if normalized_short else short
+    labeled_short = extract_labeled_short_processo_with_class(value)
+    if labeled_short:
+        return labeled_short
     digits_short = format_short_process_number_from_digits(value)
     if digits_short:
         return digits_short
     labeled = extract_labeled_short_processo(value)
-    return labeled if labeled else value.strip()
+    if labeled and re.search(r"\d", labeled):
+        labeled_formatted = format_short_process_number_from_digits(labeled)
+        return labeled_formatted if labeled_formatted else labeled
+    return ""
 
 
 def normalize_processo_num(value: str) -> str:
     if not value:
         return ""
+    special = extract_special_processo(value)
+    if special:
+        return special
     full_cnj = extract_full_cnj(value)
     if full_cnj:
         short = extract_short_processo(full_cnj)
         return short if short else full_cnj
     short = extract_short_processo(value)
     if short:
-        return short
+        normalized_short = format_short_process_number_from_digits(short)
+        return normalized_short if normalized_short else short
+    labeled_short = extract_labeled_short_processo_with_class(value)
+    if labeled_short:
+        return labeled_short
     digits_short = format_short_process_number_from_digits(value)
     if digits_short:
         return digits_short
     labeled = extract_labeled_short_processo(value)
-    return labeled if labeled else value.strip()
+    if labeled and re.search(r"\d", labeled):
+        labeled_formatted = format_short_process_number_from_digits(labeled)
+        return labeled_formatted if labeled_formatted else labeled
+    return ""
 
 
 def canonicalize_numero_processo(value: str) -> str:
@@ -696,6 +1111,61 @@ def normalize_origem_value(value: str) -> str:
     if not value:
         return ""
     value = normalize_text(value).strip().rstrip(".")
+    if not value:
+        return ""
+    comma_parts = [part.strip() for part in value.split(",") if part.strip()]
+    if len(comma_parts) >= 3:
+        return ""
+    normalized_key = normalize_class_text(value)
+    if "tribunais regionais eleitorais" in normalized_key:
+        return ""
+    if normalized_key in {"tribunal superior eleitoral", "tse"}:
+        return "TSE"
+    zona_match = re.search(r"(?i)(?:\d+\S*\s+)?zona eleitoral de?\s+([^/]+)/([a-z]{2})", value)
+    if zona_match:
+        city = zona_match.group(1).strip(" ,.;:-")
+        uf = zona_match.group(2).upper()
+        if city:
+            return f"{city}/{uf}"
+    prefixed_patterns = [
+        r"(?i)^(?:decisoes?|decisões|jurisprudencia|jurisprudência)\s+d[oa]\s+(.+)$",
+        r"(?i)^municip(?:al|io)\s+de\s+(.+)$",
+        r"(?i)^tribunal de justi[cç]a d(?:e|o|a)\s+(.+)$",
+        r"(?i)^tribunal de justi[cç]a do estado d[eo]\s+(.+)$",
+        r"(?i)^ju[ií]zo eleitoral d[eo]\s+(.+)$",
+        r"(?i)^zona eleitoral d[ea]?\s+(.+)$",
+    ]
+    for pattern in prefixed_patterns:
+        match = re.match(pattern, value)
+        if not match:
+            continue
+        stripped = match.group(1).strip(" ,.;:-")
+        normalized = normalize_origem_value(stripped)
+        if normalized:
+            return normalized
+        value = stripped
+        normalized_key = normalize_class_text(value)
+        break
+    tse_uf_match = re.match(r"(?i)^tse[-/\s]?([a-z]{2})$", value)
+    if tse_uf_match:
+        return f"TRE/{tse_uf_match.group(1).upper()}"
+    tre_context_match = re.match(
+        r"(?i)^(?:titular|suplente|ju[ií]z(?:a)?|decisoes?|decisões|jurisprudencia|jurisprudência)\s+d[oa]\s+tre[-/\s]?([a-z]{2})$",
+        value,
+    )
+    if tre_context_match:
+        return f"TRE/{tre_context_match.group(1).upper()}"
+    tit_tre_match = re.search(r"(?i)\btre[-/\s]?([a-z]{2})\b", value)
+    if tit_tre_match and any(marker in normalized_key for marker in {"titular do tre", "suplente do tre", "juiz do tre"}):
+        return f"TRE/{tit_tre_match.group(1).upper()}"
+    if normalized_key in STATE_NAME_KEYS:
+        return ""
+    eleitoral_match = re.match(r"(?i)^eleitoral\s+de\s+(.+)$", value)
+    if eleitoral_match:
+        value = eleitoral_match.group(1).strip()
+        normalized_key = normalize_class_text(value)
+        if normalized_key in STATE_NAME_KEYS:
+            return ""
     if re.search(r"(?i)^tribunal regional eleitoral d(?:e|o|a)\s+", value):
         uf = extract_uf_from_text(value)
         return f"TRE/{uf}" if uf else ""
@@ -722,6 +1192,22 @@ def normalize_origem_value(value: str) -> str:
         uf = extract_uf_from_text(match.group(2).strip())
         if city and uf:
             return f"{city}/{uf}"
+    if any(
+        marker in normalized_key
+        for marker in [
+            "tribunal de justica",
+            "tribunal regional eleitoral",
+            "tribunal superior eleitoral",
+            "jurisprudencia",
+            "decisoes",
+            "decisões",
+            "municipal de",
+            "juizo eleitoral",
+            "juízo eleitoral",
+            "zona eleitoral",
+        ]
+    ):
+        return ""
     return value
 
 
@@ -751,6 +1237,22 @@ def normalize_tre(value: str, uf: str) -> str:
 
 
 def normalize_ministro_name(name: str) -> str:
+    raw_name = str(name or "").strip()
+    if not raw_name:
+        return ""
+    split_candidates = [part.strip() for part in re.split(r"\s*[;,]\s*", raw_name) if part.strip()]
+    if len(split_candidates) > 1:
+        preferred_markers = ("sucessor", "substituto", "atual", "novo relator", "nova relatora")
+        for part in split_candidates:
+            if any(marker in normalize_class_text(part) for marker in preferred_markers):
+                return normalize_ministro_name(part)
+        non_original_candidates = [
+            part for part in split_candidates if "original" not in normalize_class_text(part)
+        ]
+        if len(non_original_candidates) == 1:
+            return normalize_ministro_name(non_original_candidates[0])
+        return normalize_ministro_name(split_candidates[0])
+
     name = re.sub(r"\[\[.*?\]\]", "", name).strip()
     name = re.sub(r"\[[^\]]+\]\([^)]+\)", "", name).strip()
     name = name.replace("*", "")
@@ -790,6 +1292,27 @@ def normalize_pedido_vista_name(value: str) -> str:
 
 def normalize_pedido_vista_value(value: str) -> str:
     return normalize_pedido_vista_name(value) if value else ""
+
+
+def is_plausible_ministro_name(name: str) -> bool:
+    canonical = normalize_ministro_name(name)
+    if not canonical:
+        return False
+    bare = re.sub(r"^Min\.\s*", "", canonical).strip()
+    normalized = normalize_class_text(bare)
+    if not normalized:
+        return False
+    if any(char.isdigit() for char in normalized):
+        return False
+    tokens = normalized.split()
+    if len(tokens) < 2 or len(tokens) > 6:
+        return False
+    if any(token in MINISTRO_INVALID_NAME_TERMS for token in tokens):
+        return False
+    meaningful = [token for token in tokens if token not in MINISTRO_NAME_PARTICLES]
+    if len(meaningful) < 2:
+        return False
+    return True
 
 
 def normalize_composicao(value: str) -> str:
@@ -836,6 +1359,29 @@ def normalize_classe_processo(value: str) -> str:
     return value.strip()
 
 
+def identity_overlay_class_key(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    raw_upper = raw.upper().replace("–", "-").replace("—", "-")
+    for prefix, canonical in [("ED-", "ED-"), ("ED ", "ED-"), ("AGRG-", "AgRg-"), ("AGRG ", "AgRg-"), ("AGR-", "AgR-"), ("AGR ", "AgR-")]:
+        if raw_upper.startswith(prefix):
+            tail = raw[len(prefix) :].strip(" -")
+            tail_canon = normalize_classe_processo(tail) or tail.strip()
+            return f"{canonical}{tail_canon}".strip("-")
+    if raw_upper in {"QO"}:
+        return "QO"
+    if raw_upper in {"REF-TUTCAUTANT", "REF TUTCAUTANT"}:
+        return "Ref-TutCautAnt"
+    if raw_upper in {"REF.-MS", "REF-MS", "REF MS"}:
+        return "Ref.-MS"
+
+    canonical = normalize_classe_processo(raw)
+    if canonical.startswith(("ED-", "AgRg-", "AgR-")) or canonical in {"QO", "Ref-TutCautAnt", "Ref.-MS"}:
+        return canonical
+    return ""
+
+
 def normalize_resultado_piece(value: str, classe_processo: str, allowed: Optional[set[str]]) -> str:
     lowered = normalize_class_text(value)
     if not lowered:
@@ -856,12 +1402,16 @@ def normalize_resultado_piece(value: str, classe_processo: str, allowed: Optiona
         return ""
     if "suspens" in lowered and "vista" in lowered:
         return "Suspenso por vista"
+    if "consulta respondida" in lowered or "respondeu a consulta" in lowered:
+        return "Aprovada"
     if "nao conhecid" in lowered:
         return "Não conhecida" if "nao conhecida" in lowered else "Não conhecido"
     if re.search(r"\bprovido\b", lowered) and "nao conhec" in lowered and "desprov" not in lowered:
         return "Provido, Não conhecido"
     if "prejudic" in lowered and "desprov" in lowered:
         return "Prejudicado, Desprovido"
+    if re.search(r"proced[eê]n(?:cia|te)\s+parcial|procedente\s+em\s+parte", lowered):
+        return "Procedente em parte"
     if re.search(r"parcialmente\s+deferid", lowered):
         return "Parcialmente deferido"
     if "homologad" in lowered:
@@ -1085,8 +1635,16 @@ def normalize_youtube_link(value: str) -> str:
     return f"https://www.youtube.com/watch?{urlencode(params)}"
 
 
-def build_timestamped_youtube_link(value: str, start_seconds: int | None) -> str:
+def build_video_only_youtube_link(value: str) -> str:
     normalized = normalize_youtube_link(value)
+    video_id = extract_youtube_video_id(normalized)
+    if not video_id:
+        return value.strip()
+    return f"https://www.youtube.com/watch?{urlencode({'v': video_id})}"
+
+
+def build_timestamped_youtube_link(value: str, start_seconds: int | None) -> str:
+    normalized = build_video_only_youtube_link(value)
     video_id = extract_youtube_video_id(normalized)
     if not video_id:
         return value.strip()

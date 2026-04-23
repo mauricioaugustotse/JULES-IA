@@ -17,12 +17,18 @@ from pydantic import BaseModel, Field, ValidationError
 
 from local_secrets import get_secret, load_local_secrets
 from tse_normalization import (
+    STATE_NAME_KEYS,
+    STATE_UF,
+    build_video_only_youtube_link,
     build_timestamped_youtube_link,
     canonicalize_numero_processo,
     dedupe_preserve_order,
+    extract_chunk_judgment_process_values,
     extract_full_cnj,
+    format_short_process_number_from_digits,
     extract_uf_from_text,
     extract_youtube_video_id,
+    identity_overlay_class_key,
     normalize_advogados_list,
     normalize_class_text,
     normalize_classe_processo,
@@ -40,6 +46,7 @@ from tse_normalization import (
     normalize_votacao,
     normalize_youtube_link,
     parse_multi_value_text,
+    is_plausible_ministro_name,
     split_csv_like_text,
 )
 
@@ -72,6 +79,44 @@ GENERIC_THEME_CLASS_RESULT_REGEX = re.compile(
     r"))?$",
     flags=re.IGNORECASE,
 )
+GENERIC_THEME_DECISION_SENTENCE_REGEX = re.compile(
+    r"^(?:"
+    r"(?:o\s+)?(?:tribunal|plen[aá]rio|colegiado|relator)"
+    r"|por\s+unanimidade|por\s+maioria|unanimemente"
+    r")\b.*\b(?:"
+    r"negou\s+provimento|deu\s+provimento|proveu|desproveu|"
+    r"n[aã]o\s+conheceu|conheceu\s+e\s+deu\s+provimento|"
+    r"indeferiu|deferiu|rejeitou|acolheu|aprovou|"
+    r"julgou\s+(?:procedente|improcedente|prejudicado)|"
+    r"manteve|cassou|reformou"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+GENERIC_THEME_REPORTING_SENTENCE_REGEX = re.compile(
+    r"^(?:(?:al[eé]m disso|ainda|por fim|nesse contexto|nesse ponto)(?:,\s+|\s+))?"
+    r"(?:(?:o|a)\s+relator(?:a)?\s+)?"
+    r"(?:destacou|assinalou|observou|ressaltou|salientou|pontuou|consignou|"
+    r"afirmou|entendeu|registrou|reafirmou|frisou|anotou)\s+que\b",
+    flags=re.IGNORECASE,
+)
+TRUNCATED_PUNCHLINE_ENDING_REGEX = re.compile(
+    r"(?i)\b(?:para|com|de|do|da|dos|das|sobre|mediante|visando|quanto|pagamento|utilizacao|utilização|destinacao|destinação|custeio|art)\.?$"
+)
+
+OVERBROAD_THEME_VALUES = {
+    "fraude a cota de genero",
+    "propaganda eleitoral irregular",
+    "propaganda eleitoral antecipada",
+    "inelegibilidade",
+    "prestacao de contas",
+    "prestação de contas",
+    "prestacao de contas partidarias",
+    "prestação de contas partidárias",
+    "prestacao de contas de campanha",
+    "prestação de contas de campanha",
+    "publicidade institucional em periodo vedado",
+    "publicidade institucional em período vedado",
+}
 
 SAFE_DYNAMIC_SELECT_OPTIONS = {
     "classe_processo": {
@@ -86,6 +131,9 @@ SAFE_DYNAMIC_SELECT_OPTIONS = {
         "AgRg-RHC",
         "AgRg-RO",
         "AREspe",
+        "ADI",
+        "ADO",
+        "AIJE",
         "CTA",
         "Czer",
         "ED-AgRg-AREspe",
@@ -105,12 +153,18 @@ SAFE_DYNAMIC_SELECT_OPTIONS = {
         "Ref-TutCautAnt",
         "Ref.-MS",
         "REspe",
+        "Rp",
         "RHC",
         "RMS",
         "RO",
         "RPP",
         "RvE",
         "TutCautAnt",
+    },
+    "resultado": {
+        "Procedente",
+        "Procedente em parte",
+        "Improcedente",
     },
     "votacao": {"Unânime", "Por maioria", "Suspenso"},
     "relator": {
@@ -130,6 +184,11 @@ SAFE_DYNAMIC_SELECT_OPTIONS = {
         "Min. Vera Lúcia Santana Araújo",
     },
 }
+SCHEMA_EXPANDED_SELECT_PROPERTIES = {
+    "relator",
+    "pedido_vista",
+}
+TIPO_REGISTRO_DYNAMIC_RE = re.compile(r"^Julgamento\s+\d+$", re.IGNORECASE)
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -258,7 +317,6 @@ REFINE_START_LOOKAHEAD_SECONDS = int(os.getenv("REFINE_START_LOOKAHEAD_SECONDS")
 ENABLE_START_REFINEMENT = env_flag("TSE_ENABLE_START_REFINEMENT", True)
 ENABLE_TRANSITION_REFINEMENT = env_flag("TSE_ENABLE_TRANSITION_REFINEMENT", True)
 CONDITIONAL_START_REFINEMENT = env_flag("TSE_CONDITIONAL_START_REFINEMENT", True)
-GROUND_PROCESS_METADATA_FOR_ORIGEM_ONLY = env_flag("TSE_GROUND_ORIGEM_WITH_SEARCH", False)
 PREFERRED_GEMINI_MODELS = [DEFAULT_GEMINI_MODEL]
 GENERAL_NEWS_LIMIT = 9
 NOT_FOUND_TEXT_MARKERS = (
@@ -295,7 +353,7 @@ RECOMPUTED_ERROR_PATTERNS = (
 )
 RECOMPUTED_WARNING_PATTERNS = (
     re.compile(r"^(?:classe_processo|tipo_registro|eleicao|origem|relator|pedido_vista|resultado|votacao) fora das opções do Notion;", re.IGNORECASE),
-    re.compile(r"^(?:origem|partes|advogados|composicao) com opções novas no Notion:", re.IGNORECASE),
+    re.compile(r"^(?:classe_processo|tipo_registro|eleicao|origem|tribunal|relator|pedido_vista|resultado|votacao|partes|advogados|composicao) com opções novas no Notion:", re.IGNORECASE),
     re.compile(r"^Tema/título vazio\.$", re.IGNORECASE),
     re.compile(r"^Número do processo não identificado;", re.IGNORECASE),
     re.compile(r"^Data da sessão não identificada em formato ISO\.$", re.IGNORECASE),
@@ -326,6 +384,7 @@ NOTION_PROPERTY_MAP = {
     "precedentes_citados": "precedentes_citados",
     "raciocinio_juridico": "raciocinio_juridico",
     "resolucoes_citadas": "resoluções_citadas",
+    "materia_semelhante": "materia_semelhante",
     "data_sessao": "data_sessao",
     "noticia_TSE": "noticia_TSE",
     "noticia_TRE": "noticia_TRE",
@@ -512,6 +571,11 @@ def get_notion_api_key() -> str:
     return get_secret("NOTION_API_KEY", "NOTION_TOKEN", base_dir=SCRIPT_DIR)
 
 
+def get_openai_api_key() -> str:
+    load_runtime_secrets()
+    return get_secret("OPENAI_API_KEY", base_dir=SCRIPT_DIR)
+
+
 def chunk_rich_text(value: str, chunk_size: int = 1900) -> list[dict[str, Any]]:
     value = value or ""
     if not value:
@@ -611,14 +675,121 @@ def _clean_inferred_theme(value: str) -> str:
     return candidate[:1].upper() + candidate[1:]
 
 
+def _is_meta_legal_sentence(normalized: str) -> bool:
+    if re.match(
+        r"^(?:o|a)\s+(?:raciocinio juridico|raciocínio jurídico|fundamentacao normativa|fundamentação normativa|analise do conteudo juridico|análise do conteúdo jurídico)\b",
+        normalized,
+    ):
+        return True
+    return bool(GENERIC_THEME_REPORTING_SENTENCE_REGEX.match(normalized))
+
+
+def _has_legal_theme_anchor(normalized: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:"
+            r"fraude|cota de genero|cota de gênero|inelegibilidade|propaganda|prestacao de contas|prestação de contas|"
+            r"abuso de poder|lista triplice|lista tríplice|consulta|fundo partidario|fundo partidário|"
+            r"modulacao|modulação|representacao feminina|representação feminina|cassacao|cassação|"
+            r"desincompatibilizacao|desincompatibilização|conduta vedada|publicidade institucional|"
+            r"improbidade|retotalizacao|retotalização|paridade de genero|paridade de gênero"
+            r")\b",
+            normalized,
+        )
+    )
+
+
+def _looks_like_relational_case_stub(normalized: str) -> bool:
+    if re.match(
+        r"^(?:o\s+)?(?:caso|processo|recurso)\s+(?:do|da|de)\s+(?:municipio|município|cidade|estado|comarca|tre|tse)\b",
+        normalized,
+    ):
+        return True
+    if "relator ministro" in normalized or "relatora ministra" in normalized:
+        return not _has_legal_theme_anchor(normalized)
+    return False
+
+
+def _looks_like_meta_or_citation_punchline(normalized: str, raw_text: str = "") -> bool:
+    if re.match(r"^(?:o|a)\s+relator(?:a)?\b", normalized):
+        return True
+    if re.match(r"^(?:o|a)\s+voto\s+d[oa]\s+relator(?:a)?\b", normalized):
+        return True
+    if re.match(
+        r"^(?:negad[oa]|desprovid[oa]|provid[oa]|aprovad[oa]|indeferid[oa]|deferid[oa]|rejeitad[oa])\b",
+        normalized,
+    ):
+        return True
+    if re.match(r"^(?:o|minist[eé]rio p[uú]blico eleitoral|mpe)\s+recorreu\b", normalized):
+        return True
+    if re.match(r"^(?:trata(?:-|\s+)se de|precedentes?)\b", normalized):
+        return True
+    if re.match(r"^(?:art(?:\.|igo)?|lei|resolu[cç][aã]o|c[oó]digo eleitoral|lindb)\b", normalized):
+        return True
+    if re.search(r"\bacompanhad[oa]s?\s+pelos?\s+ministros?\b", normalized):
+        return True
+    if re.search(r"\bacompanharam\s+o\s+voto\b", normalized):
+        return True
+    text = normalize_model_text(raw_text)
+    if text.count(";") >= 1 and not re.search(r"\b(?:discute|examina|reconhece|afasta|define|permite|veda|mant[eé]m|cassa)\b", normalized):
+        return True
+    return False
+
+
+def _prefer_more_specific_theme(
+    row: "PublishPreviewRow",
+    current_candidate: str,
+    inferred_candidate: str,
+) -> str:
+    current = normalize_model_text(current_candidate)
+    inferred = normalize_model_text(inferred_candidate)
+    if not inferred:
+        return current
+    if not current or _tema_looks_generic(current, row):
+        return inferred
+    normalized_current = normalize_class_text(current)
+    normalized_inferred = normalize_class_text(inferred)
+    if normalized_current == normalized_inferred:
+        return current
+    if normalized_current in OVERBROAD_THEME_VALUES and len(normalized_inferred) > len(normalized_current) + 8:
+        return inferred
+    return current
+
+
 def infer_theme_from_row_text(row: "PublishPreviewRow") -> str:
     sources = [
+        " ".join(
+            value
+            for value in [
+                normalize_model_text(row.punchline),
+                normalize_model_text(row.analise_do_conteudo_juridico),
+                normalize_model_text(row.raciocinio_juridico),
+                normalize_model_text(row.fundamentacao_normativa),
+            ]
+            if value
+        ).strip(),
         normalize_model_text(row.punchline),
         normalize_model_text(row.analise_do_conteudo_juridico),
         normalize_model_text(row.raciocinio_juridico),
         normalize_model_text(row.fundamentacao_normativa),
     ]
     pattern_builders: list[tuple[re.Pattern[str], Any]] = [
+        (
+            re.compile(
+                r"(?is)fraude [àa] cota de g[eê]nero[\s\S]{0,420}(?:"
+                r"modula[cç][aã]o|modular os efeitos|representa[cç][aã]o feminina|"
+                r"efeitos contr[aá]rios [àa] pol[ií]tica afirmativa|redu[cç][aã]o da representa[cç][aã]o feminina"
+                r")"
+            ),
+            lambda m: "Fraude à cota de gênero e modulação dos efeitos da cassação",
+        ),
+        (
+            re.compile(
+                r"(?is)(?:a[cç][aã]o de impugna[cç][aã]o de mandato eletivo|aime)[\s\S]{0,240}fraude [àa] cota de g[eê]nero|"
+                r"fraude [àa] cota de g[eê]nero[\s\S]{0,240}(?:a[cç][aã]o de impugna[cç][aã]o de mandato eletivo|aime)"
+            ),
+            lambda m: "Fraude à cota de gênero em ação de impugnação de mandato eletivo",
+        ),
         (
             re.compile(r"(?i)erro material(?: de [^.,;]+)? no valor da multa"),
             lambda m: "Retificação de erro material no valor da multa",
@@ -628,8 +799,35 @@ def infer_theme_from_row_text(row: "PublishPreviewRow") -> str:
             lambda m: "Uso do Fundo Partidário para custear consultoria jurídica e contábil",
         ),
         (
+            re.compile(
+                r"(?is)(?:consulta[\s\S]{0,260}conduta vedada|conduta vedada[\s\S]{0,260}consulta)"
+                r"[\s\S]{0,260}(?:fatos e provas|casos concretos|aus[êe]ncia de abstra[cç][aã]o|"
+                r"incompat[ií]vel com o rito da consulta eleitoral|nao caber ao tse analisar a configuracao|"
+                r"não caber ao tse analisar a configuração)"
+            ),
+            lambda m: "Cabimento de consulta eleitoral para análise abstrata de conduta vedada",
+        ),
+        (
             re.compile(r"(?i)integridade do sistema eletr[oô]nico de vota[cç][aã]o"),
             lambda m: "Integridade do sistema eletrônico de votação nas eleições de 2022",
+        ),
+        (
+            re.compile(
+                r"(?is)prest[aã]?[cç][aã]o de contas[\s\S]{0,120}exerc[ií]cio de (?P<ano>\d{4})"
+                r"[\s\S]{0,220}devolu[cç][aã]o ao er[aá]rio"
+            ),
+            lambda m: f"Prestação de contas partidárias do exercício de {m.group('ano')} com devolução ao erário",
+        ),
+        (
+            re.compile(
+                r"(?is)contas? partid[aá]rias?[\s\S]{0,120}exerc[ií]cio de (?P<ano>\d{4})"
+                r"[\s\S]{0,220}devolu[cç][aã]o ao er[aá]rio"
+            ),
+            lambda m: f"Prestação de contas partidárias do exercício de {m.group('ano')} com devolução ao erário",
+        ),
+        (
+            re.compile(r"(?is)prest[aã]?[cç][aã]o de contas[\s\S]{0,120}exerc[ií]cio de (?P<ano>\d{4})"),
+            lambda m: f"Prestação de contas partidárias do exercício de {m.group('ano')}",
         ),
         (
             re.compile(r"(?i)inser[cç][õo]es de r[aá]dio.*segundo turno"),
@@ -668,8 +866,8 @@ def infer_theme_from_row_text(row: "PublishPreviewRow") -> str:
             lambda m: m.group(0),
         ),
         (
-            re.compile(r"(?i)inelegibilidade(?: [^.,;]+)?"),
-            lambda m: m.group(0),
+            re.compile(r"(?i)pedido de vista|adiamento do julgamento|julgamento adiado"),
+            lambda m: "Adiamento de julgamento por pedido de vista",
         ),
         (
             re.compile(r"(?i)objeto do conv[eê]nio foi executado integralmente"),
@@ -686,6 +884,28 @@ def infer_theme_from_row_text(row: "PublishPreviewRow") -> str:
         (
             re.compile(r"(?i)al[ií]nea g\b"),
             lambda m: "Inelegibilidade da alínea g da LC 64/1990",
+        ),
+        (
+            re.compile(r"(?i)(?:contagem do )?prazo de inelegibilidade[^.]{0,160}parcelamento da (?:pena de )?multa|parcelamento da (?:pena de )?multa[^.]{0,160}prazo de inelegibilidade"),
+            lambda m: "Prazo de inelegibilidade e parcelamento da pena de multa",
+        ),
+        (
+            re.compile(r"(?i)parcelamento da (?:pena de )?multa.*n[aã]o\s+(?:suspende|posterga|afasta).*inelegibilidade|inelegibilidade.*parcelamento da (?:pena de )?multa"),
+            lambda m: "Prazo de inelegibilidade e parcelamento da pena de multa",
+        ),
+        (
+            re.compile(
+                r"(?i)(?:"
+                r"(?:repasse|uso|desvirtuamento) de (?:verba|recursos)[^.]{0,220}(?:cota feminina|fefc)[^.]{0,220}candidat(?:o|ura)s?(?: do g[eê]nero)? mascul(?:ino|ina|inos|inas)"
+                r"|fundo especial de financiamento de campanha[^.]{0,220}cota feminina[^.]{0,220}candidat(?:o|ura)s?(?: do g[eê]nero)? mascul(?:ino|ina|inos|inas)"
+                r"|desvirtuamento de valores destinados [àa] cota feminina[^.]{0,220}candidat(?:o|ura)s? mascul(?:ino|ina|inos|inas)"
+                r")"
+            ),
+            lambda m: "Desvio de recursos da cota feminina do FEFC para candidatura masculina",
+        ),
+        (
+            re.compile(r"(?i)inelegibilidade(?: [^.,;]+)?"),
+            lambda m: m.group(0),
         ),
         (
             re.compile(r"(?i)medidas cautelares? de busca e apreens[aã]o,? sequestro e bloqueio de bens e valores"),
@@ -743,7 +963,17 @@ def _tema_looks_generic(value: str, row: "PublishPreviewRow") -> bool:
         return True
     if _looks_like_process_number_theme(value, row):
         return True
+    if _is_meta_legal_sentence(normalized):
+        return True
+    if _looks_like_relational_case_stub(normalized):
+        return True
+    if re.match(r"^(?:o|a)\s+(?:processo|caso|feito)\s+(?:trata|discute|versa)\s+(?:de|sobre)\b", normalized):
+        return True
     if GENERIC_THEME_CLASS_RESULT_REGEX.fullmatch(normalized):
+        return True
+    if GENERIC_THEME_DECISION_SENTENCE_REGEX.match(normalized):
+        return True
+    if GENERIC_THEME_REPORTING_SENTENCE_REGEX.match(normalized):
         return True
     generic_candidates = {
         normalize_class_text(row.classe_processo),
@@ -778,6 +1008,13 @@ def _tema_looks_generic(value: str, row: "PublishPreviewRow") -> bool:
         "unânime",
         "por maioria",
         "inelegibilidade",
+        "prestacao de contas",
+        "prestação de contas",
+        "prestacao de contas partidarias",
+        "prestação de contas partidárias",
+        "prestacao de contas de campanha",
+        "prestação de contas de campanha",
+        "regularidade das contas",
     }
 
 
@@ -786,10 +1023,21 @@ def tema_looks_generic(value: str, row: "PublishPreviewRow") -> bool:
 
 
 def build_fallback_tema(row: "PublishPreviewRow") -> str:
+    inferred = infer_theme_from_row_text(row)
     candidates = [
-        ((row.tema or "").strip() if not _tema_looks_generic((row.tema or "").strip(), row) else ""),
-        ((row.punchline or "").strip().rstrip(".") if not _looks_like_process_number_theme((row.punchline or "").strip(), row) else ""),
-        infer_theme_from_row_text(row),
+        _prefer_more_specific_theme(
+            row,
+            (row.tema or "").strip() if not _tema_looks_generic((row.tema or "").strip(), row) else "",
+            inferred,
+        ),
+        _prefer_more_specific_theme(
+            row,
+            (row.punchline or "").strip().rstrip(".")
+            if not _tema_looks_generic((row.punchline or "").strip(), row)
+            else "",
+            inferred,
+        ),
+        inferred,
     ]
     for candidate in candidates:
         if candidate:
@@ -889,8 +1137,10 @@ def _build_row_inference_text(row: "PublishPreviewRow") -> str:
     return "\n".join(
         value
         for value in [
+            normalize_model_text(getattr(row, "title_hint", "")),
             normalize_model_text(row.tema),
             normalize_model_text(row.punchline),
+            normalize_model_text(row.resultado),
             normalize_model_text(row.analise_do_conteudo_juridico),
             normalize_model_text(row.raciocinio_juridico),
             normalize_model_text(row.fundamentacao_normativa),
@@ -898,6 +1148,286 @@ def _build_row_inference_text(row: "PublishPreviewRow") -> str:
         ]
         if value
     ).strip()
+
+
+def infer_full_numero_processo_from_row_text(row: "PublishPreviewRow") -> str:
+    text = _build_row_inference_text(row)
+    if not text:
+        return ""
+    expected = canonicalize_numero_processo(row.numero_processo)
+    pattern = re.compile(r"\b\d{6,7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b")
+    for match in pattern.finditer(text):
+        candidate = match.group(0)
+        if not expected or canonicalize_numero_processo(candidate) == expected:
+            return candidate
+    fallback = extract_full_cnj(text)
+    if fallback and (not expected or canonicalize_numero_processo(fallback) == expected):
+        return fallback
+    return ""
+
+
+def _merge_special_numero_processo(current: str, candidate: str) -> str:
+    current_display = normalize_numero_processo_display(current)
+    candidate_display = normalize_numero_processo_display(candidate)
+    if not candidate_display:
+        return current_display
+    if not current_display:
+        return candidate_display
+    if canonicalize_numero_processo(current_display) == canonicalize_numero_processo(candidate_display):
+        return candidate_display
+    current_digits = re.sub(r"\D", "", current_display)
+    candidate_digits = re.sub(r"\D", "", candidate_display)
+    if current_digits and current_digits == candidate_digits:
+        current_has_label = bool(re.search(r"\b(?:ADI|ADO)\b", current_display, flags=re.IGNORECASE))
+        candidate_has_label = bool(re.search(r"\b(?:ADI|ADO)\b", candidate_display, flags=re.IGNORECASE))
+        if candidate_has_label and not current_has_label:
+            return candidate_display
+        if len(candidate_display) > len(current_display):
+            return candidate_display
+    return current_display
+
+
+def infer_special_numero_processo_from_row_text(row: "PublishPreviewRow") -> str:
+    text = _build_row_inference_text(row)
+    if not text:
+        return ""
+    current_display = normalize_numero_processo_display(row.numero_processo)
+    current_digits = re.sub(r"\D", "", current_display)
+    special_matches = [
+        f"{match.group('label').upper()} {match.group('number').lstrip('0') or '0'}"
+        for match in re.finditer(r"(?i)\b(?P<label>ADI|ADO)\s*(?P<number>\d{1,5})\b", text)
+    ]
+    for candidate in special_matches:
+        candidate_digits = re.sub(r"\D", "", candidate)
+        if not current_display or current_digits == candidate_digits or current_display.upper() == candidate.upper():
+            return candidate
+    for match in re.finditer(r"(?i)\b(?:re?sp(?:e)?|arespe|aresp|rhc|rms|ms|ro)\s*(\d{6,9})\b", text):
+        candidate = format_short_process_number_from_digits(match.group(1))
+        if not candidate:
+            continue
+        candidate_digits = re.sub(r"\D", "", candidate)
+        if not current_display or current_digits == candidate_digits:
+            return candidate
+    return ""
+
+
+def _clean_inferred_punchline(value: str, row: "PublishPreviewRow") -> str:
+    candidate = normalize_model_text(value).strip()
+    if not candidate:
+        return ""
+    candidate = re.sub(r"\s+", " ", candidate)
+    sentences = [
+        sentence.strip(" .;,:-")
+        for sentence in re.split(r"(?<=[.!?])\s+", candidate)
+        if sentence.strip(" .;,:-")
+    ]
+    if sentences:
+        candidate = sentences[0]
+        for sentence in sentences:
+            normalized_sentence = normalize_class_text(sentence)
+            if GENERIC_THEME_DECISION_SENTENCE_REGEX.match(normalized_sentence):
+                continue
+            if _is_meta_legal_sentence(normalized_sentence):
+                continue
+            if _looks_like_relational_case_stub(normalized_sentence):
+                continue
+            if _looks_like_meta_or_citation_punchline(normalized_sentence, sentence):
+                continue
+            if re.match(
+                r"^(?:o|a)\s+(?:processo|caso|acao|ação|recurso)\s+(?:trata|discute|versa)\s+(?:de|sobre)\b",
+                normalized_sentence,
+            ):
+                continue
+            if len(sentence) >= 20:
+                candidate = sentence
+                break
+    else:
+        candidate = candidate.strip(" .;,:-")
+    candidate = re.sub(
+        r"(?i)^o processo\s+\d[\d.\-]*\s+(?:trata|discute|versa)\s+(?:de|sobre)\s+",
+        "",
+        candidate,
+    ).strip(" .;,:-")
+    if not candidate:
+        return ""
+    normalized = normalize_class_text(candidate)
+    if not normalized or GENERIC_THEME_DECISION_SENTENCE_REGEX.match(normalized):
+        return ""
+    if _is_meta_legal_sentence(normalized):
+        return ""
+    if _looks_like_relational_case_stub(normalized):
+        return ""
+    if _looks_like_meta_or_citation_punchline(normalized, candidate):
+        return ""
+    if re.match(
+        r"^(?:o processo|o caso|a acao|a ação|trata(?:-|\s+)se de)\b",
+        normalized,
+    ) and re.search(
+        r"\b(?:consulta|acao de investigacao judicial eleitoral|representacao|prestacao de contas|lista triplice|agravo|recurso)\b",
+        normalized,
+    ):
+        return ""
+    if _looks_like_process_number_theme(candidate, row):
+        return ""
+    generic_candidates = {
+        normalize_class_text(row.tema),
+        normalize_class_text(row.resultado),
+        normalize_class_text(row.votacao),
+        normalize_class_text(" ".join(part for part in [row.classe_processo, row.resultado] if part)),
+    }
+    generic_candidates.discard("")
+    if normalized in generic_candidates:
+        return ""
+    if len(candidate) < 12:
+        return ""
+    if TRUNCATED_PUNCHLINE_ENDING_REGEX.search(candidate) and not re.search(r"[.!?]$", normalize_model_text(value)):
+        return ""
+    if len(candidate) > 180:
+        return ""
+    if TRUNCATED_PUNCHLINE_ENDING_REGEX.search(candidate):
+        return ""
+    if not candidate:
+        return ""
+    candidate = candidate[:1].upper() + candidate[1:]
+    return candidate if candidate.endswith((".", "!", "?")) else f"{candidate}."
+
+
+def infer_punchline_from_row_text(row: "PublishPreviewRow") -> str:
+    combined_text = " ".join(
+        value
+        for value in [
+            normalize_model_text(row.analise_do_conteudo_juridico),
+            normalize_model_text(row.raciocinio_juridico),
+            normalize_model_text(row.fundamentacao_normativa),
+            normalize_model_text(row.precedentes_citados),
+        ]
+        if value
+    ).strip()
+    normalized_combined = normalize_class_text(combined_text)
+    punchline_patterns: list[tuple[re.Pattern[str], str]] = [
+        (
+            re.compile(
+                r"(?is)fraude [àa] cota de g[eê]nero[\s\S]{0,420}(?:"
+                r"modula[cç][aã]o|modular os efeitos|representa[cç][aã]o feminina|"
+                r"efeitos contr[aá]rios [àa] pol[ií]tica afirmativa|redu[cç][aã]o da representa[cç][aã]o feminina"
+                r")"
+            ),
+            "",
+        ),
+        (
+            re.compile(r"(?i)fundo partid[aá]rio.*consultoria jur[ií]dica e cont[aá]bil.*defesa de filiados"),
+            "Consulta sobre uso do Fundo Partidário para custear consultoria jurídica e contábil em defesa de filiados.",
+        ),
+        (
+            re.compile(
+                r"(?i)(?:consulta(?: formulada)?|possibilidade de utiliza[cç][aã]o).*"
+                r"fundo partid[aá]rio.*"
+                r"(?:despesas?|pagamento).*"
+                r"consultoria jur[ií]dica e cont[aá]bil"
+            ),
+            "Consulta sobre uso do Fundo Partidário para custear consultoria jurídica e contábil.",
+        ),
+        (
+            re.compile(r"(?i)pedido de vista|adiamento do julgamento|julgamento adiado"),
+            "Julgamento adiado por pedido de vista.",
+        ),
+    ]
+    for pattern, template in punchline_patterns:
+        if pattern.search(combined_text):
+            if not template:
+                location = normalize_model_text(row.origem)
+                if row.resultado == "Suspenso por vista":
+                    base = "Julgamento sobre fraude à cota de gênero"
+                    if location:
+                        base += f" em {location}"
+                    candidate = (
+                        f"{base} foi suspenso por vista após debate sobre modulação dos efeitos da cassação "
+                        "e preservação da representação feminina."
+                    )
+                    candidate = _clean_inferred_punchline(candidate, row)
+                    if candidate:
+                        return candidate
+                candidate = _clean_inferred_punchline(
+                    "Fraude à cota de gênero com debate sobre modulação dos efeitos da cassação e preservação da representação feminina.",
+                    row,
+                )
+                if candidate:
+                    return candidate
+                continue
+            candidate = _clean_inferred_punchline(template, row)
+            if candidate:
+                return candidate
+    sources = [
+        row.analise_do_conteudo_juridico,
+        row.raciocinio_juridico,
+        row.fundamentacao_normativa,
+        row.precedentes_citados,
+    ]
+    for source in sources:
+        candidate = _clean_inferred_punchline(source, row)
+        if candidate:
+            return candidate
+    fallback_theme = build_fallback_tema(row)
+    if fallback_theme and not _tema_looks_generic(fallback_theme, row):
+        normalized_theme = normalize_class_text(fallback_theme)
+        theme_subject = fallback_theme[:1].lower() + fallback_theme[1:].rstrip(".")
+        location = normalize_model_text(row.origem)
+        location_suffix = f" em {location}" if location and location not in {"TSE"} else ""
+        if "pedido de vista" in normalized_theme:
+            return "Julgamento adiado por pedido de vista."
+        if row.resultado:
+            if row.resultado == "Aprovada" and row.classe_processo == "CTA":
+                return f"Consulta sobre {theme_subject}."
+            if row.resultado == "Suspenso por vista":
+                return f"Julgamento sobre {theme_subject}{location_suffix} foi suspenso por pedido de vista."
+        if normalized_combined:
+            return f"Julgamento sobre {theme_subject}{location_suffix}."
+        return f"Julgamento sobre {theme_subject}{location_suffix}."
+    return ""
+
+
+def punchline_looks_generic(value: str, row: "PublishPreviewRow") -> bool:
+    text = normalize_model_text(value)
+    normalized = normalize_class_text(text)
+    if not normalized:
+        return True
+    if normalized in {
+        "julgamento adiado por pedido de vista",
+        "julgamento suspenso por pedido de vista",
+    }:
+        return False
+    if _is_meta_legal_sentence(normalized):
+        return True
+    if _looks_like_relational_case_stub(normalized):
+        return True
+    if _looks_like_meta_or_citation_punchline(normalized, text):
+        return True
+    if re.match(
+        r"^(?:o|a)\s+(?:processo|caso|recurso|acao|ação)\s+(?:trata|discute|versa)\s+(?:de|sobre)\b",
+        normalized,
+    ):
+        return True
+    if re.match(
+        r"^trata(?:-|\s+)se de\b",
+        normalized,
+    ):
+        return True
+    if GENERIC_THEME_DECISION_SENTENCE_REGEX.match(normalized):
+        return True
+    if _looks_like_process_number_theme(value, row):
+        return True
+    if len(text.strip()) < 18:
+        return True
+    if TRUNCATED_PUNCHLINE_ENDING_REGEX.search(text.strip()):
+        return True
+    generic_candidates = {
+        normalize_class_text(row.tema),
+        normalize_class_text(row.resultado),
+        normalize_class_text(row.votacao),
+        normalize_class_text(" ".join(part for part in [row.resultado, row.votacao] if part)),
+    }
+    generic_candidates.discard("")
+    return normalized in generic_candidates
 
 
 def _trim_person_capture(value: str) -> str:
@@ -934,6 +1464,95 @@ def infer_relator_from_row_text(row: "PublishPreviewRow") -> str:
     return ""
 
 
+def infer_pedido_vista_from_row_text(row: "PublishPreviewRow") -> str:
+    text = _build_row_inference_text(row)
+    if not text:
+        return ""
+    patterns = [
+        r"(?i)\bvoto-?vista d[oa]\s+(?:ministro|ministra|min\.)\s+([^,.;:\n]+)",
+        r"(?i)\bpedido de vista d[oa]\s+(?:ministro|ministra|min\.)\s+([^,.;:\n]+)",
+        r"(?i)\bpedido de vista pel[oa]\s+(?:ministro|ministra|min\.)\s+([^,.;:\n]+)",
+        r"(?i)\b(?:ministro|ministra|min\.)\s+([^,.;:\n]+?)\s+apresentou\s+seu?\s+voto-?vista\b",
+        r"(?i)\b(?:ministro|ministra|min\.)\s+([^,.;:\n]+?)\s+pediu\s+vista\b",
+        r"(?i)\b(?:ministro|ministra|min\.)\s+([^,.;:\n]+?)\s+proferiu\s+voto-?vista\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        candidate = normalize_pedido_vista_value(_trim_person_capture(match.group(1)))
+        if candidate:
+            return candidate
+    return ""
+
+
+def extract_ministro_roles_from_composition_entries(values: list[str]) -> tuple[str, str]:
+    relator = ""
+    pedido_vista = ""
+    for raw_value in values or []:
+        raw_text = str(raw_value or "").strip()
+        if not raw_text:
+            continue
+        normalized = normalize_class_text(raw_text)
+        if not relator and re.search(r"(?i)\brelator(?:a)?\b", raw_text):
+            candidate = normalize_ministro_name(raw_text)
+            if candidate and is_plausible_ministro_name(candidate):
+                relator = candidate
+        if not pedido_vista and any(marker in normalized for marker in ("voto vista", "votovista", "pedido de vista", "vista")):
+            candidate = normalize_pedido_vista_value(raw_text)
+            if candidate and is_plausible_ministro_name(candidate):
+                pedido_vista = candidate
+        if relator and pedido_vista:
+            break
+    return relator, pedido_vista
+
+
+def _canonicalize_person_select_value(
+    value: str,
+    *,
+    notion_name: str,
+    notion_schema: "NotionDataSourceSchema" | None = None,
+) -> str:
+    normalizer = normalize_ministro_name if notion_name == "relator" else normalize_pedido_vista_value
+    candidate = normalizer(value)
+    if not candidate or not is_plausible_ministro_name(candidate):
+        return ""
+    if notion_schema is None:
+        return candidate
+    prop = notion_schema.properties.get(notion_name)
+    if not prop:
+        return candidate
+    candidate_key = normalize_class_text(re.sub(r"^Min\.\s*", "", candidate))
+    for option in prop.options:
+        option_candidate = normalizer(option)
+        option_key = normalize_class_text(re.sub(r"^Min\.\s*", "", option_candidate))
+        if option_key and option_key == candidate_key:
+            return option_candidate
+    return candidate
+
+
+def _controlled_select_value_can_expand(
+    notion_name: str,
+    value: str,
+    row: "PublishPreviewRow",
+) -> bool:
+    if not value:
+        return False
+    if notion_name == "tipo_registro":
+        return bool(TIPO_REGISTRO_DYNAMIC_RE.match(value))
+    if notion_name == "classe_processo":
+        return value == normalize_classe_processo(value)
+    if notion_name == "resultado":
+        return value == normalize_resultado_final(value, row.classe_processo)
+    if notion_name == "votacao":
+        return value == normalize_votacao(value)
+    if notion_name == "eleicao":
+        return value == normalize_eleicao_value(value)
+    if notion_name == "tribunal":
+        return value == normalize_tre(value, extract_uf_from_text(row.origem))
+    return False
+
+
 def infer_votacao_from_row_text(row: "PublishPreviewRow") -> str:
     text = normalize_class_text(_build_row_inference_text(row))
     if not text:
@@ -956,15 +1575,114 @@ def infer_votacao_from_row_text(row: "PublishPreviewRow") -> str:
     return ""
 
 
+def infer_resultado_from_row_text(row: "PublishPreviewRow") -> str:
+    classe = normalize_classe_processo(row.classe_processo) if row.classe_processo else ""
+    candidate_texts = [
+        row.punchline,
+        row.raciocinio_juridico,
+        row.analise_do_conteudo_juridico,
+    ]
+    for text in candidate_texts:
+        normalized = normalize_class_text(text)
+        if not normalized:
+            continue
+        if re.search(r"\bjulgar?\s+improcedente\b|\bimprocedente\b", normalized):
+            return "Improcedente"
+        if re.search(r"proced[eê]n(?:cia|te)\s+parcial|procedente\s+em\s+parte", normalized):
+            return "Procedente em parte"
+        if re.search(r"\bjulgar?\s+procedente\b|\bprocedente\b", normalized):
+            return "Procedente"
+        if re.search(r"\bjulgar?\s+parcialmente\s+procedente\b|\bparcialmente\s+procedente\b", normalized):
+            return "Procedente em parte"
+        if "consulta respondida" in normalized or "respondeu a consulta" in normalized:
+            return "Aprovada"
+        if "lista triplice acolhida" in normalized or "lista tríplice acolhida" in normalized:
+            return "Acolhidos"
+        inferred = normalize_resultado_final(text, classe)
+        if inferred and inferred != text.strip() and len(inferred) <= 40:
+            return inferred
+    return ""
+
+
+def _classe_processo_specificity(value: str, row: "PublishPreviewRow") -> int:
+    classe = normalize_classe_processo(value)
+    if not classe:
+        return 0
+    if classe == "PA":
+        return 1
+    if classe in {"ADI", "ADO"}:
+        special_numero = normalize_class_text(row.numero_processo)
+        if re.search(rf"\b{classe.lower()}\s+\d+\b", special_numero):
+            return 5
+        if re.search(rf"\b{classe.lower()}\b", normalize_class_text(_build_row_inference_text(row))):
+            return 4
+        return 1
+    if classe in {"CTA", "Lista Tríplice"}:
+        return 3
+    if classe.startswith("AgRg") or classe.startswith("ED-"):
+        return 5
+    return 4
+
+
+def should_replace_classe_processo(
+    current: str,
+    candidate: str,
+    row: "PublishPreviewRow",
+) -> bool:
+    current_norm = normalize_classe_processo(current)
+    candidate_norm = normalize_classe_processo(candidate)
+    if not candidate_norm or candidate_norm == current_norm:
+        return False
+    if not current_norm:
+        return True
+    if candidate_norm in {"ADI", "ADO"} and current_norm not in {"ADI", "ADO"}:
+        numero_text = normalize_numero_processo_display(row.numero_processo)
+        if not re.fullmatch(rf"{candidate_norm}\s+\d+", numero_text, flags=re.IGNORECASE):
+            return False
+    current_score = _classe_processo_specificity(current_norm, row)
+    candidate_score = _classe_processo_specificity(candidate_norm, row)
+    if candidate_score > current_score:
+        return True
+    if current_norm in {"PA", "ADI", "ADO"} and candidate_norm not in {"PA", "ADI", "ADO"}:
+        return True
+    return False
+
+
 def infer_classe_from_row_text(row: "PublishPreviewRow") -> str:
     text = _build_row_inference_text(row)
     normalized = normalize_class_text(text)
     if not normalized:
         return ""
+    arespe_markers = [
+        "agravo em recurso especial eleitoral",
+        "agravos em recurso especial eleitoral",
+        "agravo em recurso especial",
+        "agravos em recurso especial",
+    ]
+    if "agravo regimental" in normalized and (any(marker in normalized for marker in arespe_markers) or "arespe" in normalized):
+        return "AgRg-AREspe"
+    if "agravo regimental" in normalized and ("recurso especial eleitoral" in normalized or "respe" in normalized):
+        return "AgRg-REspe"
+    if any(marker in normalized for marker in arespe_markers) or re.search(r"\barespe\b", normalized):
+        return "AREspe"
+    if "acao de investigacao judicial eleitoral" in normalized or "ação de investigação judicial eleitoral" in normalized:
+        return "AIJE"
+    if "representacao por propaganda eleitoral irregular" in normalized or "representação por propaganda eleitoral irregular" in normalized:
+        return "Rp"
+    if "prestacao de contas" in normalized or "prestação de contas" in normalized:
+        return "PC"
+    if "acao direta de inconstitucionalidade por omissao" in normalized or re.search(r"\bado\s+\d+\b", normalized):
+        return "ADO"
+    if "acao direta de inconstitucionalidade" in normalized or re.search(r"\badi\s+\d+\b", normalized):
+        return "ADI"
     if "lista triplice" in normalized or "lista tríplice" in normalized:
         return "Lista Tríplice"
     if "consulta formulada" in normalized or normalized.startswith("consulta ") or "trata de uma consulta" in normalized:
         return "CTA"
+    if "recurso ordinario eleitoral" in normalized:
+        return "RO"
+    if "forca federal" in normalized or "força federal" in normalized:
+        return "PA"
     if "agravo regimental" in normalized and "habeas corpus" in normalized:
         return "AgRg-HC"
     if "recurso especial eleitoral" in normalized or "recursos especiais" in normalized or "recurso especial" in normalized:
@@ -994,6 +1712,9 @@ def infer_origin_from_row_text(row: "PublishPreviewRow") -> str:
     text = _build_row_inference_text(row)
     if not text:
         return ""
+    normalized_text = normalize_class_text(text)
+    if "tribunais regionais eleitorais" in normalized_text:
+        return ""
     city_pattern = (
         r"\b("
         r"[A-ZÁÀÃÂÉÊÍÓÔÕÚÇ][A-Za-zÁÀÃÂÉÊÍÓÔÕÚÇáàãâéêíóôõúç'`´.\-]+"
@@ -1006,9 +1727,49 @@ def infer_origin_from_row_text(row: "PublishPreviewRow") -> str:
     for match in reversed(matches):
         city = match.group(1).strip(" ,.;:-")
         uf = match.group(2).upper()
-        if city and not city.upper().startswith("TRE"):
+        normalized_city = normalize_class_text(city)
+        if (
+            city
+            and not city.upper().startswith("TRE")
+            and "," not in city
+            and normalized_city not in STATE_NAME_KEYS
+        ):
             return f"{city}/{uf}"
+    tre_sigla = re.search(r"\bTRE[-/ ]([A-Z]{2})\b", text, flags=re.IGNORECASE)
+    if tre_sigla:
+        return f"TRE/{tre_sigla.group(1).upper()}"
+    tre_extenso = re.search(
+        r"(?i)\bTribunal Regional Eleitoral d(?:e|o|a)\s+([A-Za-zÀ-ÿ ]+)",
+        text,
+    )
+    if tre_extenso:
+        state_name = normalize_class_text(tre_extenso.group(1))
+        for state, uf in STATE_UF.items():
+            if state in state_name:
+                return f"TRE/{uf}"
+    if re.search(r"(?i)\bTribunal Superior Eleitoral\b|\bTSE\b", text):
+        return "TSE"
     return ""
+
+
+def row_indicates_suspension_by_vista(row: "PublishPreviewRow") -> bool:
+    if row.resultado == "Suspenso por vista":
+        return True
+    if row.votacao == "Suspenso":
+        combined = normalize_class_text(
+            "\n".join(
+                value
+                for value in [
+                    row.tema,
+                    row.punchline,
+                    row.analise_do_conteudo_juridico,
+                    row.raciocinio_juridico,
+                ]
+                if value
+            )
+        )
+        return bool(row.pedido_vista) or ("vista" in combined)
+    return False
 
 
 def format_transcript_snippet(snippet: TranscriptSnippet) -> str:
@@ -1103,7 +1864,7 @@ def normalize_party_list(values: list[str]) -> list[str]:
 
 
 def normalize_advogado_list(values: list[str]) -> list[str]:
-    normalized = normalize_advogados_list(", ".join(values))
+    normalized = normalize_advogados_list(values)
     return split_csv_like_text(normalized)
 
 
@@ -1117,10 +1878,12 @@ def _composition_quality(values: list[str]) -> tuple[int, int]:
     count = len(normalized)
     if count == 7:
         return (100, count)
-    if 5 <= count <= 9:
-        return (90 - abs(7 - count), count)
-    if 1 <= count < 5:
-        return (50 + count, count)
+    if count == 6:
+        return (99, count)
+    if count > 7:
+        return (10 - min(count - 8, 9), -count)
+    if 1 <= count < 6:
+        return (count, count)
     return (0, count)
 
 
@@ -1478,6 +2241,60 @@ def build_process_metadata_context(row: "PublishPreviewRow") -> str:
     return "\n".join(lines)
 
 
+def _normalize_local_judgment_probe(value: str) -> str:
+    normalized = normalize_class_text(unescape(str(value or "")))
+    if not normalized:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", normalized)
+
+
+def _row_has_strong_local_judgment_evidence(row: "PublishPreviewRow", artifact_store: "RunArtifacts") -> bool:
+    probes = {
+        _normalize_local_judgment_probe(row.numero_processo),
+        _normalize_local_judgment_probe(normalize_numero_processo_display(row.numero_processo)),
+        _normalize_local_judgment_probe(canonicalize_numero_processo(row.numero_processo)),
+        _normalize_local_judgment_probe(row.tema),
+    }
+    special_key = ""
+    canonical_process = canonicalize_numero_processo(row.numero_processo)
+    overlay_key = identity_overlay_class_key(row.classe_processo) or identity_overlay_class_key(row.tema)
+    if canonical_process and overlay_key:
+        special_key = f"{overlay_key} {canonical_process}"
+    probes.add(_normalize_local_judgment_probe(special_key))
+    probes.discard("")
+    if not probes:
+        return False
+
+    matched_chunks: set[str] = set()
+    for chunk_path in sorted(artifact_store.root_dir.glob("raw_global_response_chunk_*.txt")):
+        try:
+            payload = json.loads(chunk_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, list):
+            continue
+        for session_payload in payload:
+            if not isinstance(session_payload, dict):
+                continue
+            judgments = session_payload.get("julgamentos") or []
+            if not isinstance(judgments, list):
+                continue
+            for judgment in judgments:
+                if not isinstance(judgment, dict) or judgment.get("should_ignore") is True:
+                    continue
+                for raw_value in extract_chunk_judgment_process_values(judgment):
+                    chunk_probe = _normalize_local_judgment_probe(raw_value)
+                    if not chunk_probe:
+                        continue
+                    if any(
+                        probe == chunk_probe or probe in chunk_probe or chunk_probe in probe
+                        for probe in probes
+                    ):
+                        matched_chunks.add(chunk_path.name)
+                        break
+    return len(matched_chunks) >= 2 or (bool(overlay_key) and len(matched_chunks) >= 1)
+
+
 def require_google_genai():
     try:
         from google import genai
@@ -1662,6 +2479,7 @@ class PublishPreviewRow(BaseModel):
     precedentes_citados: str = ""
     raciocinio_juridico: str = ""
     resolucoes_citadas: str = ""
+    materia_semelhante: list[str] = Field(default_factory=list)
     noticia_TSE: str = ""
     noticia_TRE: str = ""
     noticias_gerais: list[str] = Field(default_factory=list)
@@ -1711,6 +2529,7 @@ class PublishPreviewRow(BaseModel):
             "precedentes_citados": self.precedentes_citados,
             "raciocinio_juridico": self.raciocinio_juridico,
             "resolucoes_citadas": self.resolucoes_citadas,
+            "materia_semelhante": ", ".join(self.materia_semelhante),
             "noticia_TSE": self.noticia_TSE,
             "noticia_TRE": self.noticia_TRE,
             "noticias_gerais": ", ".join(self.noticias_gerais),
@@ -2004,6 +2823,7 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
             precedentes_citados=str(record.get("precedentes_citados", "") or ""),
             raciocinio_juridico=str(record.get("raciocinio_juridico", "") or ""),
             resolucoes_citadas=str(record.get("resolucoes_citadas", "") or ""),
+            materia_semelhante=parse_multi_value_text(record.get("materia_semelhante", "")),
             noticia_TSE=str(record.get("noticia_TSE", "") or ""),
             noticia_TRE=str(record.get("noticia_TRE", "") or ""),
             noticias_gerais=parse_multi_value_text(record.get("noticias_gerais", "")),
@@ -2718,16 +3538,37 @@ Contexto global:
                 index,
                 exc,
             )
-            transcript_chunk = self._build_transcript_detail_chunk(
-                youtube_url,
-                start_seconds=refined_start_seconds,
-                end_seconds=window.end_seconds,
+            bundle = self._extract_judgment_bundle_from_transcript(
+                youtube_url=youtube_url,
+                session=session,
+                window=window,
+                index=index,
+                refined_start_seconds=refined_start_seconds,
             )
-            self.artifact_store.write_text(
-                f"raw_detail_transcript_{index:02d}.input.txt",
-                transcript_chunk.text,
-            )
-            transcript_prompt = f"""
+        bundle.title_hint = window.title_hint
+        bundle.start_seconds = refined_start_seconds
+        bundle.end_seconds = window.end_seconds
+        return bundle
+
+    def _extract_judgment_bundle_from_transcript(
+        self,
+        *,
+        youtube_url: str,
+        session: SessionExtraction,
+        window: SessionWindow,
+        index: int,
+        refined_start_seconds: int,
+    ) -> JudgmentBundleExtraction:
+        transcript_chunk = self._build_transcript_detail_chunk(
+            youtube_url,
+            start_seconds=refined_start_seconds,
+            end_seconds=window.end_seconds,
+        )
+        self.artifact_store.write_text(
+            f"raw_detail_transcript_{index:02d}.input.txt",
+            transcript_chunk.text,
+        )
+        transcript_prompt = f"""
 Analise o julgamento abaixo com base exclusivamente na transcrição do próprio vídeo.
 
 Contexto global:
@@ -2748,16 +3589,12 @@ Regras:
 - Se o trecho for apenas julgamento em lista, marque should_ignore=true e explique.
 - Seja fiel apenas ao que estiver explicitamente transcrito.
 """
-            bundle = self._call_gemini_text(
-                prompt=transcript_prompt,
-                response_model=JudgmentBundleExtraction,
-                system_prompt=TRANSCRIPT_DETAIL_SYSTEM_PROMPT,
-                artifact_name=f"raw_detail_transcript_{index:02d}.txt",
-            )
-        bundle.title_hint = window.title_hint
-        bundle.start_seconds = refined_start_seconds
-        bundle.end_seconds = window.end_seconds
-        return bundle
+        return self._call_gemini_text(
+            prompt=transcript_prompt,
+            response_model=JudgmentBundleExtraction,
+            system_prompt=TRANSCRIPT_DETAIL_SYSTEM_PROMPT,
+            artifact_name=f"raw_detail_transcript_{index:02d}.txt",
+        )
 
     def _refine_bundle_start_seconds(
         self,
@@ -3307,7 +4144,6 @@ class GeminiProcessMetadataEnricher:
         artifact_store: Optional[RunArtifacts] = None,
         logger: Optional[logging.Logger] = None,
         client: Any = None,
-        ground_origem_with_search: bool = GROUND_PROCESS_METADATA_FOR_ORIGEM_ONLY,
     ) -> None:
         if not api_key:
             raise ValueError("GEMINI_API_KEY/GOOGLE_API_KEY não encontrado.")
@@ -3318,7 +4154,6 @@ class GeminiProcessMetadataEnricher:
         self.types = types
         self.client = client or create_gemini_client(genai, types, api_key)
         self.model = model or DEFAULT_GEMINI_MODEL
-        self.ground_origem_with_search = ground_origem_with_search
 
     def enrich_rows(self, rows: list[PublishPreviewRow]) -> list[PublishPreviewRow]:
         enriched_rows: list[PublishPreviewRow] = []
@@ -3335,7 +4170,7 @@ class GeminiProcessMetadataEnricher:
             if has_full_cnj and has_origem:
                 enriched_rows.append(row)
                 continue
-            if has_full_cnj and not self.ground_origem_with_search:
+            if has_full_cnj:
                 enriched_rows.append(row)
                 continue
 
@@ -3377,9 +4212,14 @@ class GeminiProcessMetadataEnricher:
             if response.origem:
                 candidate.origem = response.origem
             if response.is_judged_process is False:
-                candidate.add_error(
-                    "Busca Google indicou que o número consultado aparece como precedente citado, não como processo julgado."
-                )
+                if _row_has_strong_local_judgment_evidence(candidate, self.artifact_store):
+                    candidate.add_warning(
+                        "Grounding indicou precedente citado, mas o próprio vídeo traz prova local forte do julgamento; mantendo item."
+                    )
+                else:
+                    candidate.add_error(
+                        "Busca Google indicou que o número consultado aparece como precedente citado, não como processo julgado."
+                    )
             enriched_rows.append(candidate)
             self.artifact_store.write_json(
                 f"04a_process_metadata_{index:02d}.json",
@@ -3476,12 +4316,14 @@ class NotionSessoesClient:
         notion_version: str = DEFAULT_NOTION_VERSION,
         logger: Optional[logging.Logger] = None,
         session: Optional[requests.Session] = None,
+        normalize_multiselect_colors_post_write: bool = True,
     ) -> None:
         if not api_key:
             raise ValueError("NOTION_API_KEY/NOTION_TOKEN não encontrado.")
         self.data_source_id = data_source_id
         self.logger = logger or logging.getLogger(__name__)
         self.session = session or requests.Session()
+        self.normalize_multiselect_colors_post_write = normalize_multiselect_colors_post_write
         self.session.headers.update(
             {
                 "Authorization": f"Bearer {api_key}",
@@ -3499,11 +4341,589 @@ class NotionSessoesClient:
             return {}
         return response.json()
 
+    @staticmethod
+    def _is_schema_size_limit_error(error: Exception | str) -> bool:
+        message = str(error or "").lower()
+        return "database schema has exceeded the maximum size" in message
+
+    @staticmethod
+    def _extract_saturated_multiselect_properties(
+        error: Exception | str,
+        candidates: list[str] | None = None,
+    ) -> list[str]:
+        message = str(error or "").lower()
+        ordered_candidates = candidates or ["partes", "advogados"]
+        found: list[str] = []
+        for property_name in ordered_candidates:
+            lowered = property_name.lower()
+            if f"'{lowered}'" in message or f'"{lowered}"' in message:
+                found.append(property_name)
+        return dedupe_preserve_order(found)
+
+    def _compact_multiselect_properties(self, property_names: list[str]) -> list[str]:
+        compacted: list[str] = []
+        for property_name in dedupe_preserve_order(property_names):
+            try:
+                summary = self.rebuild_multiselect_property_with_default_colors(property_name)
+            except Exception as exc:
+                self.logger.warning(
+                    "Falha ao compactar schema multiselect de %s no Notion: %s",
+                    property_name,
+                    exc,
+                )
+                continue
+            if summary.get("updated"):
+                compacted.append(property_name)
+                self.logger.warning(
+                    "Schema multiselect de %s compactado automaticamente para destravar escrita no Notion.",
+                    property_name,
+                )
+        return compacted
+
+    def _drop_unavailable_multiselect_values(
+        self,
+        schema: "NotionDataSourceSchema",
+        row: "PublishPreviewRow",
+        property_names: list[str],
+    ) -> None:
+        property_map = {
+            "partes": "partes",
+            "advogados": "advogados",
+            "composicao": "composicao",
+        }
+        for property_name in dedupe_preserve_order(property_names):
+            internal_name = property_map.get(property_name)
+            if not internal_name:
+                continue
+            prop = schema.properties.get(property_name)
+            if not prop or prop.type != "multi_select":
+                continue
+            current_values = list(getattr(row, internal_name, []) or [])
+            if not current_values:
+                continue
+            kept_values = [value for value in current_values if str(value).strip() in prop.options]
+            omitted_values = [value for value in current_values if str(value).strip() not in prop.options]
+            if not omitted_values:
+                continue
+            setattr(row, internal_name, kept_values)
+            preview = ", ".join(str(value) for value in omitted_values[:5])
+            suffix = " ..." if len(omitted_values) > 5 else ""
+            row.add_warning(
+                f"{property_name} parcialmente omitido por limite estrutural do schema do Notion: {preview}{suffix}"
+            )
+
+    def _prepare_row_schema(self, schema: "NotionDataSourceSchema", row: "PublishPreviewRow") -> "NotionDataSourceSchema":
+        missing_select_options = self._collect_missing_select_options(schema, row)
+        if missing_select_options:
+            self.ensure_select_options_default(missing_select_options)
+            self._extend_schema_options(schema, missing_select_options)
+        missing_multiselect_options = self._collect_missing_multiselect_options(schema, row)
+        if self.normalize_multiselect_colors_post_write and missing_multiselect_options:
+            self.ensure_multiselect_options_default(missing_multiselect_options)
+            self._extend_schema_options(schema, missing_multiselect_options)
+        return schema
+
+    def _write_row_once(
+        self,
+        schema: "NotionDataSourceSchema",
+        row: "PublishPreviewRow",
+        *,
+        page_id: str = "",
+    ) -> dict[str, Any]:
+        prepared_schema = self._prepare_row_schema(schema, row)
+        if page_id:
+            payload = {"properties": self.build_properties_payload(prepared_schema, row)}
+            return self._request("PATCH", f"/pages/{page_id}", json=payload)
+        payload = {
+            "parent": {"type": "data_source_id", "data_source_id": self.data_source_id},
+            "properties": self.build_properties_payload(prepared_schema, row),
+        }
+        return self._request("POST", "/pages", json=payload)
+
+    def _write_row_with_schema_recovery(
+        self,
+        schema: "NotionDataSourceSchema",
+        row: "PublishPreviewRow",
+        *,
+        page_id: str = "",
+    ) -> dict[str, Any]:
+        try:
+            return self._write_row_once(schema, row, page_id=page_id)
+        except RuntimeError as exc:
+            if not self._is_schema_size_limit_error(exc):
+                raise
+            candidate_properties = dedupe_preserve_order(
+                self._extract_saturated_multiselect_properties(exc)
+                + [name for name in self._collect_missing_multiselect_options(schema, row).keys() if name in {"partes", "advogados"}]
+            )
+            candidate_properties = [name for name in candidate_properties if name in {"partes", "advogados"}]
+            if not candidate_properties:
+                raise
+            self._compact_multiselect_properties(candidate_properties)
+            refreshed_schema = self.fetch_schema()
+            try:
+                return self._write_row_once(refreshed_schema, row, page_id=page_id)
+            except RuntimeError as retry_exc:
+                if not self._is_schema_size_limit_error(retry_exc):
+                    raise
+                fallback_properties = self._extract_saturated_multiselect_properties(
+                    retry_exc,
+                    candidates=candidate_properties,
+                ) or candidate_properties
+                self._drop_unavailable_multiselect_values(refreshed_schema, row, fallback_properties)
+                return self._write_row_once(refreshed_schema, row, page_id=page_id)
+
     def fetch_schema(self) -> NotionDataSourceSchema:
         payload = self._request("GET", f"/data_sources/{self.data_source_id}")
         schema = NotionDataSourceSchema(self.data_source_id, payload)
         schema.ensure_expected_properties()
         return schema
+
+    def _collect_missing_multiselect_properties(
+        self,
+        schema: NotionDataSourceSchema,
+        row: PublishPreviewRow,
+        allowed_properties: Optional[list[str]] = None,
+    ) -> list[str]:
+        target_properties = set(allowed_properties or ["partes", "advogados"])
+        missing_properties: list[str] = []
+        for internal_name, notion_name in {
+            "partes": "partes",
+            "advogados": "advogados",
+            "composicao": "composicao",
+        }.items():
+            if notion_name not in target_properties:
+                continue
+            prop = schema.properties.get(notion_name)
+            if not prop or prop.type != "multi_select":
+                continue
+            values = getattr(row, internal_name, []) or []
+            if any(str(value).strip() and str(value) not in prop.options for value in values):
+                missing_properties.append(notion_name)
+        return missing_properties
+
+    def _collect_missing_multiselect_options(
+        self,
+        schema: NotionDataSourceSchema,
+        row: PublishPreviewRow,
+        allowed_properties: Optional[list[str]] = None,
+    ) -> dict[str, list[str]]:
+        target_properties = set(allowed_properties or ["partes", "advogados"])
+        missing_options: dict[str, list[str]] = {}
+        for internal_name, notion_name in {
+            "partes": "partes",
+            "advogados": "advogados",
+            "composicao": "composicao",
+        }.items():
+            if notion_name not in target_properties:
+                continue
+            prop = schema.properties.get(notion_name)
+            if not prop or prop.type != "multi_select":
+                continue
+            seen_missing: set[str] = set()
+            ordered_missing: list[str] = []
+            for value in getattr(row, internal_name, []) or []:
+                normalized = str(value).strip()
+                if not normalized or normalized in prop.options or normalized in seen_missing:
+                    continue
+                seen_missing.add(normalized)
+                ordered_missing.append(normalized)
+            if ordered_missing:
+                missing_options[notion_name] = ordered_missing
+        return missing_options
+
+    def _collect_missing_select_options(
+        self,
+        schema: NotionDataSourceSchema,
+        row: PublishPreviewRow,
+        allowed_properties: Optional[list[str]] = None,
+    ) -> dict[str, list[str]]:
+        target_properties = set(
+            allowed_properties
+            or [
+                "relator",
+                "pedido_vista",
+            ]
+        )
+        missing_options: dict[str, list[str]] = {}
+        for internal_name, notion_name in {
+            "relator": "relator",
+            "pedido_vista": "pedido_vista",
+        }.items():
+            if notion_name not in target_properties:
+                continue
+            prop = schema.properties.get(notion_name)
+            if not prop or prop.type != "select":
+                continue
+            value = str(getattr(row, internal_name, "") or "").strip()
+            if not value or value in prop.options:
+                continue
+            missing_options[notion_name] = [value]
+        return missing_options
+
+    @staticmethod
+    def _merge_select_options(
+        live_options_raw: list[dict[str, Any]],
+        option_name: str,
+    ) -> list[dict[str, Any]]:
+        merged_options: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        for option in live_options_raw:
+            existing_name = str(option.get("name", "")).strip()
+            if not existing_name or existing_name in seen_names:
+                continue
+            seen_names.add(existing_name)
+            merged_options.append(
+                {
+                    "name": existing_name,
+                    "color": str(option.get("color") or "default"),
+                }
+            )
+        merged_options.append({"name": option_name, "color": "default"})
+        return merged_options
+
+    def ensure_select_options_default(
+        self,
+        missing_options: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        if not missing_options:
+            return {"updated": False, "properties": []}
+        property_summaries: list[dict[str, Any]] = []
+        for property_name, option_names in missing_options.items():
+            created_count = 0
+            skipped_due_to_schema_limit = False
+            for option_name in option_names:
+                live_payload = self._request("GET", f"/data_sources/{self.data_source_id}")
+                live_prop = (live_payload.get("properties") or {}).get(property_name) or {}
+                if live_prop.get("type") != "select":
+                    continue
+                live_options_raw = ((live_prop.get("select") or {}).get("options") or [])
+                live_option_names = {
+                    str(option.get("name", "")).strip()
+                    for option in live_options_raw
+                    if str(option.get("name", "")).strip()
+                }
+                normalized_option_name = str(option_name or "").strip()
+                if property_name in {"relator", "pedido_vista"} and normalized_option_name:
+                    normalized_option_name = _canonicalize_person_select_value(
+                        normalized_option_name,
+                        notion_name=property_name,
+                    )
+                if not normalized_option_name or normalized_option_name in live_option_names:
+                    continue
+                if len(live_option_names) >= 100:
+                    skipped_due_to_schema_limit = True
+                    continue
+                merged_options = self._merge_select_options(live_options_raw, normalized_option_name)
+                try:
+                    self._request(
+                        "PATCH",
+                        f"/data_sources/{self.data_source_id}",
+                        json={"properties": {property_name: {"select": {"options": merged_options}}}},
+                    )
+                except RuntimeError as exc:
+                    message = str(exc)
+                    if "select.options.length should be ≤" in message:
+                        skipped_due_to_schema_limit = True
+                        continue
+                    if "Cannot update color of select with name:" not in message:
+                        raise
+                    live_payload = self._request("GET", f"/data_sources/{self.data_source_id}")
+                    live_prop = (live_payload.get("properties") or {}).get(property_name) or {}
+                    if live_prop.get("type") != "select":
+                        continue
+                    live_options_raw = ((live_prop.get("select") or {}).get("options") or [])
+                    live_option_names = {
+                        str(option.get("name", "")).strip()
+                        for option in live_options_raw
+                        if str(option.get("name", "")).strip()
+                    }
+                    if normalized_option_name in live_option_names:
+                        continue
+                    merged_options = [{"name": str(option.get("name", "")).strip()} for option in live_options_raw if str(option.get("name", "")).strip()]
+                    merged_options.append({"name": normalized_option_name, "color": "default"})
+                    self._request(
+                        "PATCH",
+                        f"/data_sources/{self.data_source_id}",
+                        json={"properties": {property_name: {"select": {"options": merged_options}}}},
+                    )
+                created_count += 1
+            if created_count:
+                property_summaries.append({"property": property_name, "created_options": created_count})
+            elif skipped_due_to_schema_limit:
+                property_summaries.append(
+                    {
+                        "property": property_name,
+                        "created_options": 0,
+                        "skipped_schema_update_due_to_limit": True,
+                    }
+                )
+        return {"updated": bool(property_summaries), "properties": property_summaries}
+
+    @staticmethod
+    def _extend_schema_options(
+        schema: NotionDataSourceSchema,
+        new_options: dict[str, list[str]],
+    ) -> None:
+        for property_name, values in new_options.items():
+            prop = schema.properties.get(property_name)
+            if not prop:
+                continue
+            for value in values:
+                normalized = str(value or "").strip()
+                if normalized and normalized not in prop.options:
+                    prop.options.append(normalized)
+
+    def ensure_multiselect_options_default(
+        self,
+        missing_options: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        if not missing_options:
+            return {"updated": False, "properties": []}
+        property_summaries: list[dict[str, Any]] = []
+        for property_name, option_names in missing_options.items():
+            created_count = 0
+            skipped_due_to_schema_limit = False
+            for option_name in option_names:
+                live_payload = self._request("GET", f"/data_sources/{self.data_source_id}")
+                live_prop = (live_payload.get("properties") or {}).get(property_name) or {}
+                live_options_raw = ((live_prop.get("multi_select") or {}).get("options") or [])
+                live_option_names = {
+                    str(option.get("name", "")).strip()
+                    for option in live_options_raw
+                    if str(option.get("name", "")).strip()
+                }
+                normalized_option_name = str(option_name or "").strip()
+                if not normalized_option_name or normalized_option_name in live_option_names:
+                    continue
+                # The Notion schema PATCH endpoint rejects option payloads above 100 entries,
+                # even when the live property already contains more than 100 options. In that
+                # case we skip the schema-level update and let the page write carry the value.
+                if len(live_option_names) >= 100:
+                    skipped_due_to_schema_limit = True
+                    continue
+                merged_options: list[dict[str, Any]] = []
+                seen_names: set[str] = set()
+                for option in live_options_raw:
+                    existing_name = str(option.get("name", "")).strip()
+                    if not existing_name or existing_name in seen_names:
+                        continue
+                    seen_names.add(existing_name)
+                    merged_options.append(
+                        {
+                            "name": existing_name,
+                            "color": str(option.get("color") or "default"),
+                        }
+                    )
+                merged_options.append({"name": normalized_option_name, "color": "default"})
+                try:
+                    self._request(
+                        "PATCH",
+                        f"/data_sources/{self.data_source_id}",
+                        json={"properties": {property_name: {"multi_select": {"options": merged_options}}}},
+                    )
+                except RuntimeError as exc:
+                    message = str(exc)
+                    if "multi_select.options.length should be ≤" in message:
+                        skipped_due_to_schema_limit = True
+                        continue
+                    if "Cannot update color of select with name:" not in message:
+                        raise
+                    live_payload = self._request("GET", f"/data_sources/{self.data_source_id}")
+                    live_prop = (live_payload.get("properties") or {}).get(property_name) or {}
+                    live_options_raw = ((live_prop.get("multi_select") or {}).get("options") or [])
+                    live_option_names = {
+                        str(option.get("name", "")).strip()
+                        for option in live_options_raw
+                        if str(option.get("name", "")).strip()
+                    }
+                    if normalized_option_name in live_option_names:
+                        continue
+                    merged_options = []
+                    seen_names = set()
+                    for option in live_options_raw:
+                        existing_name = str(option.get("name", "")).strip()
+                        if not existing_name or existing_name in seen_names:
+                            continue
+                        seen_names.add(existing_name)
+                        merged_options.append({"name": existing_name})
+                    merged_options.append({"name": normalized_option_name, "color": "default"})
+                    self._request(
+                        "PATCH",
+                        f"/data_sources/{self.data_source_id}",
+                        json={"properties": {property_name: {"multi_select": {"options": merged_options}}}},
+                    )
+                created_count += 1
+            if created_count:
+                property_summaries.append({"property": property_name, "created_options": created_count})
+            elif skipped_due_to_schema_limit:
+                property_summaries.append(
+                    {
+                        "property": property_name,
+                        "created_options": 0,
+                        "skipped_schema_update_due_to_limit": True,
+                    }
+                )
+        return {"updated": bool(property_summaries), "properties": property_summaries}
+
+    def create_multi_select_property(self, property_name: str) -> None:
+        self._request("PATCH", f"/data_sources/{self.data_source_id}", json={"properties": {property_name: {"multi_select": {}}}})
+
+    def rename_property(self, current_name: str, new_name: str) -> None:
+        payload = self._request("GET", f"/data_sources/{self.data_source_id}")
+        prop = payload.get("properties", {}).get(current_name)
+        if not prop:
+            raise RuntimeError(f"Propriedade {current_name!r} não encontrada para renomear.")
+        prop_id = prop.get("id") or current_name
+        self._request(
+            "PATCH",
+            f"/data_sources/{self.data_source_id}",
+            json={"properties": {prop_id: {"name": new_name}}},
+        )
+
+    def drop_property(self, property_name: str) -> None:
+        self._request("PATCH", f"/data_sources/{self.data_source_id}", json={"properties": {property_name: None}})
+
+    def rebuild_multiselect_property_with_default_colors(
+        self,
+        property_name: str,
+        *,
+        temp_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        payload = self._request("GET", f"/data_sources/{self.data_source_id}")
+        properties = payload.get("properties", {})
+        prop = properties.get(property_name)
+        if not prop or prop.get("type") != "multi_select":
+            return {"updated": False, "property": property_name}
+        pages = self.query_data_source()
+        used_option_names: list[str] = []
+        seen_option_names: set[str] = set()
+        page_values: list[tuple[str, list[str]]] = []
+        for page in pages:
+            values = [
+                item.get("name", "").strip()
+                for item in page.get("properties", {}).get(property_name, {}).get("multi_select", [])
+                if item.get("name", "").strip()
+            ]
+            page_values.append((page.get("id", ""), values))
+            for value in values:
+                if value not in seen_option_names:
+                    seen_option_names.add(value)
+                    used_option_names.append(value)
+        options = prop.get("multi_select", {}).get("options", []) or []
+        current_option_names = [option.get("name", "").strip() for option in options if option.get("name", "").strip()]
+        nondefault_options = [option for option in options if (option.get("color") or "") != "default"]
+        unused_count = len(options) - len(used_option_names)
+        if not nondefault_options and unused_count == 0 and current_option_names == used_option_names:
+            return {
+                "updated": False,
+                "property": property_name,
+                "used_options": len(used_option_names),
+                "page_updates": 0,
+            }
+
+        def restore_property_in_place() -> dict[str, Any]:
+            self.drop_property(property_name)
+            self.create_multi_select_property(property_name)
+            page_updates = 0
+            for page_id, values in page_values:
+                if not page_id or not values:
+                    continue
+                self._request(
+                    "PATCH",
+                    f"/pages/{page_id}",
+                    json={"properties": {property_name: {"multi_select": [{"name": value} for value in values]}}},
+                )
+                page_updates += 1
+            return {
+                "updated": True,
+                "property": property_name,
+                "nondefault_options": len(nondefault_options),
+                "unused_options_observed": unused_count,
+                "used_options": len(used_option_names),
+                "page_updates": page_updates,
+                "recreated_in_place": True,
+            }
+
+        working_temp_name = temp_name or f"{property_name}__default_tmp"
+        legacy_name = f"{property_name}__legacy_color"
+        refreshed_properties = self._request("GET", f"/data_sources/{self.data_source_id}").get("properties", {})
+        for residue_name in [working_temp_name, legacy_name]:
+            if residue_name in refreshed_properties:
+                self.drop_property(residue_name)
+        try:
+            self.create_multi_select_property(working_temp_name)
+            if 0 < len(used_option_names) <= 100:
+                self.ensure_multiselect_options_default({working_temp_name: used_option_names})
+            page_updates = 0
+            for page_id, values in page_values:
+                if not page_id or not values:
+                    continue
+                self._request(
+                    "PATCH",
+                    f"/pages/{page_id}",
+                    json={"properties": {working_temp_name: {"multi_select": [{"name": value} for value in values]}}},
+                )
+                page_updates += 1
+            self.rename_property(property_name, legacy_name)
+            self.rename_property(working_temp_name, property_name)
+            self.drop_property(legacy_name)
+            return {
+                "updated": True,
+                "property": property_name,
+                "nondefault_options": len(nondefault_options),
+                "unused_options_observed": unused_count,
+                "used_options": len(used_option_names),
+                "page_updates": page_updates,
+            }
+        except RuntimeError as exc:
+            if not self._is_schema_size_limit_error(exc):
+                raise
+            self.logger.warning(
+                "Compactação em duas propriedades falhou para %s por limite estrutural do schema; recriando a propriedade em lugar.",
+                property_name,
+            )
+            refreshed_properties = self._request("GET", f"/data_sources/{self.data_source_id}").get("properties", {})
+            for residue_name in [working_temp_name, legacy_name]:
+                if residue_name in refreshed_properties:
+                    self.drop_property(residue_name)
+            return restore_property_in_place()
+
+    def set_multi_select_options_color_default(
+        self,
+        schema: NotionDataSourceSchema,
+        property_names: list[str],
+    ) -> dict[str, Any]:
+        changed_summary: dict[str, int] = {}
+        property_summaries: list[dict[str, Any]] = []
+        pages = self.query_data_source()
+        for property_name in property_names:
+            prop = schema.raw_payload.get("properties", {}).get(property_name, {})
+            if prop.get("type") != "multi_select":
+                continue
+            options = prop.get("multi_select", {}).get("options", []) or []
+            used_option_names: list[str] = []
+            seen_option_names: set[str] = set()
+            for page in pages:
+                values = [
+                    item.get("name", "").strip()
+                    for item in page.get("properties", {}).get(property_name, {}).get("multi_select", [])
+                    if item.get("name", "").strip()
+                ]
+                for value in values:
+                    if value not in seen_option_names:
+                        seen_option_names.add(value)
+                        used_option_names.append(value)
+            nondefault_options = [option for option in options if (option.get("color") or "") != "default"]
+            unused_count = len(options) - len(used_option_names)
+            current_option_names = [option.get("name", "").strip() for option in options if option.get("name", "").strip()]
+            if not nondefault_options and unused_count == 0 and current_option_names == used_option_names:
+                continue
+            changed_summary[property_name] = len(nondefault_options)
+            property_summaries.append(self.rebuild_multiselect_property_with_default_colors(property_name))
+        if not property_summaries:
+            return {"updated": False, "changed": changed_summary}
+        return {"updated": True, "changed": changed_summary, "properties": property_summaries}
 
     def query_data_source(self, filter_payload: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
@@ -3561,6 +4981,8 @@ class NotionSessoesClient:
             return payload.get("name") or ""
         if prop_schema.type == "multi_select":
             return ", ".join(item.get("name", "") for item in value.get("multi_select", []))
+        if prop_schema.type == "relation":
+            return ", ".join(item.get("id", "") for item in value.get("relation", []))
         return ""
 
     def find_existing_row(
@@ -3624,6 +5046,9 @@ class NotionSessoesClient:
         if prop.type == "multi_select":
             values = value if isinstance(value, list) else parse_multi_value_text(value)
             return {"multi_select": [{"name": str(item)} for item in values if str(item).strip()]}
+        if prop.type == "relation":
+            values = value if isinstance(value, list) else parse_multi_value_text(value)
+            return {"relation": [{"id": str(item)} for item in values if str(item).strip()]}
         return None
 
     def _build_empty_property_value(
@@ -3646,6 +5071,8 @@ class NotionSessoesClient:
             return {"status": None}
         if prop.type == "multi_select":
             return {"multi_select": []}
+        if prop.type == "relation":
+            return {"relation": []}
         return None
 
     def build_properties_payload(
@@ -3689,15 +5116,10 @@ class NotionSessoesClient:
         return payload
 
     def create_row(self, schema: NotionDataSourceSchema, row: PublishPreviewRow) -> dict[str, Any]:
-        payload = {
-            "parent": {"type": "data_source_id", "data_source_id": self.data_source_id},
-            "properties": self.build_properties_payload(schema, row),
-        }
-        return self._request("POST", "/pages", json=payload)
+        return self._write_row_with_schema_recovery(schema, row)
 
     def update_row(self, schema: NotionDataSourceSchema, page_id: str, row: PublishPreviewRow) -> dict[str, Any]:
-        payload = {"properties": self.build_properties_payload(schema, row)}
-        return self._request("PATCH", f"/pages/{page_id}", json=payload)
+        return self._write_row_with_schema_recovery(schema, row, page_id=page_id)
 
 
 def validate_preview_row(
@@ -3715,17 +5137,49 @@ def validate_preview_row(
         if not any(pattern.search(message) for pattern in RECOMPUTED_ERROR_PATTERNS)
     ]
     raw_general_news_count = len([value for value in row.noticias_gerais if str(value).strip()])
+    original_numero_processo = str(row.numero_processo or "")
     row.data_sessao = normalize_session_date_to_iso(row.data_sessao)
     row.numero_processo = normalize_numero_processo_display(row.numero_processo)
+    inferred_full_cnj = infer_full_numero_processo_from_row_text(row)
+    if inferred_full_cnj:
+        row.numero_processo = normalize_numero_processo_display(inferred_full_cnj)
+    inferred_special_numero = infer_special_numero_processo_from_row_text(row)
+    if inferred_special_numero:
+        row.numero_processo = _merge_special_numero_processo(row.numero_processo, inferred_special_numero)
     row.classe_processo = normalize_classe_processo(row.classe_processo)
     row.eleicao = normalize_eleicao_value(row.eleicao)
     row.origem = normalize_origem_value(row.origem)
     uf = extract_uf_from_text(row.origem)
     row.tribunal = normalize_tre(row.tribunal, uf)
+    if not row.origem:
+        tribunal_value = str(row.tribunal or "").strip().upper()
+        tre_match = re.match(r"^TRE-([A-Z]{2})$", tribunal_value)
+        if tre_match:
+            row.origem = f"TRE/{tre_match.group(1)}"
+        elif tribunal_value == "TSE":
+            row.origem = "TSE"
+        elif row.classe_processo == "CTA":
+            row.origem = "TSE"
     row.relator = normalize_ministro_name(row.relator) if row.relator else ""
     row.pedido_vista = normalize_pedido_vista_value(row.pedido_vista)
     row.resultado = normalize_resultado_final(row.resultado, row.classe_processo)
     row.votacao = normalize_votacao(row.votacao)
+    if not row.relator:
+        row.relator = infer_relator_from_row_text(row)
+    if not row.votacao:
+        row.votacao = infer_votacao_from_row_text(row)
+    inferred_classe = infer_classe_from_row_text(row)
+    if inferred_classe and should_replace_classe_processo(row.classe_processo, inferred_classe, row):
+        row.classe_processo = inferred_classe
+    elif not row.classe_processo:
+        row.classe_processo = inferred_classe
+    if not row.resultado:
+        row.resultado = infer_resultado_from_row_text(row)
+    if row.resultado == "Suspenso por vista" and not row.votacao:
+        row.votacao = "Suspenso"
+    if row_indicates_suspension_by_vista(row):
+        row.resultado = "Suspenso por vista"
+        row.votacao = "Suspenso"
     row.youtube_link = normalize_youtube_link(row.youtube_link)
     row.partes = normalize_party_list(row.partes)
     row.advogados = normalize_advogado_list(row.advogados)
@@ -3734,12 +5188,19 @@ def validate_preview_row(
     row.precedentes_citados = normalize_mpe_reference(row.precedentes_citados)
     row.raciocinio_juridico = strip_legacy_raciocinio_text(normalize_mpe_reference(row.raciocinio_juridico))
     row.analise_do_conteudo_juridico = normalize_mpe_reference(row.analise_do_conteudo_juridico)
+    if punchline_looks_generic(row.punchline, row):
+        row.punchline = infer_punchline_from_row_text(row)
     row.noticia_TSE = normalize_external_url(row.noticia_TSE)
     row.noticia_TRE = normalize_external_url(row.noticia_TRE)
     row.noticias_gerais = normalize_external_url_list(row.noticias_gerais, limit=GENERAL_NEWS_LIMIT)
     row.tema = build_fallback_tema(row)
+    if not row.pedido_vista:
+        row.pedido_vista = infer_pedido_vista_from_row_text(row)
     row.warnings = dedupe_preserve_order(row.warnings)
     row.errors = dedupe_preserve_order(row.errors)
+
+    if original_numero_processo and not row.numero_processo:
+        row.add_warning("Número do processo textual inválido removido por falta de identificação confiável.")
 
     if row.noticia_TSE:
         valid_tse_urls, dropped_tse_urls = filter_accessible_news_urls([row.noticia_TSE])
@@ -3786,10 +5247,25 @@ def validate_preview_row(
             continue
         if prop.type not in {"select", "status"}:
             continue
+        if notion_name in {"relator", "pedido_vista"}:
+            canonical_person = _canonicalize_person_select_value(
+                value,
+                notion_name=notion_name,
+                notion_schema=notion_schema,
+            )
+            if canonical_person:
+                setattr(row, internal_name, canonical_person)
+                value = canonical_person
         if value not in prop.options:
-            if notion_name == "origem":
+            if notion_name in {"relator", "pedido_vista"} and value:
+                row.add_warning(f"{notion_name} com opção nova no Notion: {value}")
+            elif notion_name == "origem":
                 row.add_warning(f"origem com opção nova no Notion: {value}")
+            elif notion_name == "tipo_registro" and TIPO_REGISTRO_DYNAMIC_RE.match(value):
+                row.add_warning(f"{notion_name} com opção nova no Notion: {value}")
             elif value in SAFE_DYNAMIC_SELECT_OPTIONS.get(notion_name, set()):
+                row.add_warning(f"{notion_name} com opção nova no Notion: {value}")
+            elif notion_name in SCHEMA_EXPANDED_SELECT_PROPERTIES and _controlled_select_value_can_expand(notion_name, value, row):
                 row.add_warning(f"{notion_name} com opção nova no Notion: {value}")
             elif notion_name in {"tipo_registro", "eleicao", "classe_processo", "relator", "pedido_vista", "resultado", "votacao"}:
                 row.add_warning(f"{notion_name} fora das opções do Notion; valor omitido: {value}")
@@ -3866,13 +5342,19 @@ def build_preview_rows(
 ) -> list[PublishPreviewRow]:
     rows: list[PublishPreviewRow] = []
     session_composicao = normalize_composition_list(analysis.session.composicao)
-    session_composicao_fallback = session_composicao if 5 <= len(session_composicao) <= 9 else []
+    session_composicao_fallback = session_composicao if 6 <= len(session_composicao) <= 7 else []
+    authoritative_session_date = normalize_session_date_to_iso(analysis.session.data_sessao)
     for bundle_index, bundle in enumerate(analysis.bundles, start=1):
         if bundle.should_ignore:
             continue
         for item_index, item in enumerate(_prepare_bundle_items_for_preview(bundle.items), start=1):
+            derived_relator, derived_pedido_vista = extract_ministro_roles_from_composition_entries(item.composicao)
             composicao = choose_preferred_composition(item.composicao, session_composicao_fallback)
             origem = item.origem
+            item_session_date = normalize_session_date_to_iso(item.data_sessao)
+            youtube_link = build_timestamped_youtube_link(youtube_url, bundle.start_seconds)
+            if authoritative_session_date and item_session_date and item_session_date != authoritative_session_date:
+                youtube_link = build_video_only_youtube_link(youtube_url)
             row = PublishPreviewRow(
                 tema=item.tema.strip(),
                 classe_processo=item.classe_processo.strip(),
@@ -3881,12 +5363,12 @@ def build_preview_rows(
                 origem=origem.strip(),
                 tribunal=(item.tre or normalize_tre("", item.uf)).strip(),
                 numero_processo=item.numero_processo.strip(),
-                youtube_link=build_timestamped_youtube_link(youtube_url, bundle.start_seconds),
-                relator=item.relator.strip(),
-                pedido_vista=item.pedido_vista.strip(),
+                youtube_link=youtube_link,
+                relator=(item.relator.strip() or derived_relator),
+                pedido_vista=(item.pedido_vista.strip() or derived_pedido_vista),
                 resultado=item.resultado_final.strip(),
                 votacao=item.votacao.strip(),
-                data_sessao=item.data_sessao or analysis.session.data_sessao,
+                data_sessao=analysis.session.data_sessao or item.data_sessao,
                 partes=item.partes + item.indicados_lista_triplice,
                 advogados=item.advogados,
                 composicao=composicao,
@@ -3910,7 +5392,7 @@ def build_preview_rows(
             if notion_client and notion_schema and row.numero_processo and row.youtube_link:
                 match = notion_client.find_existing_row(
                     notion_schema,
-                    youtube_link=row.youtube_link,
+                    youtube_link=build_video_only_youtube_link(row.youtube_link),
                     numero_processo=canonicalize_numero_processo(row.numero_processo),
                 )
                 if match:
@@ -4009,32 +5491,187 @@ def _preview_row_signal_score(row: PublishPreviewRow) -> int:
     return sum(1 for value in scalar_fields if normalize_model_text(value)) + len(row.partes) + len(row.advogados)
 
 
-def _merge_preview_row_data(primary: PublishPreviewRow, secondary: PublishPreviewRow) -> PublishPreviewRow:
+def _preview_row_numero_specificity(row: PublishPreviewRow) -> int:
+    text = normalize_numero_processo_display(row.numero_processo)
+    if not text:
+        return 0
+    if extract_full_cnj(text):
+        return 4
+    if re.fullmatch(r"\d{3,7}-\d{2}", text):
+        return 2
+    if re.fullmatch(r"(?:ADO|ADI)\s+\d+", text, flags=re.IGNORECASE):
+        return 3
+    return 1
+
+
+def _preview_row_looks_administrative(row: PublishPreviewRow) -> bool:
+    text = normalize_class_text(
+        " ".join(
+            value
+            for value in [
+                row.tema,
+                row.punchline,
+                row.analise_do_conteudo_juridico,
+                row.raciocinio_juridico,
+            ]
+            if normalize_model_text(value)
+        )
+    )
+    if not text:
+        return False
+    administrative_patterns = (
+        r"\bresolu[cç][aã]o\b",
+        r"\baprova[cç][aã]o\b",
+        r"\bminuta\b",
+        r"\btexto proposto\b",
+        r"\baprovou a resolu[cç][aã]o\b",
+        r"\blista triplice\b",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in administrative_patterns)
+
+
+def _preview_row_looks_case_specific(row: PublishPreviewRow) -> bool:
+    text = normalize_class_text(
+        " ".join(
+            value
+            for value in [
+                row.tema,
+                row.punchline,
+                row.analise_do_conteudo_juridico,
+                row.raciocinio_juridico,
+                row.origem,
+                row.numero_processo,
+            ]
+            if normalize_model_text(value)
+        )
+    )
+    if not text:
+        return False
+    judicial_patterns = (
+        r"\brecurso especial\b",
+        r"\bagr-?respe\b",
+        r"\brespe\b",
+        r"\badiamento\b",
+        r"\bsustentacao oral\b",
+        r"\bretirado de pauta\b",
+        r"\bproblemas? tecnic",
+        r"\bfraude\b",
+        r"\bprestacao de contas\b",
+        r"\babuso de poder\b",
+        r"\bcota de genero\b",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in judicial_patterns)
+
+
+def _preview_row_case_specificity_score(row: PublishPreviewRow) -> int:
+    score = _preview_row_signal_score(row)
+    score += _preview_row_numero_specificity(row) * 3
+    if row.origem:
+        score += 2
+    if row.partes:
+        score += 2
+    if row.advogados:
+        score += 2
+    if row.tema and not tema_looks_generic(row.tema, row):
+        score += 2
+    if row.punchline and not punchline_looks_generic(row.punchline, row):
+        score += 1
+    if _preview_row_looks_case_specific(row):
+        score += 2
+    if _preview_row_looks_administrative(row):
+        score -= 2
+    return score
+
+
+def _preview_rows_have_semantic_conflict(primary: PublishPreviewRow, secondary: PublishPreviewRow) -> bool:
+    if canonicalize_numero_processo(primary.numero_processo) != canonicalize_numero_processo(secondary.numero_processo):
+        return False
+    if normalize_numero_processo_display(primary.numero_processo) == normalize_numero_processo_display(secondary.numero_processo):
+        return False
+
+    primary_admin = _preview_row_looks_administrative(primary)
+    secondary_admin = _preview_row_looks_administrative(secondary)
+    primary_case = _preview_row_looks_case_specific(primary)
+    secondary_case = _preview_row_looks_case_specific(secondary)
+    if primary_admin != secondary_admin and primary_case != secondary_case:
+        return True
+
+    primary_theme = normalize_class_text(primary.tema)
+    secondary_theme = normalize_class_text(secondary.tema)
+    if primary_theme and secondary_theme and primary_theme != secondary_theme:
+        return True
+
+    return False
+
+
+def _choose_dedupe_primary(
+    existing: PublishPreviewRow,
+    candidate: PublishPreviewRow,
+) -> tuple[PublishPreviewRow, PublishPreviewRow, bool, bool]:
+    same_process = bool(
+        canonicalize_numero_processo(existing.numero_processo)
+        and canonicalize_numero_processo(existing.numero_processo) == canonicalize_numero_processo(candidate.numero_processo)
+    )
+    semantic_conflict = same_process and _preview_rows_have_semantic_conflict(existing, candidate)
+    if same_process:
+        existing_numero_score = _preview_row_numero_specificity(existing)
+        candidate_numero_score = _preview_row_numero_specificity(candidate)
+        if candidate_numero_score > existing_numero_score:
+            return candidate, existing, semantic_conflict, semantic_conflict
+        if existing_numero_score > candidate_numero_score:
+            return existing, candidate, semantic_conflict, semantic_conflict
+        if semantic_conflict:
+            existing_score = _preview_row_case_specificity_score(existing)
+            candidate_score = _preview_row_case_specificity_score(candidate)
+            if candidate_score > existing_score:
+                return candidate, existing, True, True
+            if existing_score > candidate_score:
+                return existing, candidate, True, True
+
+    existing_ts = extract_youtube_timestamp_seconds(existing.youtube_link)
+    candidate_ts = extract_youtube_timestamp_seconds(candidate.youtube_link)
+    if candidate_ts and (not existing_ts or candidate_ts < existing_ts):
+        return candidate, existing, False, False
+    if existing_ts and candidate_ts and existing_ts == candidate_ts:
+        primary = existing if _preview_row_signal_score(existing) >= _preview_row_signal_score(candidate) else candidate
+        secondary = candidate if primary is existing else existing
+        return primary, secondary, False, False
+    return existing, candidate, False, False
+
+
+def _merge_preview_row_data(
+    primary: PublishPreviewRow,
+    secondary: PublishPreviewRow,
+    *,
+    allow_scalar_backfill: bool = True,
+    prefer_primary_source_fields: bool = False,
+) -> PublishPreviewRow:
     merged = primary.model_copy(deep=True)
 
-    for field_name in [
-        "tema",
-        "classe_processo",
-        "eleicao",
-        "origem",
-        "tribunal",
-        "numero_processo",
-        "relator",
-        "pedido_vista",
-        "resultado",
-        "votacao",
-        "data_sessao",
-        "punchline",
-        "analise_do_conteudo_juridico",
-        "fundamentacao_normativa",
-        "precedentes_citados",
-        "raciocinio_juridico",
-        "resolucoes_citadas",
-        "noticia_TSE",
-        "noticia_TRE",
-    ]:
-        if not normalize_model_text(getattr(merged, field_name, "")):
-            setattr(merged, field_name, getattr(secondary, field_name, ""))
+    if allow_scalar_backfill:
+        for field_name in [
+            "tema",
+            "classe_processo",
+            "eleicao",
+            "origem",
+            "tribunal",
+            "numero_processo",
+            "relator",
+            "pedido_vista",
+            "resultado",
+            "votacao",
+            "data_sessao",
+            "punchline",
+            "analise_do_conteudo_juridico",
+            "fundamentacao_normativa",
+            "precedentes_citados",
+            "raciocinio_juridico",
+            "resolucoes_citadas",
+            "noticia_TSE",
+            "noticia_TRE",
+        ]:
+            if not normalize_model_text(getattr(merged, field_name, "")):
+                setattr(merged, field_name, getattr(secondary, field_name, ""))
 
     merged.partes = _merge_party_values(merged.partes, secondary.partes)
     merged.advogados = dedupe_preserve_order(merged.advogados + secondary.advogados)
@@ -4042,11 +5679,22 @@ def _merge_preview_row_data(primary: PublishPreviewRow, secondary: PublishPrevie
     merged.noticias_gerais = dedupe_preserve_order(merged.noticias_gerais + secondary.noticias_gerais)[:GENERAL_NEWS_LIMIT]
     merged.warnings = dedupe_preserve_order(merged.warnings + secondary.warnings)
     merged.errors = dedupe_preserve_order(merged.errors + secondary.errors)
-    (
-        merged.source_start_seconds,
-        merged.source_bundle_index,
-        merged.source_item_index,
-    ) = _merge_source_order_fields(primary, secondary)
+    if prefer_primary_source_fields:
+        (
+            merged.source_start_seconds,
+            merged.source_bundle_index,
+            merged.source_item_index,
+        ) = (
+            primary.source_start_seconds,
+            primary.source_bundle_index,
+            primary.source_item_index,
+        )
+    else:
+        (
+            merged.source_start_seconds,
+            merged.source_bundle_index,
+            merged.source_item_index,
+        ) = _merge_source_order_fields(primary, secondary)
     if secondary.action == "update" and secondary.page_id:
         merged.action = "update"
         merged.page_id = secondary.page_id
@@ -4080,33 +5728,36 @@ def _is_generic_party_label(value: str) -> bool:
     return any(marker in normalized for marker in generic_markers)
 
 
-def _dedupe_preview_rows(rows: list[PublishPreviewRow], youtube_url: str) -> list[PublishPreviewRow]:
+def _preview_row_dedupe_key(row: PublishPreviewRow, youtube_url: str) -> tuple[str, str, str]:
     video_id = extract_youtube_video_id(youtube_url) or normalize_youtube_link(youtube_url)
-    deduped: dict[tuple[str, str], PublishPreviewRow] = {}
+    process_key = canonicalize_numero_processo(row.numero_processo)
+    overlay_classe = identity_overlay_class_key(row.classe_processo)
+    if overlay_classe:
+        return (video_id, process_key, overlay_classe)
+    return (video_id, process_key, "")
+
+
+def _dedupe_preview_rows(rows: list[PublishPreviewRow], youtube_url: str) -> list[PublishPreviewRow]:
+    deduped: dict[tuple[str, str, str], PublishPreviewRow] = {}
     passthrough: list[PublishPreviewRow] = []
 
     for row in rows:
         if not row.numero_processo:
             passthrough.append(row)
             continue
-        key = (video_id, canonicalize_numero_processo(row.numero_processo))
+        key = _preview_row_dedupe_key(row, youtube_url)
         existing = deduped.get(key)
         if existing is None:
             deduped[key] = row
             continue
 
-        existing_ts = extract_youtube_timestamp_seconds(existing.youtube_link)
-        candidate_ts = extract_youtube_timestamp_seconds(row.youtube_link)
-        if candidate_ts and (not existing_ts or candidate_ts < existing_ts):
-            primary = row
-            secondary = existing
-        elif existing_ts and candidate_ts and existing_ts == candidate_ts:
-            primary = existing if _preview_row_signal_score(existing) >= _preview_row_signal_score(row) else row
-            secondary = row if primary is existing else existing
-        else:
-            primary = existing
-            secondary = row
-        deduped[key] = _merge_preview_row_data(primary, secondary)
+        primary, secondary, scalar_conflict, prefer_primary_source_fields = _choose_dedupe_primary(existing, row)
+        deduped[key] = _merge_preview_row_data(
+            primary,
+            secondary,
+            allow_scalar_backfill=not scalar_conflict,
+            prefer_primary_source_fields=prefer_primary_source_fields,
+        )
 
     return sorted(
         passthrough + list(deduped.values()),
@@ -4220,6 +5871,7 @@ def publish_preview_rows(
 
 def build_runtime_context() -> dict[str, str]:
     return {
+        "openai_api_key": get_openai_api_key(),
         "gemini_api_key": get_gemini_api_key(),
         "notion_api_key": get_notion_api_key(),
         "notion_data_source_id": DEFAULT_NOTION_DATA_SOURCE_ID,

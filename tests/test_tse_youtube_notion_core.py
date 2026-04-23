@@ -31,12 +31,18 @@ from tse_youtube_notion_core import (
     extract_retry_delay_seconds,
     filter_general_news_urls,
     infer_classe_from_row_text,
+    infer_full_numero_processo_from_row_text,
+    infer_resultado_from_row_text,
     infer_origin_from_row_text,
+    infer_punchline_from_row_text,
     infer_relator_from_row_text,
     infer_votacao_from_row_text,
     normalize_party_list,
+    punchline_looks_generic,
     publish_preview_rows,
+    should_replace_classe_processo,
     should_disable_model,
+    tema_looks_generic,
     create_gemini_client,
     validate_preview_row,
 )
@@ -331,6 +337,173 @@ def test_build_preview_rows_prefers_session_composition_when_item_is_sparse():
     ]
 
 
+def test_build_preview_rows_extracts_relator_and_pedido_vista_from_composicao_markers():
+    schema = make_schema()
+    notion = FakeNotionClient()
+    analysis = AnalysisResult(
+        session=SessionExtraction(
+            data_sessao="03/02/2022",
+            composicao=["Min. Alexandre de Moraes", "Min. Sérgio Banhos"],
+            judgments=[],
+        ),
+        bundles=[
+            JudgmentBundleExtraction(
+                start_seconds=4860,
+                items=[
+                    JudgmentItemExtraction(
+                        data_sessao="08/09/2020",
+                        eleicao="2020",
+                        classe_processo="AgRg-REspe",
+                        numero_processo="0000697-22.2016.6.13.0000",
+                        origem="Belo Horizonte/MG",
+                        tre="TRE-MG",
+                        partes=["Alice"],
+                        advogados=[],
+                        composicao=[
+                            "Ministro Sérgio Banhos (Relator)",
+                            "Ministro Alexandre de Moraes (Voto-vista)",
+                        ],
+                        relator="",
+                        pedido_vista="",
+                        tema="Tema útil",
+                        punchline="Resumo forte",
+                        analise_do_conteudo_juridico="Análise",
+                        fundamentacao_normativa="Fundamentação",
+                        precedentes_citados="",
+                        raciocinio_juridico="",
+                        pontos_processuais_relevantes="",
+                        efeitos_e_providencias_praticas="",
+                        resolucoes_citadas="",
+                        votacao="Por maioria",
+                        resultado_final="Desprovido",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    rows = build_preview_rows(analysis, "https://youtu.be/NALJtQaMUSs", schema, notion)
+
+    assert len(rows) == 1
+    assert rows[0].relator == "Min. Sérgio Banhos"
+    assert rows[0].pedido_vista == "Min. Alexandre de Moraes"
+    assert rows[0].data_sessao == "2022-02-03"
+
+
+def test_build_preview_rows_ignores_invalid_session_composition_with_eight_names():
+    schema = make_schema()
+    notion = FakeNotionClient()
+    analysis = AnalysisResult(
+        session=SessionExtraction(
+            data_sessao="20/03/2026",
+            composicao=[
+                "Ministra Cármen Lúcia",
+                "Ministro André Mendonça",
+                "Ministra Isabel Gallotti",
+                "Ministro Kassio Nunes Marques",
+                "Ministro Floriano de Azevedo Marques",
+                "Ministro Alexandre de Moraes",
+                "Ministro Ramos Tavares",
+                "Ministro Excedente",
+            ],
+            judgments=[],
+        ),
+        bundles=[
+            JudgmentBundleExtraction(
+                start_seconds=120,
+                items=[
+                    JudgmentItemExtraction(
+                        data_sessao="20/03/2026",
+                        eleicao="2024",
+                        classe_processo="PA",
+                        numero_processo="0600001-01.2024.6.00.0000",
+                        origem="Brasília/DF",
+                        tre="TSE",
+                        partes=["Alice"],
+                        composicao=["Ministra Cármen Lúcia", "Ministro André Mendonça"],
+                        relator="Ministro André Mendonça",
+                        tema="Tema útil",
+                        punchline="Resumo",
+                        resultado_final="Aprovada",
+                        votacao="Unânime",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    rows = build_preview_rows(analysis, "https://youtu.be/abc123", schema, notion)
+    assert rows[0].composicao == ["Min. Cármen Lúcia", "Min. André Mendonça"]
+
+
+def test_build_preview_rows_prefers_session_date_over_item_date():
+    schema = make_schema()
+    notion = FakeNotionClient()
+    analysis = AnalysisResult(
+        session=SessionExtraction(
+            data_sessao="20/03/2026",
+            composicao=["Ministra Cármen Lúcia"],
+            judgments=[],
+        ),
+        bundles=[
+            JudgmentBundleExtraction(
+                start_seconds=120,
+                items=[
+                    JudgmentItemExtraction(
+                        data_sessao="16/05/2023",
+                        eleicao="2024",
+                        classe_processo="PA",
+                        numero_processo="0600001-01.2024.6.00.0000",
+                        origem="Brasília/DF",
+                        tre="TSE",
+                        relator="Ministro André Mendonça",
+                        tema="Tema útil",
+                        resultado_final="Aprovada",
+                        votacao="Unânime",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    rows = build_preview_rows(analysis, "https://youtu.be/abc123", schema, notion)
+    assert len(rows) == 1
+    assert rows[0].data_sessao == "2026-03-20"
+
+
+def test_build_preview_rows_drops_timestamp_when_item_date_conflicts_with_authoritative_session_date():
+    schema = make_schema()
+    notion = FakeNotionClient()
+    analysis = AnalysisResult(
+        session=SessionExtraction(
+            data_sessao="11/02/2021",
+            composicao=["Ministro Luís Roberto Barroso"],
+            judgments=[],
+        ),
+        bundles=[
+            JudgmentBundleExtraction(
+                start_seconds=114,
+                items=[
+                    JudgmentItemExtraction(
+                        data_sessao="23/06/2021",
+                        numero_processo="0600378-65.2020.6.00.0000",
+                        tema="Tema útil",
+                        relator="Ministro Luís Roberto Barroso",
+                        resultado_final="Aprovado o voto do relator.",
+                        votacao="Unânime.",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    rows = build_preview_rows(analysis, "https://youtu.be/s9Ts40TfDas", schema, notion)
+
+    assert len(rows) == 1
+    assert rows[0].data_sessao == "2021-02-11"
+    assert rows[0].youtube_link == "https://www.youtube.com/watch?v=s9Ts40TfDas"
+
+
 def test_build_preview_rows_orders_joint_cases_by_item_position_not_process_number():
     schema = make_schema()
     notion = FakeNotionClient()
@@ -463,6 +636,44 @@ def test_build_fallback_tema_infers_from_analysis_text_when_theme_is_generic():
     assert build_fallback_tema(row) == "Manutenção de medidas cautelares patrimoniais"
 
 
+def test_build_fallback_tema_discards_decision_sentence_and_infers_legal_issue():
+    row = PublishPreviewRow(
+        tema="O Tribunal, por unanimidade, negou provimento ao agravo regimental",
+        punchline="O Tribunal, por unanimidade, negou provimento ao agravo regimental.",
+        classe_processo="AgRg-REspe",
+        numero_processo="0600136-55",
+        resultado="Desprovido",
+        votacao="Unânime",
+        analise_do_conteudo_juridico=(
+            "O cerne da discussão jurídica reside na contagem do prazo de inelegibilidade "
+            "decorrente de condenação criminal quando há parcelamento da multa."
+        ),
+        raciocinio_juridico=(
+            "O relator reafirmou que o parcelamento da multa não posterga o prazo de inelegibilidade."
+        ),
+        fundamentacao_normativa="Súmula 61 do TSE.",
+    )
+    assert build_fallback_tema(row) == "Prazo de inelegibilidade e parcelamento da pena de multa"
+
+
+def test_build_fallback_tema_infers_cota_feminina_fefc_theme_from_context():
+    row = PublishPreviewRow(
+        tema="O Tribunal negou provimento ao agravo regimental, mantendo a decisão que desaprovou as contas de campanha da candidata",
+        punchline="O Tribunal negou provimento ao agravo regimental.",
+        classe_processo="AgRg-REspe",
+        numero_processo="0600433-71",
+        resultado="Desprovido",
+        votacao="Unânime",
+        analise_do_conteudo_juridico=(
+            "A irregularidade apontada foi o repasse de verba do Fundo Especial de Financiamento "
+            "de Campanha, destinado à cota feminina, para candidato do gênero masculino, sem a "
+            "demonstração de benefício comum à campanha da candidata."
+        ),
+        raciocinio_juridico="Aplicou-se a Súmula 30 do TSE sobre o desvirtuamento da cota feminina.",
+    )
+    assert build_fallback_tema(row) == "Desvio de recursos da cota feminina do FEFC para candidatura masculina"
+
+
 def test_build_fallback_tema_infers_fundo_partidario_consultoria_theme():
     row = PublishPreviewRow(
         tema="Processo 0600366-24.2022.6.00.0000",
@@ -474,6 +685,28 @@ def test_build_fallback_tema_infers_fundo_partidario_consultoria_theme():
         ),
     )
     assert build_fallback_tema(row) == "Uso do Fundo Partidário para custear consultoria jurídica e contábil"
+
+
+def test_build_fallback_tema_infers_consulta_conduta_vedada_theme():
+    row = PublishPreviewRow(
+        tema=(
+            "Além disso, destacou que a análise sobre a configuração de conduta vedada exige "
+            "a verificação de fatos e provas, o que é incompatível com o rito da consulta eleitoral"
+        ),
+        classe_processo="CTA",
+        numero_processo="0600090-81",
+        analise_do_conteudo_juridico=(
+            "Consulta formulada questionando a possibilidade de exame de conduta vedada em tese. "
+            "O relator votou pelo não conhecimento da consulta por ausência de abstração e por "
+            "tratar de casos concretos, além de não caber ao TSE analisar a configuração de "
+            "condutas vedadas por meio de consulta."
+        ),
+        raciocinio_juridico=(
+            "A análise sobre a configuração de conduta vedada exige a verificação de fatos e provas, "
+            "o que é incompatível com o rito da consulta eleitoral."
+        ),
+    )
+    assert build_fallback_tema(row) == "Cabimento de consulta eleitoral para análise abstrata de conduta vedada"
 
 
 def test_build_fallback_tema_infers_publicidade_institucional_theme():
@@ -500,6 +733,23 @@ def test_build_fallback_tema_infers_programa_social_theme():
         ),
     )
     assert build_fallback_tema(row) == "Uso promocional de programa social como conduta vedada"
+
+
+def test_build_fallback_tema_infers_specific_party_accounts_theme():
+    row = PublishPreviewRow(
+        tema="Prestação de contas partidárias",
+        classe_processo="PC",
+        numero_processo="0600231-08.2019.6.00.0000",
+        analise_do_conteudo_juridico=(
+            "O processo trata da prestação de contas do exercício de 2015, relatada pelo Ministro "
+            "Tarcísio Vieira de Carvalho, que foi aprovada com ressalvas."
+        ),
+        punchline=(
+            "As contas partidárias do exercício de 2015 foram aprovadas com ressalvas, "
+            "com determinação de devolução ao erário do valor de R$ 1.253.409,31."
+        ),
+    )
+    assert build_fallback_tema(row) == "Prestação de contas partidárias do exercício de 2015 com devolução ao erário"
 
 
 def test_build_fallback_tema_infers_panfletagem_theme():
@@ -542,6 +792,189 @@ def test_build_fallback_tema_replaces_overbroad_inelegibilidade_with_specific_th
     assert build_fallback_tema(row) == "Execução integral de convênio afasta inelegibilidade por rejeição de contas"
 
 
+def test_tema_looks_generic_flags_decision_sentence_theme():
+    row = PublishPreviewRow(
+        classe_processo="AgRg-REspe",
+        numero_processo="0600136-55",
+        resultado="Desprovido",
+        votacao="Unânime",
+    )
+    assert tema_looks_generic(
+        "O Tribunal, por unanimidade, negou provimento ao agravo regimental",
+        row,
+    )
+
+
+def test_tema_looks_generic_flags_o_processo_trata_de_formula():
+    row = PublishPreviewRow(
+        classe_processo="PC",
+        numero_processo="0600444-44.0000.6.00.0000",
+    )
+    assert tema_looks_generic(
+        "O processo trata de prestação de contas",
+        row,
+    )
+
+
+def test_tema_looks_generic_flags_relational_case_stub():
+    row = PublishPreviewRow(
+        classe_processo="REspe",
+        numero_processo="0600003-05",
+        relator="Min. Ramos Tavares",
+    )
+    assert tema_looks_generic(
+        "Caso do município de Aracaju, relator Ministro Raul Araújo",
+        row,
+    )
+
+
+def test_tema_looks_generic_flags_reporting_sentence_theme():
+    row = PublishPreviewRow(
+        classe_processo="CTA",
+        numero_processo="0600090-81",
+    )
+    assert tema_looks_generic(
+        "Além disso, destacou que a análise sobre a configuração de conduta vedada exige a verificação de fatos e provas, o que é incompatível com o rito da consulta eleitoral",
+        row,
+    )
+
+
+def test_tema_looks_generic_flags_overbroad_party_accounts_theme():
+    row = PublishPreviewRow(
+        classe_processo="PC",
+        numero_processo="0600231-08.2019.6.00.0000",
+    )
+    assert tema_looks_generic("Prestação de contas partidárias", row)
+
+
+def test_build_fallback_tema_prefers_more_specific_cota_genero_theme():
+    row = PublishPreviewRow(
+        tema="Fraude à cota de gênero",
+        classe_processo="REspe",
+        numero_processo="0600003-05",
+        origem="Granjeiro/CE",
+        resultado="Suspenso por vista",
+        analise_do_conteudo_juridico=(
+            "O recurso especial eleitoral discute a configuração de fraude à cota de gênero "
+            "nas eleições de 2020 para vereador em Granjeiro/CE. A Ministra Cármen Lúcia "
+            "pediu vista para examinar a modulação dos efeitos da cassação e o impacto da "
+            "decisão sobre a representação feminina."
+        ),
+        raciocinio_juridico=(
+            "O voto propõe reconhecer a fraude e cassar o mandato, mas o colegiado debate "
+            "como modular os efeitos para não reduzir a representação feminina."
+        ),
+    )
+    assert build_fallback_tema(row) == "Fraude à cota de gênero e modulação dos efeitos da cassação"
+
+
+def test_build_fallback_tema_infers_aime_cota_genero_theme():
+    row = PublishPreviewRow(
+        tema="Fraude à cota de gênero",
+        classe_processo="REspe",
+        numero_processo="0600003-05",
+        analise_do_conteudo_juridico=(
+            "O processo trata de recurso especial eleitoral contra acórdão do TRE/CE que julgou "
+            "improcedente ação de impugnação de mandato eletivo (AIME) por suposta fraude à cota "
+            "de gênero nas eleições de 2020 para vereador em Granjeiro/CE."
+        ),
+    )
+    assert build_fallback_tema(row) == "Fraude à cota de gênero em ação de impugnação de mandato eletivo"
+
+
+def test_punchline_looks_generic_keeps_pedido_de_vista_sentence():
+    row = PublishPreviewRow(
+        classe_processo="PC",
+        numero_processo="0600444-44.0000.6.00.0000",
+    )
+    assert not punchline_looks_generic("Julgamento adiado por pedido de vista.", row)
+
+
+def test_punchline_looks_generic_flags_o_processo_trata_de_prestacao_de_contas():
+    row = PublishPreviewRow(
+        classe_processo="PC",
+        numero_processo="0600444-44.0000.6.00.0000",
+    )
+    assert punchline_looks_generic("O processo trata de prestação de contas.", row)
+
+
+def test_punchline_looks_generic_flags_long_recurso_intro():
+    row = PublishPreviewRow(
+        classe_processo="REspe",
+        numero_processo="0600003-05",
+    )
+    assert punchline_looks_generic(
+        "O processo trata de recurso especial eleitoral contra acórdão do TRE/CE que julgou improcedente ação de impugnação de mandato eletivo por suposta fraude à cota de gênero.",
+        row,
+    )
+
+
+def test_punchline_looks_generic_flags_relator_stub():
+    row = PublishPreviewRow(
+        classe_processo="REspe",
+        numero_processo="0600003-05",
+    )
+    assert punchline_looks_generic(
+        "Caso do município de Aracaju, relator Ministro Raul Araújo com julgamento suspenso por pedido de vista.",
+        row,
+    )
+
+
+def test_punchline_looks_generic_flags_meta_raciocinio_sentence():
+    row = PublishPreviewRow(
+        classe_processo="AIJE",
+        numero_processo="0600003-05",
+    )
+    assert punchline_looks_generic(
+        "O raciocínio jurídico baseou-se na premissa de que a fraude à cota de gênero compromete a lisura do pleito.",
+        row,
+    )
+
+
+def test_punchline_looks_generic_flags_relator_vote_stub():
+    row = PublishPreviewRow(
+        classe_processo="REspe",
+        numero_processo="0600863-49.2022.6.05.0000",
+    )
+    assert punchline_looks_generic(
+        "O relator, Ministro Raul Araújo, votou pelo desprovimento do recurso.",
+        row,
+    )
+
+
+def test_punchline_looks_generic_flags_vote_followed_by_other_ministers():
+    row = PublishPreviewRow(
+        classe_processo="AREspe",
+        numero_processo="0600682-94.2024.6.00.0000",
+    )
+    assert punchline_looks_generic(
+        "O voto da relatora foi acompanhado pelos ministros André Ramos Tavares, Nunes Marques e Cristiano Zanin.",
+        row,
+    )
+
+
+def test_punchline_looks_generic_flags_result_only_sentence():
+    row = PublishPreviewRow(
+        classe_processo="AgRg-REspe",
+        numero_processo="0600279-20",
+    )
+    assert punchline_looks_generic(
+        "Negado provimento ao agravo regimental, mantendo-se a decisão que aprovou com ressalvas as contas de campanha.",
+        row,
+    )
+
+
+def test_punchline_looks_generic_flags_citation_only_sentence():
+    row = PublishPreviewRow(
+        classe_processo="PC",
+        numero_processo="0600231-08.2019.6.00.0000",
+    )
+    assert punchline_looks_generic(
+        "Artigo 73, inciso VI, alínea b, da Lei 9.504/1997; Lei 9.996/96.",
+        row,
+    )
+
+
 def test_infer_relator_from_row_text_reads_relatoria_phrase():
     row = PublishPreviewRow(
         analise_do_conteudo_juridico="O processo estava sob relatoria do Ministro Ramos Tavares e foi levado a julgamento."
@@ -566,11 +999,79 @@ def test_infer_classe_from_row_text_detects_consulta():
     assert infer_classe_from_row_text(row) == "CTA"
 
 
+def test_infer_classe_from_row_text_detects_aije():
+    row = PublishPreviewRow(
+        analise_do_conteudo_juridico=(
+            "Trata-se de Ação de Investigação Judicial Eleitoral (AIJE) proposta para apurar "
+            "abuso de poder e desinformação sobre o sistema eletrônico de votação."
+        )
+    )
+    assert infer_classe_from_row_text(row) == "AIJE"
+
+
+def test_infer_classe_from_row_text_detects_prestacao_de_contas():
+    row = PublishPreviewRow(
+        analise_do_conteudo_juridico=(
+            "O processo versa sobre prestação de contas partidárias com exame da regularidade "
+            "de despesas custeadas pelo Fundo Partidário."
+        )
+    )
+    assert infer_classe_from_row_text(row) == "PC"
+
+
+def test_infer_classe_from_row_text_detects_arespe():
+    row = PublishPreviewRow(
+        analise_do_conteudo_juridico=(
+            "Agravo em recurso especial eleitoral sobre fraude à cota de gênero e cassação dos diplomas."
+        )
+    )
+    assert infer_classe_from_row_text(row) == "AREspe"
+
+
+def test_infer_classe_from_row_text_detects_plural_agravos_em_recurso_especial():
+    row = PublishPreviewRow(
+        resultado="Parcial provimento aos agravos em recurso especial para afastar a multa imposta na origem.",
+        analise_do_conteudo_juridico="Abuso de poder econômico em Tucuruí/PA.",
+    )
+    assert infer_classe_from_row_text(row) == "AREspe"
+
+
 def test_infer_origin_from_row_text_extracts_city_uf():
     row = PublishPreviewRow(
         analise_do_conteudo_juridico="Discute-se a inelegibilidade de candidatos a prefeito e vice-prefeito de Paranhos/MS."
     )
     assert infer_origin_from_row_text(row) == "Paranhos/MS"
+
+
+def test_infer_origin_from_row_text_falls_back_to_tre_sigla_and_tse():
+    row_tre = PublishPreviewRow(
+        analise_do_conteudo_juridico="Acórdão do Tribunal Regional Eleitoral de Sergipe (TRE-SE)."
+    )
+    row_tse = PublishPreviewRow(
+        analise_do_conteudo_juridico="Questão administrativa interna do Tribunal Superior Eleitoral."
+    )
+    assert infer_origin_from_row_text(row_tre) == "TRE/SE"
+    assert infer_origin_from_row_text(row_tse) == "TSE"
+
+
+def test_infer_origin_from_row_text_ignores_plural_tre_listing_noise():
+    row = PublishPreviewRow(
+        analise_do_conteudo_juridico=(
+            "Consulta enviada aos Tribunais Regionais Eleitorais do Pará, Paraná/RJ, "
+            "sem indicação segura da cidade de origem do processo."
+        )
+    )
+    assert infer_origin_from_row_text(row) == ""
+
+
+def test_infer_origin_from_row_text_ignores_state_listing_ending_with_fake_city_uf():
+    row = PublishPreviewRow(
+        analise_do_conteudo_juridico=(
+            "Foram citados Distrito Federal, Rio Grande do Sul, Rio Grande do Norte, Acre, Amapá/RO, "
+            "sem indicação segura da cidade de origem do processo."
+        )
+    )
+    assert infer_origin_from_row_text(row) == ""
 
 
 def test_validate_preview_row_keeps_safe_new_select_options():
@@ -590,6 +1091,42 @@ def test_validate_preview_row_keeps_safe_new_select_options():
     assert validated.relator == "Min. Alexandre de Moraes"
     assert validated.votacao == "Unânime"
     assert any("opção nova no Notion" in message for message in validated.warnings)
+
+
+def test_validate_preview_row_accepts_safe_dynamic_aije_and_resultado():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Integridade do sistema eletrônico de votação",
+        numero_processo="0600263-54.2022.6.00.0000",
+        data_sessao="2024-05-07",
+        classe_processo="AIJE",
+        resultado="Improcedente",
+        votacao="Unânime",
+        relator="Min. Alexandre de Moraes",
+    )
+
+    validated = validate_preview_row(row, schema)
+
+    assert validated.classe_processo == "AIJE"
+    assert validated.resultado == "Improcedente"
+
+
+def test_validate_preview_row_sets_tse_as_subsidiary_origin_for_cta():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Uso do Fundo Partidário para custear consultoria jurídica e contábil",
+        numero_processo="0600814-85.2022.6.00.0000",
+        data_sessao="2025-02-26",
+        classe_processo="CTA",
+        origem="",
+        tribunal="",
+        resultado="Aprovada",
+        votacao="Unânime",
+    )
+
+    validated = validate_preview_row(row, schema)
+
+    assert validated.origem == "TSE"
 
 
 def test_normalize_party_list_keeps_role_at_end_and_drops_lawyers():
@@ -684,6 +1221,417 @@ def test_build_properties_payload_can_clear_multi_select_on_update():
     assert payload["partes"] == {"multi_select": []}
 
 
+def test_collect_missing_multiselect_properties_only_tracks_partes_and_advogados():
+    schema = make_schema()
+    client = NotionSessoesClient(api_key="token", data_source_id="fake-ds")
+    row = PublishPreviewRow(
+        partes=["Alice", "Carol"],
+        advogados=["Dr. João da Silva", "Dr. Maria"],
+        composicao=["Min. Ministro Novo"],
+    )
+    assert client._collect_missing_multiselect_properties(schema, row) == ["partes", "advogados"]
+
+
+def test_collect_missing_multiselect_options_collects_new_labels_once():
+    schema = make_schema()
+    client = NotionSessoesClient(api_key="token", data_source_id="fake-ds")
+    row = PublishPreviewRow(
+        partes=["Alice", "Carol", "Carol"],
+        advogados=["Dr. João da Silva", "Dr. Maria"],
+        composicao=["Min. Ministro Novo"],
+    )
+    assert client._collect_missing_multiselect_options(schema, row) == {
+        "partes": ["Carol"],
+        "advogados": ["Dr. Maria"],
+    }
+
+
+def test_create_row_preseeds_new_partes_and_advogados_in_default_schema():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(api_key="token", data_source_id="fake-ds")
+            self.created_payload = None
+            self.preseeded_options = None
+
+        def _request(self, method, path, **kwargs):
+            if method == "POST" and path == "/pages":
+                self.created_payload = kwargs.get("json")
+                return {"id": "page-created", "url": "https://notion.so/page-created"}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        def ensure_multiselect_options_default(self, missing_options):
+            self.preseeded_options = dict(missing_options)
+            return {"updated": True}
+
+    schema = make_schema()
+    client = RecordingClient()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        partes=["Alice", "Carol"],
+        advogados=["Dr. João da Silva", "Dr. Maria"],
+        data_sessao="2026-03-20",
+    )
+    response = client.create_row(schema, row)
+    assert response["id"] == "page-created"
+    assert client.created_payload["properties"]["partes"]["multi_select"] == [{"name": "Alice"}, {"name": "Carol"}]
+    assert client.created_payload["properties"]["advogados"]["multi_select"] == [
+        {"name": "Dr. João da Silva"},
+        {"name": "Dr. Maria"},
+    ]
+    assert client.preseeded_options == {
+        "partes": ["Carol"],
+        "advogados": ["Dr. Maria"],
+    }
+
+
+def test_create_row_preseeds_missing_select_options_for_relator_and_pedido_vista():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(api_key="token", data_source_id="fake-ds")
+            self.created_payload = None
+            self.preseeded_select_options = None
+            self.preseeded_multiselect_options = None
+
+        def _request(self, method, path, **kwargs):
+            if method == "POST" and path == "/pages":
+                self.created_payload = kwargs.get("json")
+                return {"id": "page-created", "url": "https://notion.so/page-created"}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        def ensure_select_options_default(self, missing_options):
+            self.preseeded_select_options = dict(missing_options)
+            return {"updated": True}
+
+        def ensure_multiselect_options_default(self, missing_options):
+            self.preseeded_multiselect_options = dict(missing_options)
+            return {"updated": True}
+
+    schema = make_schema()
+    client = RecordingClient()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        numero_processo="0000697-22.2016.6.13.0000",
+        relator="Ministro Sérgio Banhos",
+        pedido_vista="Alexandre de Moraes",
+        data_sessao="03/02/2022",
+    )
+
+    response = client.create_row(schema, row)
+
+    assert response["id"] == "page-created"
+    assert client.preseeded_select_options == {
+        "relator": ["Ministro Sérgio Banhos"],
+        "pedido_vista": ["Alexandre de Moraes"],
+    }
+    assert client.preseeded_multiselect_options is None
+
+
+def test_ensure_multiselect_options_default_ignores_remote_existing_option_with_legacy_color():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(api_key="token", data_source_id="fake-ds")
+            self.patch_calls = []
+            self.get_count = 0
+
+        def _request(self, method, path, **kwargs):
+            if method == "GET" and path == "/data_sources/fake-ds":
+                self.get_count += 1
+                options = [{"name": "Alice", "color": "default"}]
+                if self.get_count >= 2:
+                    options.append({"name": "Carol", "color": "blue"})
+                return {
+                    "properties": {
+                        "partes": {
+                            "type": "multi_select",
+                            "multi_select": {"options": options},
+                        }
+                    }
+                }
+            if method == "PATCH" and path == "/data_sources/fake-ds":
+                self.patch_calls.append(kwargs.get("json"))
+                raise RuntimeError(
+                    'Notion API error 400: {"object":"error","status":400,"code":"validation_error",'
+                    '"message":"Cannot update color of select with name: Carol."}'
+                )
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = RecordingClient()
+
+    result = client.ensure_multiselect_options_default({"partes": ["Carol"]})
+
+    assert result == {"updated": False, "properties": []}
+    assert len(client.patch_calls) == 1
+    assert client.get_count == 2
+
+
+def test_ensure_multiselect_options_default_preserves_existing_options_when_adding_new_one():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(api_key="token", data_source_id="fake-ds")
+            self.options = [
+                {"name": "Alice", "color": "default"},
+                {"name": "Bob", "color": "default"},
+            ]
+            self.patch_calls = []
+
+        def _request(self, method, path, **kwargs):
+            if method == "GET" and path == "/data_sources/fake-ds":
+                return {
+                    "properties": {
+                        "partes": {
+                            "type": "multi_select",
+                            "multi_select": {"options": list(self.options)},
+                        }
+                    }
+                }
+            if method == "PATCH" and path == "/data_sources/fake-ds":
+                payload_options = kwargs.get("json", {}).get("properties", {}).get("partes", {}).get("multi_select", {}).get("options", [])
+                self.patch_calls.append(payload_options)
+                self.options = list(payload_options)
+                return {"ok": True}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = RecordingClient()
+
+    result = client.ensure_multiselect_options_default({"partes": ["Carol"]})
+
+    assert result == {"updated": True, "properties": [{"property": "partes", "created_options": 1}]}
+    assert client.options == [
+        {"name": "Alice", "color": "default"},
+        {"name": "Bob", "color": "default"},
+        {"name": "Carol", "color": "default"},
+    ]
+    assert client.patch_calls[-1] == client.options
+
+
+def test_ensure_select_options_default_preserves_existing_options_when_adding_new_one():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(api_key="token", data_source_id="fake-ds")
+            self.options = [
+                {"name": "Min. Cármen Lúcia", "color": "default"},
+                {"name": "Min. André Mendonça", "color": "default"},
+            ]
+            self.patch_calls = []
+
+        def _request(self, method, path, **kwargs):
+            if method == "GET" and path == "/data_sources/fake-ds":
+                return {
+                    "properties": {
+                        "relator": {
+                            "type": "select",
+                            "select": {"options": list(self.options)},
+                        }
+                    }
+                }
+            if method == "PATCH" and path == "/data_sources/fake-ds":
+                payload_options = kwargs.get("json", {}).get("properties", {}).get("relator", {}).get("select", {}).get("options", [])
+                self.patch_calls.append(payload_options)
+                self.options = list(payload_options)
+                return {"ok": True}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = RecordingClient()
+
+    result = client.ensure_select_options_default({"relator": ["Min. Sérgio Banhos"]})
+
+    assert result == {"updated": True, "properties": [{"property": "relator", "created_options": 1}]}
+    assert client.options == [
+        {"name": "Min. Cármen Lúcia", "color": "default"},
+        {"name": "Min. André Mendonça", "color": "default"},
+        {"name": "Min. Sérgio Banhos", "color": "default"},
+    ]
+    assert client.patch_calls[-1] == client.options
+
+
+def test_ensure_multiselect_options_default_skips_schema_patch_when_property_is_already_above_limit():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(api_key="token", data_source_id="fake-ds")
+            self.patch_calls = []
+
+        def _request(self, method, path, **kwargs):
+            if method == "GET" and path == "/data_sources/fake-ds":
+                options = [{"name": f"Opt {index}", "color": "default"} for index in range(101)]
+                return {
+                    "properties": {
+                        "partes": {
+                            "type": "multi_select",
+                            "multi_select": {"options": options},
+                        }
+                    }
+                }
+            if method == "PATCH" and path == "/data_sources/fake-ds":
+                self.patch_calls.append(kwargs.get("json"))
+                return {"ok": True}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = RecordingClient()
+
+    result = client.ensure_multiselect_options_default({"partes": ["Carol"]})
+
+    assert result == {
+        "updated": True,
+        "properties": [
+            {
+                "property": "partes",
+                "created_options": 0,
+                "skipped_schema_update_due_to_limit": True,
+            }
+        ],
+    }
+    assert client.patch_calls == []
+
+
+def test_update_row_skips_schema_normalization_when_no_new_multiselect_option_exists():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(api_key="token", data_source_id="fake-ds")
+            self.updated_payload = None
+            self.preseeded_options = None
+
+        def _request(self, method, path, **kwargs):
+            if method == "PATCH" and path == "/pages/page-123":
+                self.updated_payload = kwargs.get("json")
+                return {"id": "page-123", "url": "https://notion.so/page-123"}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        def ensure_multiselect_options_default(self, missing_options):
+            self.preseeded_options = dict(missing_options)
+            return {"updated": True}
+
+    schema = make_schema()
+    client = RecordingClient()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        partes=["Alice"],
+        advogados=["Dr. João da Silva"],
+        data_sessao="2026-03-20",
+    )
+    response = client.update_row(schema, "page-123", row)
+    assert response["id"] == "page-123"
+    assert client.updated_payload["properties"]["partes"]["multi_select"] == [{"name": "Alice"}]
+    assert client.updated_payload["properties"]["advogados"]["multi_select"] == [{"name": "Dr. João da Silva"}]
+    assert client.preseeded_options is None
+
+
+def test_create_row_skips_schema_normalization_when_post_write_is_disabled():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(
+                api_key="token",
+                data_source_id="fake-ds",
+                normalize_multiselect_colors_post_write=False,
+            )
+            self.created_payload = None
+
+        def _request(self, method, path, **kwargs):
+            if method == "POST" and path == "/pages":
+                self.created_payload = kwargs.get("json")
+                return {"id": "page-created", "url": "https://notion.so/page-created"}
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        def ensure_multiselect_options_default(self, missing_options):
+            raise AssertionError("schema normalization should stay disabled in this mode")
+
+    schema = make_schema()
+    client = RecordingClient()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        partes=["Alice", "Carol"],
+        advogados=["Dr. João da Silva", "Dr. Maria"],
+        data_sessao="2026-03-20",
+    )
+    response = client.create_row(schema, row)
+    assert response["id"] == "page-created"
+    assert client.created_payload["properties"]["partes"]["multi_select"] == [{"name": "Alice"}, {"name": "Carol"}]
+    assert client.created_payload["properties"]["advogados"]["multi_select"] == [
+        {"name": "Dr. João da Silva"},
+        {"name": "Dr. Maria"},
+    ]
+
+
+def test_rebuild_multiselect_property_with_default_colors_swaps_property_schema():
+    class RecordingClient(NotionSessoesClient):
+        def __init__(self):
+            super().__init__(api_key="token", data_source_id="fake-ds")
+            self.properties = {
+                "partes": {
+                    "id": "prop-partes",
+                    "type": "multi_select",
+                    "multi_select": {
+                        "options": [
+                            {"id": "opt-a", "name": "Alice", "color": "red"},
+                            {"id": "opt-b", "name": "Bob", "color": "blue"},
+                        ]
+                    },
+                }
+            }
+            self.pages = [
+                {"id": "page-1", "properties": {"partes": {"multi_select": [{"name": "Alice"}]}}},
+                {"id": "page-2", "properties": {"partes": {"multi_select": [{"name": "Bob"}]}}},
+            ]
+
+        def fetch_schema(self):
+            schema = make_schema()
+            schema.properties["partes"].options = [
+                option.get("name", "")
+                for option in self.properties.get("partes", {}).get("multi_select", {}).get("options", [])
+                if option.get("name", "")
+            ]
+            return schema
+
+        def _request(self, method, path, **kwargs):
+            if method == "GET" and path == "/data_sources/fake-ds":
+                return {"properties": self.properties}
+            if method == "POST" and path == "/data_sources/fake-ds/query":
+                return {"results": self.pages, "has_more": False, "next_cursor": None}
+            if method == "PATCH" and path == "/data_sources/fake-ds":
+                properties = kwargs.get("json", {}).get("properties", {})
+                for key, value in properties.items():
+                    if value is None:
+                        self.properties.pop(key, None)
+                        continue
+                    if "name" in value and key in {prop.get("id") for prop in self.properties.values()}:
+                        for current_name, prop in list(self.properties.items()):
+                            if prop.get("id") == key:
+                                new_name = value["name"]
+                                self.properties[new_name] = self.properties.pop(current_name)
+                                break
+                        continue
+                    target = self.properties.setdefault(key, {"id": f"id-{key}", "type": "multi_select", "multi_select": {"options": []}})
+                    options = value.get("multi_select", {}).get("options")
+                    if options is not None:
+                        existing = {opt["name"]: opt for opt in target["multi_select"]["options"]}
+                        for option in options:
+                            existing[option["name"]] = {
+                                "id": existing.get(option["name"], {}).get("id", f"id-{key}-{option['name']}"),
+                                "name": option["name"],
+                                "color": option.get("color", "default"),
+                            }
+                        target["multi_select"]["options"] = list(existing.values())
+                return {"properties": self.properties}
+            if method == "PATCH" and path.startswith("/pages/"):
+                page_id = path.split("/")[-1]
+                properties = kwargs.get("json", {}).get("properties", {})
+                for page in self.pages:
+                    if page["id"] == page_id:
+                        page["properties"].update(properties)
+                        return {"id": page_id}
+                raise AssertionError(f"unknown page: {page_id}")
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+    client = RecordingClient()
+    summary = client.rebuild_multiselect_property_with_default_colors("partes")
+    assert summary["updated"] is True
+    assert "partes" in client.properties
+    assert "partes__legacy_color" not in client.properties
+    assert "partes__default_tmp" not in client.properties
+    assert [opt["color"] for opt in client.properties["partes"]["multi_select"]["options"]] == ["default", "default"]
+    assert client.pages[0]["properties"]["partes"]["multi_select"] == [{"name": "Alice"}]
+    assert client.pages[1]["properties"]["partes"]["multi_select"] == [{"name": "Bob"}]
+
+
 def test_validate_preview_row_downgrades_noncritical_invalid_selects_to_warning():
     schema = make_schema()
     row = PublishPreviewRow(
@@ -707,6 +1655,21 @@ def test_validate_preview_row_downgrades_noncritical_invalid_selects_to_warning(
     assert any("resultado" in warning for warning in validated.warnings)
     assert validated.classe_processo == ""
     assert validated.resultado == ""
+
+
+def test_validate_preview_row_keeps_dynamic_tipo_registro_beyond_schema_options():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        tipo_registro="Julgamento 10",
+        numero_processo="0600249-07",
+        youtube_link="https://youtu.be/abc123?t=10",
+        data_sessao="20/03/2026",
+    )
+    validated = validate_preview_row(row, schema)
+    assert validated.tipo_registro == "Julgamento 10"
+    assert any("tipo_registro com opção nova no Notion: Julgamento 10" in warning for warning in validated.warnings)
+    assert not any("tipo_registro fora das opções do Notion" in warning for warning in validated.warnings)
 
 
 def test_validate_preview_row_clears_stale_dynamic_errors_after_normalization():
@@ -742,6 +1705,158 @@ def test_validate_preview_row_clears_stale_dynamic_errors_after_normalization():
     assert validated.eleicao == ""
     assert validated.pedido_vista == ""
     assert not any("relator fora das opções do Notion" in warning for warning in validated.warnings)
+
+
+def test_validate_preview_row_keeps_canonical_new_relator_and_pedido_vista_options():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        numero_processo="0000697-22.2016.6.13.0000",
+        relator="Ministro Sérgio Banhos",
+        pedido_vista="Alexandre de Moraes",
+        resultado="Aprovada",
+        votacao="Unânime",
+        data_sessao="03/02/2022",
+    )
+
+    validated = validate_preview_row(row, schema)
+
+    assert validated.relator == "Min. Sérgio Banhos"
+    assert validated.pedido_vista == "Min. Alexandre de Moraes"
+    assert any("relator com opção nova no Notion: Min. Sérgio Banhos" in warning for warning in validated.warnings)
+    assert any(
+        "pedido_vista com opção nova no Notion: Min. Alexandre de Moraes" in warning
+        for warning in validated.warnings
+    )
+    assert not any("relator fora das opções do Notion" in warning for warning in validated.warnings)
+    assert not any("pedido_vista fora das opções do Notion" in warning for warning in validated.warnings)
+
+
+def test_validate_preview_row_collapses_multi_name_relator_to_single_canonical_option():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        numero_processo="2354620-17",
+        relator="Luís Felipe Salomão (original), Raul Araújo (sucessor)",
+        pedido_vista="Ministro Raul Araújo",
+        data_sessao="31/08/2023",
+    )
+
+    validated = validate_preview_row(row, schema)
+
+    assert validated.relator == "Min. Raul Araújo"
+    assert validated.pedido_vista == "Min. Raul Araújo"
+    assert not any("Luís Felipe Salomão, Raul Araújo" in warning for warning in validated.warnings)
+
+
+def test_validate_preview_row_overrides_result_when_judgment_is_suspended_by_vista():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        numero_processo="0613678-87",
+        classe_processo="AgRg-REspe",
+        resultado="Provido",
+        votacao="Suspenso",
+        pedido_vista="Ministro Nunes Marques",
+        data_sessao="20/03/2026",
+    )
+    validated = validate_preview_row(row, schema)
+    assert validated.votacao == "Suspenso"
+    assert validated.resultado == "Suspenso por vista"
+
+
+def test_validate_preview_row_replaces_generic_pa_with_arespe_when_text_supports_it():
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        numero_processo="0600071-96.2025.6.00.0000",
+        classe_processo="PA",
+        analise_do_conteudo_juridico="Agravo em recurso especial eleitoral envolvendo fraude à cota de gênero.",
+        data_sessao="20/03/2026",
+    )
+
+    validated = validate_preview_row(row, None)
+
+    assert validated.classe_processo == "AREspe"
+
+
+def test_validate_preview_row_removes_textual_numero_and_splits_person_partes():
+    row = PublishPreviewRow(
+        tema="Abuso de poder político",
+        numero_processo="Recursos Ordinários de Luiz Augusto Barcelos Lara e Divaldo Vieira Lara",
+        partes=["Luiz Augusto Barcelos Lara e Divaldo Vieira Lara"],
+        data_sessao="03/03/2022",
+    )
+
+    validated = validate_preview_row(row, None)
+
+    assert validated.numero_processo == ""
+    assert validated.partes == ["Luiz Augusto Barcelos Lara", "Divaldo Vieira Lara"]
+    assert any(
+        "Número do processo textual inválido removido" in warning
+        for warning in validated.warnings
+    )
+
+
+def test_validate_preview_row_keeps_final_result_when_view_was_historical_but_vote_is_final():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        numero_processo="0600020-93",
+        classe_processo="AgRg-REspe",
+        resultado="Desprovido",
+        votacao="Por maioria",
+        pedido_vista="Ministro André Ramos Tavares",
+        data_sessao="20/03/2026",
+    )
+    validated = validate_preview_row(row, schema)
+    assert validated.votacao == "Por maioria"
+    assert validated.resultado == "Desprovido"
+
+
+def test_infer_resultado_from_row_text_maps_consulta_respondida_to_aprovada():
+    row = PublishPreviewRow(
+        tema="Utilização de Fundo Partidário para defesa de filiados",
+        punchline="",
+        analise_do_conteudo_juridico="Consulta formulada pelo partido sobre o uso do Fundo Partidário.",
+        raciocinio_juridico="Consulta respondida nos termos do voto do relator.",
+    )
+    assert infer_resultado_from_row_text(row) == "Aprovada"
+
+
+def test_infer_resultado_from_row_text_maps_improcedente():
+    row = PublishPreviewRow(
+        analise_do_conteudo_juridico=(
+            "O relator votou por julgar improcedente a ação de investigação judicial eleitoral, "
+            "afastando as alegações de fraude nas urnas eletrônicas."
+        ),
+    )
+    assert infer_resultado_from_row_text(row) == "Improcedente"
+
+
+def test_infer_resultado_from_row_text_maps_procedente_em_parte():
+    row = PublishPreviewRow(
+        analise_do_conteudo_juridico=(
+            "O voto conclui pela procedência parcial da representação, com imposição de multa "
+            "e manutenção de ordem de remoção do conteúdo irregular."
+        ),
+    )
+    assert infer_resultado_from_row_text(row) == "Procedente em parte"
+
+
+def test_validate_preview_row_infers_missing_resultado_from_text():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Utilização de Fundo Partidário para defesa de filiados",
+        numero_processo="0600814-85.2022.6.00.0000",
+        resultado="",
+        votacao="Unânime",
+        relator="Ministro Alexandre de Moraes",
+        analise_do_conteudo_juridico="Consulta formulada pelo partido sobre o uso do Fundo Partidário.",
+        raciocinio_juridico="Consulta respondida nos termos do voto do relator.",
+        data_sessao="21/05/2024",
+    )
+    validated = validate_preview_row(row, schema)
+    assert validated.resultado == "Aprovada"
 
 
 def test_publish_preview_rows_skips_blocked_and_updates_existing():
@@ -1068,7 +2183,6 @@ def test_process_metadata_enricher_skips_grounding_when_only_origem_is_missing(t
     )
     enricher = object.__new__(GeminiProcessMetadataEnricher)
     enricher.artifact_store = RunArtifacts(tmp_path)
-    enricher.ground_origem_with_search = False
 
     def should_not_run(*args, **kwargs):
         raise AssertionError("grounding não deveria ser chamado quando só falta origem")
@@ -1099,7 +2213,6 @@ def test_process_metadata_enricher_still_grounds_when_cnj_is_incomplete(tmp_path
     )
     enricher = object.__new__(GeminiProcessMetadataEnricher)
     enricher.artifact_store = RunArtifacts(tmp_path)
-    enricher.ground_origem_with_search = False
 
     def fake_call_grounded_json(*, prompt, response_model, artifact_name):
         assert "0600001-01" in prompt
@@ -1115,6 +2228,192 @@ def test_process_metadata_enricher_still_grounds_when_cnj_is_incomplete(tmp_path
 
     assert enriched[0].numero_processo == "0600001-01.2024.6.00.0000"
     assert enriched[0].origem == "Brasília/DF"
+
+
+def test_process_metadata_enricher_keeps_item_when_grounding_marks_precedent_but_local_video_proves_overlay_judgment(tmp_path):
+    row = PublishPreviewRow(
+        tema="ED na PC - 060122740",
+        classe_processo="PC",
+        tipo_registro="Julgamento 5",
+        eleicao="2018",
+        origem="Brasília/DF",
+        tribunal="TSE",
+        numero_processo="0601227-40",
+        youtube_link="https://www.youtube.com/watch?v=BLnwPIWKZv4&t=4963",
+        resultado="Rejeitados",
+        votacao="Unânime",
+        data_sessao="2023-04-18",
+        source_start_seconds=4963,
+        source_bundle_index=9,
+        source_item_index=1,
+    )
+    artifact_store = RunArtifacts(tmp_path)
+    artifact_store.write_text(
+        "raw_global_response_chunk_19.txt",
+        json.dumps(
+            [
+                {
+                    "data_sessao": "18 de abril de 2023",
+                    "julgamentos": [
+                        {
+                            "processo": "ED na PC - 060122740",
+                            "timestamp_inicial": 4963,
+                            "timestamp_final": 5106,
+                            "should_ignore": False,
+                        }
+                    ],
+                }
+            ],
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+    enricher = object.__new__(GeminiProcessMetadataEnricher)
+    enricher.artifact_store = artifact_store
+
+    def fake_call_grounded_json(*, prompt, response_model, artifact_name):
+        return core.ProcessMetadataResult(
+            full_numero_processo="0601227-40.2018.6.00.0000",
+            origem="Brasília/DF",
+            is_judged_process=False,
+        )
+
+    enricher._call_grounded_json = fake_call_grounded_json
+
+    enriched = enricher.enrich_rows([row])
+
+    assert enriched[0].blocked is False
+    assert enriched[0].numero_processo == "0601227-40.2018.6.00.0000"
+    assert any("prova local forte do julgamento" in warning for warning in enriched[0].warnings)
+
+
+def test_process_metadata_enricher_still_blocks_single_chunk_false_positive_when_grounding_marks_precedent(tmp_path):
+    row = PublishPreviewRow(
+        tema="0600378-65",
+        classe_processo="CTA",
+        tipo_registro="Julgamento 1",
+        tribunal="TSE",
+        numero_processo="0600378-65",
+        youtube_link="https://www.youtube.com/watch?v=s9Ts40TfDas&t=114",
+        data_sessao="2021-02-11",
+        source_start_seconds=114,
+        source_bundle_index=1,
+        source_item_index=1,
+    )
+    artifact_store = RunArtifacts(tmp_path)
+    artifact_store.write_text(
+        "raw_global_response_chunk_01.txt",
+        json.dumps(
+            [
+                {
+                    "data_sessao": "23 de junho de 2021",
+                    "julgamentos": [
+                        {
+                            "processo": "0600378-65.2020.6.00.0000",
+                            "timestamp_inicial": 114,
+                            "timestamp_final": 299,
+                            "should_ignore": False,
+                        }
+                    ],
+                }
+            ],
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+    enricher = object.__new__(GeminiProcessMetadataEnricher)
+    enricher.artifact_store = artifact_store
+
+    def fake_call_grounded_json(*, prompt, response_model, artifact_name):
+        return core.ProcessMetadataResult(
+            full_numero_processo="0600378-65.2020.6.00.0000",
+            origem="",
+            is_judged_process=False,
+        )
+
+    enricher._call_grounded_json = fake_call_grounded_json
+
+    enriched = enricher.enrich_rows([row])
+
+    assert enriched[0].blocked is True
+    assert any("precedente citado" in error for error in enriched[0].errors)
+
+
+def test_row_has_strong_local_judgment_evidence_accepts_processos_plural(tmp_path):
+    row = PublishPreviewRow(
+        tema="Agravo regimental em recurso especial eleitoral",
+        classe_processo="AgRg-REspe",
+        numero_processo="0602136-21.2022.6.17.0000",
+    )
+    artifact_store = RunArtifacts(tmp_path)
+    for chunk_name, start_seconds in [("10", 2679), ("11", 2700)]:
+        artifact_store.write_text(
+            f"raw_global_response_chunk_{chunk_name}.txt",
+            json.dumps(
+                [
+                    {
+                        "julgamentos": [
+                            {
+                                "processos": ["060213621", "060210598"],
+                                "timestamp_inicial": start_seconds,
+                                "should_ignore": False,
+                            }
+                        ]
+                    }
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+    assert core._row_has_strong_local_judgment_evidence(row, artifact_store) is True
+
+
+def test_process_metadata_enricher_keeps_judged_process_when_local_chunks_use_processos_plural(tmp_path):
+    row = PublishPreviewRow(
+        tema="Agravo regimental em recurso especial eleitoral",
+        classe_processo="AgRg-REspe",
+        numero_processo="0602136-21",
+        youtube_link="https://www.youtube.com/watch?v=r_TMEJe3iIg&t=2679",
+        data_sessao="2023-08-17",
+    )
+    artifact_store = RunArtifacts(tmp_path)
+    for chunk_name, start_seconds in [("10", 2679), ("11", 2700)]:
+        artifact_store.write_text(
+            f"raw_global_response_chunk_{chunk_name}.txt",
+            json.dumps(
+                [
+                    {
+                        "julgamentos": [
+                            {
+                                "processos": ["060213621", "060210598"],
+                                "timestamp_inicial": start_seconds,
+                                "should_ignore": False,
+                            }
+                        ]
+                    }
+                ],
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+    enricher = object.__new__(GeminiProcessMetadataEnricher)
+    enricher.artifact_store = artifact_store
+
+    def fake_call_grounded_json(*, prompt, response_model, artifact_name):
+        return core.ProcessMetadataResult(
+            full_numero_processo="0602136-21.2022.6.17.0000",
+            origem="Vitória/ES",
+            is_judged_process=False,
+        )
+
+    enricher._call_grounded_json = fake_call_grounded_json
+
+    enriched = enricher.enrich_rows([row])
+
+    assert enriched[0].blocked is False
+    assert any("prova local forte do julgamento" in warning for warning in enriched[0].warnings)
+    assert not any("precedente citado" in error for error in enriched[0].errors)
 
 
 def test_news_enricher_reuses_cached_artifact(tmp_path):
@@ -1985,3 +3284,252 @@ def test_should_disable_model_only_for_zero_quota_or_unsupported():
 def test_extract_retry_delay_seconds_parses_response_text():
     exc = RuntimeError("Please retry in 46.167278487s. {'retryDelay': '46s'}")
     assert extract_retry_delay_seconds(exc) == 46.167278487
+
+
+def test_validate_preview_row_promotes_full_cnj_and_fills_origin_from_tribunal():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="",
+        classe_processo="PA",
+        tipo_registro="Julgamento 1",
+        origem="Amapá",
+        tribunal="TRE-AP",
+        numero_processo="0600249-07",
+        youtube_link="https://www.youtube.com/watch?v=abc123&t=10",
+        raciocinio_juridico="O processo 0600249-07.2024.6.02.0001 trata de publicidade institucional.",
+        analise_do_conteudo_juridico="Publicidade institucional em período vedado.",
+        data_sessao="20/03/2026",
+    )
+
+    validated = validate_preview_row(row, schema)
+
+    assert validated.numero_processo == "0600249-07.2024.6.02.0001"
+    assert validated.origem == "TRE/AP"
+
+
+def test_validate_preview_row_promotes_special_adi_number_from_text():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Distribuição de sobras eleitorais",
+        numero_processo="7228",
+        analise_do_conteudo_juridico="O julgamento trata das ADI 7228, 7263 e 7325.",
+    )
+
+    validated = validate_preview_row(row, schema)
+
+    assert validated.numero_processo == "ADI 7228"
+    assert validated.classe_processo == "ADI"
+
+
+def test_infer_punchline_from_row_text_uses_contextual_sentence_not_decision_formula():
+    row = PublishPreviewRow(
+        tema="",
+        classe_processo="REspe",
+        resultado="Desprovido",
+        votacao="Unânime",
+        analise_do_conteudo_juridico=(
+            "Publicidade institucional em período vedado antes das eleições municipais. "
+            "O Tribunal, por unanimidade, negou provimento ao recurso."
+        ),
+        raciocinio_juridico="A propaganda institucional teve caráter promocional.",
+        fundamentacao_normativa="Art. 73, VI, b, da Lei 9.504/1997.",
+    )
+
+    assert infer_punchline_from_row_text(row) == "Publicidade institucional em período vedado antes das eleições municipais."
+
+
+def test_infer_punchline_from_row_text_rebuilds_consulta_sentence_without_truncation():
+    row = PublishPreviewRow(
+        tema="Uso do Fundo Partidário para custear consultoria jurídica e contábil",
+        classe_processo="CTA",
+        resultado="Aprovada",
+        votacao="Unânime",
+        analise_do_conteudo_juridico=(
+            "Consulta formulada pelo PSDB sobre a possibilidade de utilização de recursos do Fundo Partidário "
+            "para o pagamento de serviços de consultoria jurídica e contábil relacionados à defesa de filiados."
+        ),
+    )
+
+    assert infer_punchline_from_row_text(row) == (
+        "Consulta sobre uso do Fundo Partidário para custear consultoria jurídica e contábil em defesa de filiados."
+    )
+
+
+def test_infer_punchline_from_row_text_rebuilds_consulta_without_truncated_pagamento():
+    row = PublishPreviewRow(
+        tema="Uso do Fundo Partidário para custear consultoria jurídica e contábil",
+        classe_processo="CTA",
+        resultado="Aprovada",
+        analise_do_conteudo_juridico=(
+            "O processo trata de uma consulta formulada pelo PSDB sobre a possibilidade de utilização "
+            "de recursos do Fundo Partidário para o pagamento de despesas com a contratação de serviços "
+            "de consultoria jurídica e contábil."
+        ),
+    )
+
+    assert infer_punchline_from_row_text(row) == (
+        "Consulta sobre uso do Fundo Partidário para custear consultoria jurídica e contábil."
+    )
+
+
+def test_infer_punchline_from_row_text_rejects_generic_aije_intro_and_uses_theme():
+    row = PublishPreviewRow(
+        tema="Integridade do sistema eletrônico de votação nas eleições de 2022",
+        classe_processo="AIJE",
+        votacao="Unânime",
+        analise_do_conteudo_juridico=(
+            "Trata-se de Ação de Investigação Judicial Eleitoral (AIJE) proposta pelo Partido Liberal "
+            "contra Jair Messias Bolsonaro, questionando a integridade do sistema eletrônico de votação."
+        ),
+    )
+
+    assert infer_punchline_from_row_text(row) == (
+        "Julgamento sobre integridade do sistema eletrônico de votação nas eleições de 2022."
+    )
+
+
+def test_infer_punchline_from_row_text_discards_long_truncated_sentence_after_crop():
+    row = PublishPreviewRow(
+        tema="Propaganda eleitoral irregular",
+        classe_processo="Rp",
+        resultado="Procedente em parte",
+        raciocinio_juridico=(
+            "O relator fundamenta seu voto na interpretação restritiva do art. 57-D da Lei das Eleições, "
+            "argumentando que o impulsionamento de conteúdo deve observar estritamente as finalidades "
+            "permitidas pela norma, sob pena de desequilíbrio do pleito e violação do art. 57-D."
+        ),
+    )
+    assert infer_punchline_from_row_text(row) == "Julgamento sobre propaganda eleitoral irregular."
+
+
+def test_infer_punchline_from_row_text_rebuilds_cota_genero_vista_sentence():
+    row = PublishPreviewRow(
+        tema="Fraude à cota de gênero e modulação dos efeitos da cassação",
+        classe_processo="REspe",
+        numero_processo="0600003-05",
+        origem="Granjeiro/CE",
+        resultado="Suspenso por vista",
+        votacao="Suspenso",
+        analise_do_conteudo_juridico=(
+            "O recurso especial eleitoral discute fraude à cota de gênero nas eleições de 2020 "
+            "em Granjeiro/CE. A Ministra Cármen Lúcia pediu vista para examinar a modulação dos "
+            "efeitos da cassação e evitar redução da representação feminina."
+        ),
+        raciocinio_juridico=(
+            "O voto do relator reconhece a fraude, mas o colegiado debate a preservação da "
+            "representação feminina e a modulação dos efeitos."
+        ),
+    )
+    assert infer_punchline_from_row_text(row) == (
+        "Julgamento sobre fraude à cota de gênero em Granjeiro/CE foi suspenso por vista após debate sobre modulação dos efeitos da cassação e preservação da representação feminina."
+    )
+
+
+def test_should_replace_classe_processo_rejects_speculative_adi_over_consulta():
+    row = PublishPreviewRow(
+        numero_processo="0601984-92.2022.6.00.0000",
+        classe_processo="CTA",
+        analise_do_conteudo_juridico="O voto menciona julgamentos de ADI relacionados ao tema.",
+    )
+
+    assert should_replace_classe_processo("CTA", "ADI", row) is False
+
+
+def test_should_replace_classe_processo_accepts_adi_when_numero_proves_it():
+    row = PublishPreviewRow(
+        numero_processo="ADI 7228",
+        classe_processo="CTA",
+        analise_do_conteudo_juridico="O voto discute a ADI 7228.",
+    )
+
+    assert should_replace_classe_processo("CTA", "ADI", row) is True
+
+
+def test_dedupe_preview_rows_preserves_overlay_class_same_process_same_video():
+    rows = [
+        PublishPreviewRow(
+            tema="Prestação de contas",
+            numero_processo="262-19",
+            classe_processo="PC",
+            youtube_link="https://www.youtube.com/watch?v=abc123&t=1620",
+        ),
+        PublishPreviewRow(
+            tema="Embargos de declaração na prestação de contas",
+            numero_processo="262-19",
+            classe_processo="ED-PC",
+            youtube_link="https://www.youtube.com/watch?v=abc123&t=1890",
+        ),
+    ]
+
+    deduped = core.dedupe_preview_rows(rows, "https://www.youtube.com/watch?v=abc123")
+
+    assert len(deduped) == 2
+    assert {row.classe_processo for row in deduped} == {"PC", "ED-PC"}
+
+
+def test_dedupe_preview_rows_prefers_richer_full_cnj_when_short_row_is_semantically_weaker():
+    rows = [
+        PublishPreviewRow(
+            tema="Aprovação de resolução",
+            classe_processo="PA",
+            numero_processo="0600127-72",
+            youtube_link="https://www.youtube.com/watch?v=FkjHl4xgbfQ&t=1029",
+            relator="Min. Mauro Campbell Marques",
+            origem="Lago do Junco/MA",
+            analise_do_conteudo_juridico=(
+                "O Tribunal aprovou a resolução nos termos do voto do relator."
+            ),
+            raciocinio_juridico=(
+                "O colegiado deliberou pela aprovação unânime do texto proposto."
+            ),
+        ),
+        PublishPreviewRow(
+            tema="Adiamento de julgamento por falha técnica",
+            classe_processo="REspe",
+            numero_processo="0600127-72.2020.6.10.0000",
+            youtube_link="https://www.youtube.com/watch?v=FkjHl4xgbfQ&t=1223",
+            origem="Lago do Junco/MA",
+            partes=["Recorrente: Francisca Josenita Soares de Arruda Moraes"],
+            advogados=["Carlos Eduardo Barros"],
+            analise_do_conteudo_juridico=(
+                "O julgamento do recurso especial foi interrompido por falha técnica "
+                "na sustentação oral da defesa."
+            ),
+            raciocinio_juridico=(
+                "O relator submeteu ao colegiado o adiamento do julgamento após a "
+                "instabilidade na conexão do advogado."
+            ),
+        ),
+    ]
+
+    deduped = core.dedupe_preview_rows(rows, "https://www.youtube.com/watch?v=FkjHl4xgbfQ")
+
+    assert len(deduped) == 1
+    row = deduped[0]
+    assert row.numero_processo == "0600127-72.2020.6.10.0000"
+    assert row.classe_processo == "REspe"
+    assert row.tema == "Adiamento de julgamento por falha técnica"
+    assert row.youtube_link == "https://www.youtube.com/watch?v=FkjHl4xgbfQ&t=1223"
+    assert row.analise_do_conteudo_juridico.startswith("O julgamento do recurso especial")
+    assert row.relator == ""
+
+
+def test_punchline_looks_generic_flags_generic_aije_intro():
+    row = PublishPreviewRow(
+        tema="Integridade do sistema eletrônico de votação nas eleições de 2022",
+        classe_processo="AIJE",
+        numero_processo="0600814-85.2022.6.00.0000",
+    )
+    assert punchline_looks_generic(
+        "O processo trata de uma Ação de Investigação Judicial Eleitoral (AIJE) proposta contra Jair Bolsonaro.",
+        row,
+    )
+
+
+def test_infer_full_numero_processo_from_row_text_matches_existing_short_number():
+    row = PublishPreviewRow(
+        numero_processo="0600249-07",
+        analise_do_conteudo_juridico="No processo 0600249-07.2024.6.02.0001 houve discussão sobre publicidade institucional.",
+    )
+
+    assert infer_full_numero_processo_from_row_text(row) == "0600249-07.2024.6.02.0001"
