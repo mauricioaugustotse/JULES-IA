@@ -11,6 +11,7 @@ from functools import lru_cache
 from html import unescape
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import requests
 from pydantic import BaseModel, Field, ValidationError
@@ -19,8 +20,10 @@ from local_secrets import get_secret, load_local_secrets
 from tse_normalization import (
     STATE_NAME_KEYS,
     STATE_UF,
+    UF_CAPITALS,
     build_video_only_youtube_link,
     build_timestamped_youtube_link,
+    canonicalize_party_option_label,
     canonicalize_numero_processo,
     dedupe_preserve_order,
     extract_chunk_judgment_process_values,
@@ -29,6 +32,7 @@ from tse_normalization import (
     extract_uf_from_text,
     extract_youtube_video_id,
     identity_overlay_class_key,
+    composicao_regimental_issue,
     normalize_advogados_list,
     normalize_class_text,
     normalize_classe_processo,
@@ -46,6 +50,7 @@ from tse_normalization import (
     normalize_votacao,
     normalize_youtube_link,
     parse_multi_value_text,
+    is_regimentally_valid_composicao,
     is_plausible_ministro_name,
     split_csv_like_text,
 )
@@ -54,6 +59,7 @@ from tse_normalization import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 ARTIFACT_ROOT = SCRIPT_DIR / "artifacts" / "tse_youtube_notion"
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+DEFAULT_NEWS_GEMINI_MODEL = os.getenv("GEMINI_NEWS_MODEL") or DEFAULT_GEMINI_MODEL
 GEMINI_REST_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_NOTION_VERSION = os.getenv("NOTION_VERSION") or "2025-09-03"
 DEFAULT_NOTION_DATA_SOURCE_ID = (
@@ -131,8 +137,6 @@ SAFE_DYNAMIC_SELECT_OPTIONS = {
         "AgRg-RHC",
         "AgRg-RO",
         "AREspe",
-        "ADI",
-        "ADO",
         "AIJE",
         "CTA",
         "Czer",
@@ -165,8 +169,9 @@ SAFE_DYNAMIC_SELECT_OPTIONS = {
         "Procedente",
         "Procedente em parte",
         "Improcedente",
+        "Suspenso mas julgado depois",
     },
-    "votacao": {"Unânime", "Por maioria", "Suspenso"},
+    "votacao": {"Unânime", "Por maioria", "Suspenso", "Suspenso*"},
     "relator": {
         "Min. Alexandre de Moraes",
         "Min. André Mendonça",
@@ -470,7 +475,8 @@ ORIENTAÇÕES OBRIGATÓRIAS POR CAMPO:
 - `raciocinio_juridico`: reconstrua os argumentos jurídicos aplicados ao caso concreto. Indique quais premissas fáticas ou processuais foram tomadas como dadas, qual norma, súmula ou precedente foi usado, qual argumento da parte foi acolhido ou rejeitado e por que isso levou ao resultado.
 - `raciocinio_juridico`: não escreva apenas que o recurso foi provido ou desprovido. Explique o encadeamento lógico entre fatos, norma e conclusão.
 - `raciocinio_juridico`: mencione barreiras processuais, como vedação ao reexame de fatos e provas, apenas quando elas forem efetivamente usadas como razão de decidir no voto.
-- `tema`: informe um tema jurídico curto, indexável e aderente ao caso concreto, como "conduta vedada por uso de bens públicos" ou "fraude à cota de gênero". Nunca repita o número do processo. Nunca use apenas rótulos genéricos como "Processo", "Julgamento" ou só a classe processual. Se o vídeo não permitir identificar o tema com segurança, deixe o campo vazio.
+- `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta, como "conduta vedada por uso de bens públicos" ou "fraude à cota de gênero em chapa proporcional". Não descreva o resultado, não repita número do processo, não use nomes das partes como eixo principal e nunca use apenas rótulos genéricos como "Processo", "Julgamento" ou só a classe processual. Se o vídeo não permitir identificar o tema com segurança, deixe o campo vazio.
+- `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 """
 
 TRANSCRIPT_DETAIL_SYSTEM_PROMPT = """
@@ -487,7 +493,8 @@ TAREFA:
 - Se o trecho contiver mais de um processo julgado em conjunto, retorne um item por processo.
 - Não crie item para número de processo citado apenas como precedente, comparação, referência jurisprudencial ou exemplo.
 - Extraia os mesmos campos exigidos na etapa detalhada do vídeo, preservando fidelidade máxima ao conteúdo efetivamente transcrito.
-- `tema`: informe um tema jurídico curto, indexável e aderente ao caso concreto. Nunca use número do processo, "Processo", "Julgamento" ou apenas a classe processual. Se não houver base suficiente na transcrição, deixe vazio.
+- `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta. Nunca use número do processo, "Processo", "Julgamento", nomes das partes como eixo principal ou apenas a classe processual. Se não houver base suficiente na transcrição, deixe vazio.
+- `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 """
 
 NEWS_ENRICHMENT_SYSTEM_PROMPT = """
@@ -531,6 +538,33 @@ EXEMPLOS:
 - Se o texto tratar de uso promocional de programa social em campanha, retorne esse núcleo temático.
 - Se o texto tratar de inserções de rádio no segundo turno de 2022, retorne esse núcleo temático.
 - Se o texto tratar de comprovação de gastos com panfletagem em prestação de contas, retorne esse núcleo temático.
+"""
+
+THEME_PUNCHLINE_REPAIR_SYSTEM_PROMPT = """
+Você é um editor jurídico-eleitoral encarregado de revisar, em lote, os campos `tema` e `punchline` de julgamentos do TSE.
+
+Use exclusivamente os dados fornecidos no prompt. Não use fonte externa e não invente fatos ausentes.
+
+OBJETIVO:
+- `tema`: cabeçalho de ficha de catalogação média, em frase nominal jurídica, específica, sintética e indexável.
+- `punchline`: frase editorial autônoma que contextualiza o caso, sintetiza a controvérsia pública/jurídica e registra a consequência do julgamento.
+
+REGRAS PARA `tema`:
+- Deve identificar a questão jurídica submetida a julgamento.
+- Use preferencialmente 7 a 18 palavras.
+- Não inclua número do processo, timestamp, nomes das partes como eixo principal, relator ou resultado.
+- Não use tema amplo demais, só classe processual, "Processo", "Julgamento" ou frase de decisão.
+
+REGRAS PARA `punchline`:
+- Use uma frase completa, preferencialmente entre 28 e 55 palavras.
+- Deve complementar o `tema`, não copiá-lo nem apenas trocar sinônimos.
+- Inclua, quando constar do contexto, o cenário fático, a tese debatida, o problema processual e o resultado prático.
+- Evite fórmulas pobres como "recurso provido", "julgamento sobre...", "o relator entendeu..." ou repetição da fundamentação.
+- Se o julgamento ficou suspenso por pedido de vista, explique qual debate ficou pendente.
+
+RETORNO:
+- Devolva exatamente um item para cada `key` recebido.
+- Se o contexto for insuficiente para escrever com segurança, mantenha o melhor texto possível a partir dos campos existentes e marque `source_insufficient=true`.
 """
 
 START_REFINEMENT_SYSTEM_PROMPT = """
@@ -1430,6 +1464,199 @@ def punchline_looks_generic(value: str, row: "PublishPreviewRow") -> bool:
     return normalized in generic_candidates
 
 
+THEME_PUNCHLINE_STOPWORDS = {
+    "a",
+    "as",
+    "ao",
+    "aos",
+    "com",
+    "da",
+    "das",
+    "de",
+    "do",
+    "dos",
+    "e",
+    "em",
+    "na",
+    "nas",
+    "no",
+    "nos",
+    "o",
+    "os",
+    "para",
+    "por",
+    "que",
+    "se",
+    "sem",
+    "sob",
+    "sobre",
+}
+
+
+def _compact_theme_punchline_context(value: Any, limit: int = 1200) -> str:
+    text = normalize_model_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit].rsplit(" ", 1)[0].strip()
+    return f"{clipped}..."
+
+
+def _strip_process_references_from_text(value: str) -> str:
+    text = normalize_model_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"(?i)\bprocesso\s+n?[ºo.]?\s*(?=\d)", "", text)
+    text = re.sub(r"\b\d{6,7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b", "", text)
+    text = re.sub(r"\b\d{3,7}-\d{2}\b", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip(" ,.;:-")
+
+
+def clean_theme_punchline_theme(value: str, row: "PublishPreviewRow") -> str:
+    candidate = _strip_process_references_from_text(value).strip(" \"'`“”‘’.;,:-")
+    if not candidate:
+        return ""
+    candidate = _clean_inferred_theme(candidate)
+    if not candidate:
+        return ""
+    if _tema_looks_generic(candidate, row):
+        return ""
+    return candidate
+
+
+def clean_theme_punchline_punchline(value: str, row: "PublishPreviewRow") -> str:
+    candidate = normalize_model_text(value).strip(" \"'`“”‘’")
+    if not candidate:
+        return ""
+    candidate = re.sub(r"^\s*[-*]\s*", "", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    candidate = _strip_process_references_from_text(candidate).strip(" \"'`“”‘’")
+    if not candidate:
+        return ""
+    if not re.search(r"[.!?]$", candidate):
+        candidate = f"{candidate}."
+    if punchline_looks_generic(candidate, row):
+        return ""
+    return candidate[:1].upper() + candidate[1:]
+
+
+def _theme_punchline_tokens(value: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+", normalize_class_text(value)))
+    return {token for token in tokens if len(token) > 2 and token not in THEME_PUNCHLINE_STOPWORDS}
+
+
+def theme_punchline_pair_too_similar(theme: str, punchline: str) -> bool:
+    theme_norm = normalize_class_text(theme)
+    punchline_norm = normalize_class_text(punchline)
+    if not theme_norm or not punchline_norm:
+        return False
+    if theme_norm == punchline_norm:
+        return True
+    if punchline_norm.startswith(theme_norm) and len(punchline_norm) <= len(theme_norm) + 45:
+        return True
+    theme_tokens = _theme_punchline_tokens(theme)
+    punchline_tokens = _theme_punchline_tokens(punchline)
+    if len(theme_tokens) < 3 or not punchline_tokens:
+        return False
+    overlap = len(theme_tokens & punchline_tokens) / len(theme_tokens)
+    return overlap >= 0.8 and len(punchline_tokens) <= len(theme_tokens) + 5
+
+
+def theme_punchline_pair_needs_rewrite(row: "PublishPreviewRow") -> bool:
+    theme = normalize_model_text(row.tema)
+    punchline = normalize_model_text(row.punchline)
+    if _tema_looks_generic(theme, row):
+        return True
+    if punchline_looks_generic(punchline, row):
+        return True
+    if len(theme) < 24 or len(theme) > 180:
+        return True
+    if len(punchline) < 90:
+        return True
+    if re.match(r"(?i)^julgamento\s+sobre\b", punchline):
+        return True
+    if theme_punchline_pair_too_similar(theme, punchline):
+        return True
+    return False
+
+
+def _first_contextual_sentence_for_punchline(row: "PublishPreviewRow") -> str:
+    for source in [
+        row.analise_do_conteudo_juridico,
+        row.raciocinio_juridico,
+        row.fundamentacao_normativa,
+        row.precedentes_citados,
+    ]:
+        text = normalize_model_text(source)
+        if not text:
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            candidate = sentence.strip(" .;,:-")
+            if len(candidate) < 55 or len(candidate) > 220:
+                continue
+            normalized = normalize_class_text(candidate)
+            if _is_meta_legal_sentence(normalized):
+                continue
+            if _looks_like_meta_or_citation_punchline(normalized, candidate):
+                continue
+            if _looks_like_relational_case_stub(normalized):
+                continue
+            return f"{candidate}."
+    return ""
+
+
+def build_editorial_punchline_fallback(row: "PublishPreviewRow", theme: str = "") -> str:
+    theme = clean_theme_punchline_theme(theme, row) or build_fallback_tema(row)
+    existing = clean_theme_punchline_punchline(row.punchline, row)
+    if existing and not theme_punchline_pair_too_similar(theme, existing) and len(existing) >= 90:
+        return existing
+    inferred = infer_punchline_from_row_text(row)
+    inferred = clean_theme_punchline_punchline(inferred, row)
+    if inferred and not theme_punchline_pair_too_similar(theme, inferred) and len(inferred) >= 90:
+        return inferred
+    contextual = _first_contextual_sentence_for_punchline(row)
+    if contextual and not theme_punchline_pair_too_similar(theme, contextual):
+        result_suffix = ""
+        result = normalize_model_text(row.resultado)
+        if result:
+            result_suffix = f" O desfecho registrado foi {result[:1].lower() + result[1:]}."
+        return clean_theme_punchline_punchline(f"{contextual.rstrip('.')}.{result_suffix}", row)
+    subject = (theme or "a controvérsia eleitoral").strip().rstrip(".")
+    result = normalize_model_text(row.resultado)
+    vote = normalize_model_text(row.votacao)
+    outcome = ""
+    if result:
+        outcome = f", com resultado registrado como {result[:1].lower() + result[1:]}"
+        if vote:
+            outcome += f" e votação {vote[:1].lower() + vote[1:]}"
+    return clean_theme_punchline_punchline(
+        f"A controvérsia levou o TSE a examinar {subject[:1].lower() + subject[1:]} a partir do caso concreto{outcome}.",
+        row,
+    )
+
+
+def build_theme_punchline_repair_payload(row: "PublishPreviewRow", key: str) -> dict[str, Any]:
+    return {
+        "key": key,
+        "classe_processo": normalize_model_text(row.classe_processo),
+        "numero_processo": normalize_model_text(row.numero_processo),
+        "data_sessao": normalize_model_text(row.data_sessao),
+        "origem": normalize_model_text(row.origem),
+        "resultado": normalize_model_text(row.resultado),
+        "votacao": normalize_model_text(row.votacao),
+        "relator": normalize_model_text(row.relator),
+        "partes": row.partes[:8],
+        "tema_atual": normalize_model_text(row.tema),
+        "punchline_atual": normalize_model_text(row.punchline),
+        "analise_factual": _compact_theme_punchline_context(row.analise_do_conteudo_juridico, 1400),
+        "raciocinio_juridico": _compact_theme_punchline_context(row.raciocinio_juridico, 1100),
+        "fundamentacao_normativa": _compact_theme_punchline_context(row.fundamentacao_normativa, 900),
+        "precedentes_citados": _compact_theme_punchline_context(row.precedentes_citados, 600),
+    }
+
+
 def _trim_person_capture(value: str) -> str:
     cleaned = normalize_model_text(value)
     cleaned = re.split(
@@ -1611,12 +1838,7 @@ def _classe_processo_specificity(value: str, row: "PublishPreviewRow") -> int:
     if classe == "PA":
         return 1
     if classe in {"ADI", "ADO"}:
-        special_numero = normalize_class_text(row.numero_processo)
-        if re.search(rf"\b{classe.lower()}\s+\d+\b", special_numero):
-            return 5
-        if re.search(rf"\b{classe.lower()}\b", normalize_class_text(_build_row_inference_text(row))):
-            return 4
-        return 1
+        return 0
     if classe in {"CTA", "Lista Tríplice"}:
         return 3
     if classe.startswith("AgRg") or classe.startswith("ED-"):
@@ -1633,17 +1855,17 @@ def should_replace_classe_processo(
     candidate_norm = normalize_classe_processo(candidate)
     if not candidate_norm or candidate_norm == current_norm:
         return False
+    if candidate_norm in {"ADI", "ADO"}:
+        return False
     if not current_norm:
         return True
-    if candidate_norm in {"ADI", "ADO"} and current_norm not in {"ADI", "ADO"}:
-        numero_text = normalize_numero_processo_display(row.numero_processo)
-        if not re.fullmatch(rf"{candidate_norm}\s+\d+", numero_text, flags=re.IGNORECASE):
-            return False
+    if current_norm in {"ADI", "ADO"}:
+        return True
     current_score = _classe_processo_specificity(current_norm, row)
     candidate_score = _classe_processo_specificity(candidate_norm, row)
     if candidate_score > current_score:
         return True
-    if current_norm in {"PA", "ADI", "ADO"} and candidate_norm not in {"PA", "ADI", "ADO"}:
+    if current_norm == "PA" and candidate_norm != "PA":
         return True
     return False
 
@@ -1671,10 +1893,6 @@ def infer_classe_from_row_text(row: "PublishPreviewRow") -> str:
         return "Rp"
     if "prestacao de contas" in normalized or "prestação de contas" in normalized:
         return "PC"
-    if "acao direta de inconstitucionalidade por omissao" in normalized or re.search(r"\bado\s+\d+\b", normalized):
-        return "ADO"
-    if "acao direta de inconstitucionalidade" in normalized or re.search(r"\badi\s+\d+\b", normalized):
-        return "ADI"
     if "lista triplice" in normalized or "lista tríplice" in normalized:
         return "Lista Tríplice"
     if "consulta formulada" in normalized or normalized.startswith("consulta ") or "trata de uma consulta" in normalized:
@@ -1703,6 +1921,8 @@ def infer_classe_from_row_text(row: "PublishPreviewRow") -> str:
     ):
         return "PA"
     candidate = normalize_classe_processo(text)
+    if candidate in {"ADI", "ADO"}:
+        return ""
     if candidate and candidate != text.strip():
         return candidate
     return ""
@@ -1737,7 +1957,7 @@ def infer_origin_from_row_text(row: "PublishPreviewRow") -> str:
             return f"{city}/{uf}"
     tre_sigla = re.search(r"\bTRE[-/ ]([A-Z]{2})\b", text, flags=re.IGNORECASE)
     if tre_sigla:
-        return f"TRE/{tre_sigla.group(1).upper()}"
+        return UF_CAPITALS.get(tre_sigla.group(1).upper(), "")
     tre_extenso = re.search(
         r"(?i)\bTribunal Regional Eleitoral d(?:e|o|a)\s+([A-Za-zÀ-ÿ ]+)",
         text,
@@ -1746,9 +1966,9 @@ def infer_origin_from_row_text(row: "PublishPreviewRow") -> str:
         state_name = normalize_class_text(tre_extenso.group(1))
         for state, uf in STATE_UF.items():
             if state in state_name:
-                return f"TRE/{uf}"
+                return UF_CAPITALS.get(uf, "")
     if re.search(r"(?i)\bTribunal Superior Eleitoral\b|\bTSE\b", text):
-        return "TSE"
+        return UF_CAPITALS["DF"]
     return ""
 
 
@@ -1860,7 +2080,15 @@ def chunk_video_windows(
 
 def normalize_party_list(values: list[str]) -> list[str]:
     cleaned = normalize_partes_list(values)
-    return split_csv_like_text(cleaned)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in split_csv_like_text(cleaned):
+        canonical = canonicalize_party_option_label(value)
+        if not canonical or canonical in seen:
+            continue
+        seen.add(canonical)
+        normalized.append(canonical)
+    return normalized
 
 
 def normalize_advogado_list(values: list[str]) -> list[str]:
@@ -1876,10 +2104,17 @@ def normalize_composition_list(values: list[str]) -> list[str]:
 def _composition_quality(values: list[str]) -> tuple[int, int]:
     normalized = normalize_composition_list(values)
     count = len(normalized)
+    regimental_issue = composicao_regimental_issue(normalized)
+    if is_regimentally_valid_composicao(normalized):
+        return (300, count)
+    if regimental_issue in {"category_excess", "distribution"}:
+        return (15, -count)
     if count == 7:
         return (100, count)
-    if count == 6:
+    if count == 6 and not regimental_issue:
         return (99, count)
+    if count == 6:
+        return (14, -count)
     if count > 7:
         return (10 - min(count - 8, 9), -count)
     if 1 <= count < 6:
@@ -2151,31 +2386,73 @@ def _extract_party_markers(partes: list[str]) -> list[str]:
 
 
 def _extract_theme_markers(row: "PublishPreviewRow") -> list[str]:
-    candidates = [
-        "conduta vedada" if "conduta vedada" in fold_text_for_match(row.tema + " " + row.punchline) else "",
-        "bens publicos" if "bens publicos" in fold_text_for_match(row.tema + " " + row.punchline) else "",
-        "campanha eleitoral" if "campanha eleitoral" in fold_text_for_match(row.tema + " " + row.punchline) else "",
+    text = fold_text_for_match(" ".join([row.tema, row.punchline, row.analise_do_conteudo_juridico]))
+    known_markers = [
+        "abuso de poder",
+        "capacitacao ilicita de sufragio",
+        "captacao ilicita de sufragio",
+        "conduta vedada",
+        "cota de genero",
+        "desinformacao",
+        "fundo eleitoral",
+        "fundo partidario",
+        "inelegibilidade",
+        "prestacao de contas",
+        "propaganda eleitoral",
+        "propaganda irregular",
+        "publicidade institucional",
+        "registro de candidatura",
+        "sobras eleitorais",
+        "uso de bens publicos",
     ]
-    return [value for value in candidates if value]
+    candidates = [marker for marker in known_markers if marker in text]
+    if "campanha eleitoral" in text:
+        candidates.append("campanha eleitoral")
+    return dedupe_preserve_order(candidates)[:5]
 
 
-def is_general_news_url_relevant(url: str, row: "PublishPreviewRow") -> bool:
-    page_text = fold_text_for_match(fetch_candidate_page_text(url))
-    if not page_text:
-        return False
+def _process_markers_for_news(row: "PublishPreviewRow") -> tuple[list[str], list[str]]:
+    process_values = [
+        row.numero_processo,
+        extract_full_cnj(row.numero_processo),
+        canonicalize_numero_processo(row.numero_processo),
+    ]
+    folded_markers: list[str] = []
+    digit_markers: list[str] = []
+    for value in process_values:
+        folded = fold_text_for_match(value)
+        if folded:
+            folded_markers.append(folded)
+        digits = re.sub(r"\D", "", str(value or ""))
+        if len(digits) >= 6:
+            digit_markers.append(digits)
+    return dedupe_preserve_order(folded_markers), dedupe_preserve_order(digit_markers)
 
+
+def _news_page_relevance_evidence(page_text: str, row: "PublishPreviewRow") -> dict[str, Any]:
+    folded_page_text = fold_text_for_match(page_text)
+    page_digits = re.sub(r"\D", "", page_text or "")
+    if not folded_page_text:
+        return {"relevant": False, "score": 0}
+
+    process_markers, process_digit_markers = _process_markers_for_news(row)
     full_process = fold_text_for_match(extract_full_cnj(row.numero_processo))
     short_process = fold_text_for_match(canonicalize_numero_processo(row.numero_processo))
     city_marker, uf_marker = _extract_origin_markers(row.origem)
     party_markers = _extract_party_markers(row.partes)
     theme_markers = _extract_theme_markers(row)
 
-    process_hit = bool(full_process and full_process in page_text) or bool(short_process and short_process in page_text)
-    city_hit = bool(city_marker and city_marker in page_text)
-    uf_hit = bool(uf_marker and uf_marker in page_text)
-    party_hits = sum(1 for marker in party_markers if marker and marker in page_text)
-    theme_hits = sum(1 for marker in theme_markers if marker and marker in page_text)
-    tribunal_hits = sum(1 for marker in [fold_text_for_match(row.tribunal), "tse"] if marker and marker in page_text)
+    process_hit = (
+        bool(full_process and full_process in folded_page_text)
+        or bool(short_process and short_process in folded_page_text)
+        or any(marker in folded_page_text for marker in process_markers)
+        or any(marker and marker in page_digits for marker in process_digit_markers)
+    )
+    city_hit = bool(city_marker and city_marker in folded_page_text)
+    uf_hit = bool(uf_marker and uf_marker in folded_page_text)
+    party_hits = sum(1 for marker in party_markers if marker and marker in folded_page_text)
+    theme_hits = sum(1 for marker in theme_markers if marker and marker in folded_page_text)
+    tribunal_hits = sum(1 for marker in [fold_text_for_match(row.tribunal), "tse"] if marker and marker in folded_page_text)
 
     score = 0
     if process_hit:
@@ -2188,8 +2465,30 @@ def is_general_news_url_relevant(url: str, row: "PublishPreviewRow") -> bool:
     score += min(theme_hits, 2) * 2
     score += min(tribunal_hits, 1)
 
-    strong_context_hit = process_hit or (city_hit and party_hits >= 1) or (city_hit and theme_hits >= 1 and tribunal_hits >= 1)
-    return strong_context_hit and score >= 5
+    strong_context_hit = (
+        process_hit
+        or (city_hit and party_hits >= 1)
+        or (city_hit and theme_hits >= 1 and tribunal_hits >= 1)
+        or (party_hits >= 1 and theme_hits >= 1 and (city_hit or tribunal_hits >= 1))
+    )
+    return {
+        "relevant": strong_context_hit and score >= 5,
+        "score": score,
+        "process_hit": process_hit,
+        "city_hit": city_hit,
+        "uf_hit": uf_hit,
+        "party_hits": party_hits,
+        "theme_hits": theme_hits,
+        "tribunal_hits": tribunal_hits,
+    }
+
+
+def is_news_page_text_relevant(page_text: str, row: "PublishPreviewRow") -> bool:
+    return bool(_news_page_relevance_evidence(page_text, row).get("relevant"))
+
+
+def is_general_news_url_relevant(url: str, row: "PublishPreviewRow") -> bool:
+    return is_news_page_text_relevant(fetch_candidate_page_text(url), row)
 
 
 def filter_general_news_urls(urls: list[str], row: "PublishPreviewRow") -> list[str]:
@@ -2198,6 +2497,54 @@ def filter_general_news_urls(urls: list[str], row: "PublishPreviewRow") -> list[
         if is_general_news_url_relevant(url, row):
             accepted.append(url)
     return dedupe_preserve_order(accepted)
+
+
+def is_generic_institutional_news_url(url: str) -> bool:
+    parsed = urlparse(normalize_external_url(url))
+    host = (parsed.netloc or "").lower()
+    path = re.sub(r"/+", "/", parsed.path or "/").rstrip("/").lower()
+    if not host.endswith(".jus.br"):
+        return False
+    is_electoral_domain = host in {"tse.jus.br", "www.tse.jus.br"} or host.startswith("www.tre-") or host.startswith("tre-")
+    if not is_electoral_domain:
+        return False
+    return path in {"", "/", "/comunicacao", "/comunicacao/noticias"}
+
+
+def filter_relevant_institutional_news_urls(
+    urls: list[str],
+    row: "PublishPreviewRow",
+) -> tuple[list[str], list[str], list[str]]:
+    accepted: list[str] = []
+    dropped_unavailable: list[str] = []
+    dropped_irrelevant: list[str] = []
+    for url in normalize_external_url_list(urls):
+        if is_generic_institutional_news_url(url):
+            dropped_irrelevant.append(url)
+            continue
+        final_url, status_code, content_type, text = fetch_candidate_page_snapshot(url)
+        candidate_url = final_url or normalize_external_url(url)
+        if not candidate_url:
+            continue
+        if is_generic_institutional_news_url(candidate_url):
+            dropped_irrelevant.append(candidate_url)
+            continue
+        if not is_html_like_response(content_type, text):
+            dropped_unavailable.append(candidate_url)
+            continue
+        if page_looks_not_found(status_code=status_code, final_url=candidate_url, text=text):
+            dropped_unavailable.append(candidate_url)
+            continue
+        page_text = f"{candidate_url}\n{_extract_visible_html_text(text)}"
+        if not is_news_page_text_relevant(page_text, row):
+            dropped_irrelevant.append(candidate_url)
+            continue
+        accepted.append(candidate_url)
+    return (
+        dedupe_preserve_order(accepted),
+        dedupe_preserve_order(dropped_unavailable),
+        dedupe_preserve_order(dropped_irrelevant),
+    )
 
 
 def build_news_enrichment_context(row: "PublishPreviewRow") -> str:
@@ -2447,6 +2794,19 @@ class ThemeRepairResult(BaseModel):
     tema: str = ""
     confidence: str = ""
     rationale: str = ""
+
+
+class ThemePunchlineRepairItem(BaseModel):
+    key: str = ""
+    tema: str = ""
+    punchline: str = ""
+    confidence: str = ""
+    source_insufficient: bool = False
+    reason: str = ""
+
+
+class ThemePunchlineRepairBatchResult(BaseModel):
+    items: list[ThemePunchlineRepairItem] = Field(default_factory=list)
 
 
 class StartRefinementResult(BaseModel):
@@ -2781,6 +3141,12 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
             payload = {"items": payload}
         elif model_name == "ProcessMetadataResult":
             payload = next((item for item in payload if isinstance(item, dict)), {})
+        elif model_name == "NewsEnrichmentResult":
+            payload = {
+                "noticia_TSE": [],
+                "noticia_TRE": [],
+                "noticia_geral": [str(item) for item in payload if isinstance(item, str)],
+            }
         elif len(payload) == 1 and isinstance(payload[0], dict):
             payload = payload[0]
 
@@ -3937,10 +4303,12 @@ class GeminiNewsEnricher:
     def __init__(
         self,
         api_key: str,
-        model: str = DEFAULT_GEMINI_MODEL,
+        model: str = DEFAULT_NEWS_GEMINI_MODEL,
         artifact_store: Optional[RunArtifacts] = None,
         logger: Optional[logging.Logger] = None,
         client: Any = None,
+        allow_institutional_repair: bool = True,
+        max_grounding_attempts: int = GEMINI_CALL_RETRIES,
     ) -> None:
         if not api_key:
             raise ValueError("GEMINI_API_KEY/GOOGLE_API_KEY não encontrado.")
@@ -3950,26 +4318,33 @@ class GeminiNewsEnricher:
         genai, types = require_google_genai()
         self.types = types
         self.client = client or create_gemini_client(genai, types, api_key)
-        self.model = model or DEFAULT_GEMINI_MODEL
+        self.model = model or DEFAULT_NEWS_GEMINI_MODEL
+        self.allow_institutional_repair = allow_institutional_repair
+        self.max_grounding_attempts = max(1, int(max_grounding_attempts or 1))
 
     def enrich_rows(self, rows: list[PublishPreviewRow]) -> list[PublishPreviewRow]:
         enriched_rows: list[PublishPreviewRow] = []
         for index, row in enumerate(rows, start=1):
+            context = build_news_enrichment_context(row)
             cache_filename = f"06_news_enrichment_{index:02d}.json"
             if self.artifact_store.exists(cache_filename):
                 cached_payload = self.artifact_store.read_json(cache_filename)
-                candidate = row.model_copy(deep=True)
-                applied = cached_payload.get("applied") or {}
-                candidate.noticia_TSE = str(applied.get("noticia_TSE", "") or "")
-                candidate.noticia_TRE = str(applied.get("noticia_TRE", "") or "")
-                candidate.noticias_gerais = list(applied.get("noticias_gerais", []) or [])
-                enriched_rows.append(candidate)
-                continue
-            context = build_news_enrichment_context(row)
+                if cached_payload.get("context") == context:
+                    candidate = row.model_copy(deep=True)
+                    applied = cached_payload.get("applied") or {}
+                    candidate.noticia_TSE = str(applied.get("noticia_TSE", "") or "")
+                    candidate.noticia_TRE = str(applied.get("noticia_TRE", "") or "")
+                    candidate.noticias_gerais = list(applied.get("noticias_gerais", []) or [])
+                    enriched_rows.append(candidate)
+                    continue
             if not context:
                 candidate = row.model_copy(deep=True)
                 candidate.add_warning("Enriquecimento de notícias ignorado por falta de contexto.")
                 enriched_rows.append(candidate)
+                continue
+            reused = self._reuse_existing_news_links(row, context=context, cache_filename=cache_filename)
+            if reused is not None:
+                enriched_rows.append(reused)
                 continue
 
             prompt = (
@@ -3986,9 +4361,9 @@ class GeminiNewsEnricher:
             tse_urls, tre_urls, general_urls = classify_news_urls(
                 response.noticia_TSE + response.noticia_TRE + response.noticia_geral + grounding_urls
             )
-            valid_tse_urls, dropped_tse_urls = filter_accessible_news_urls(tse_urls)
-            valid_tre_urls, dropped_tre_urls = filter_accessible_news_urls(tre_urls)
-            if not valid_tse_urls and dropped_tse_urls:
+            valid_tse_urls, dropped_tse_urls, irrelevant_tse_urls = filter_relevant_institutional_news_urls(tse_urls, row)
+            valid_tre_urls, dropped_tre_urls, irrelevant_tre_urls = filter_relevant_institutional_news_urls(tre_urls, row)
+            if getattr(self, "allow_institutional_repair", True) and not valid_tse_urls and dropped_tse_urls:
                 repaired_tse_urls = self._repair_institutional_urls(
                     context=context,
                     broken_urls=dropped_tse_urls,
@@ -3996,9 +4371,10 @@ class GeminiNewsEnricher:
                     domain_label="TSE",
                     artifact_name=f"06_news_repair_tse_{index:02d}.txt",
                 )
-                valid_tse_urls, extra_dropped_tse_urls = filter_accessible_news_urls(repaired_tse_urls)
+                valid_tse_urls, extra_dropped_tse_urls, extra_irrelevant_tse_urls = filter_relevant_institutional_news_urls(repaired_tse_urls, row)
                 dropped_tse_urls = dedupe_preserve_order(dropped_tse_urls + extra_dropped_tse_urls)
-            if not valid_tre_urls and dropped_tre_urls:
+                irrelevant_tse_urls = dedupe_preserve_order(irrelevant_tse_urls + extra_irrelevant_tse_urls)
+            if getattr(self, "allow_institutional_repair", True) and not valid_tre_urls and dropped_tre_urls:
                 repaired_tre_urls = self._repair_institutional_urls(
                     context=context,
                     broken_urls=dropped_tre_urls,
@@ -4006,8 +4382,9 @@ class GeminiNewsEnricher:
                     domain_label="TRE",
                     artifact_name=f"06_news_repair_tre_{index:02d}.txt",
                 )
-                valid_tre_urls, extra_dropped_tre_urls = filter_accessible_news_urls(repaired_tre_urls)
+                valid_tre_urls, extra_dropped_tre_urls, extra_irrelevant_tre_urls = filter_relevant_institutional_news_urls(repaired_tre_urls, row)
                 dropped_tre_urls = dedupe_preserve_order(dropped_tre_urls + extra_dropped_tre_urls)
+                irrelevant_tre_urls = dedupe_preserve_order(irrelevant_tre_urls + extra_irrelevant_tre_urls)
             filtered_general_urls = filter_general_news_urls(general_urls, row)
             candidate = row.model_copy(deep=True)
             candidate.noticia_TSE = valid_tse_urls[0] if valid_tse_urls else ""
@@ -4020,6 +4397,14 @@ class GeminiNewsEnricher:
             if dropped_tre_urls:
                 candidate.add_warning(
                     f"{len(dropped_tre_urls)} link(s) instituciona(is) de TRE descartado(s) por indisponibilidade."
+                )
+            if irrelevant_tse_urls:
+                candidate.add_warning(
+                    f"{len(irrelevant_tse_urls)} link(s) instituciona(is) do TSE descartado(s) por baixa aderência ao caso."
+                )
+            if irrelevant_tre_urls:
+                candidate.add_warning(
+                    f"{len(irrelevant_tre_urls)} link(s) instituciona(is) de TRE descartado(s) por baixa aderência ao caso."
                 )
             dropped_general_urls = [url for url in general_urls if url not in filtered_general_urls]
             if dropped_general_urls:
@@ -4044,11 +4429,56 @@ class GeminiNewsEnricher:
                     },
                     "tse_filtered_out": dropped_tse_urls,
                     "tre_filtered_out": dropped_tre_urls,
+                    "tse_irrelevant": irrelevant_tse_urls,
+                    "tre_irrelevant": irrelevant_tre_urls,
                     "general_candidates": general_urls,
                     "general_filtered_out": dropped_general_urls,
+                    "model": getattr(self, "model", DEFAULT_NEWS_GEMINI_MODEL),
                 },
             )
         return enriched_rows
+
+    def _reuse_existing_news_links(
+        self,
+        row: PublishPreviewRow,
+        *,
+        context: str,
+        cache_filename: str,
+    ) -> PublishPreviewRow | None:
+        existing_urls = [row.noticia_TSE, row.noticia_TRE] + list(row.noticias_gerais or [])
+        if not any(normalize_external_url(value) for value in existing_urls):
+            return None
+        tse_urls, tre_urls, general_urls = classify_news_urls(existing_urls)
+        valid_tse_urls, dropped_tse_urls, irrelevant_tse_urls = filter_relevant_institutional_news_urls(tse_urls, row)
+        valid_tre_urls, dropped_tre_urls, irrelevant_tre_urls = filter_relevant_institutional_news_urls(tre_urls, row)
+        filtered_general_urls = filter_general_news_urls(general_urls, row)
+        if not valid_tse_urls and not valid_tre_urls and not filtered_general_urls:
+            return None
+        candidate = row.model_copy(deep=True)
+        candidate.noticia_TSE = valid_tse_urls[0] if valid_tse_urls else ""
+        candidate.noticia_TRE = valid_tre_urls[0] if valid_tre_urls else ""
+        candidate.noticias_gerais = filtered_general_urls[:GENERAL_NEWS_LIMIT]
+        if dropped_tse_urls or dropped_tre_urls:
+            candidate.add_warning("Notícias existentes indisponíveis foram descartadas antes de chamar grounding.")
+        if irrelevant_tse_urls or irrelevant_tre_urls:
+            candidate.add_warning("Notícias institucionais existentes sem aderência suficiente foram descartadas.")
+        self.artifact_store.write_json(
+            cache_filename,
+            {
+                "context": context,
+                "skipped_grounding": True,
+                "reason": "existing_relevant_news_links",
+                "applied": {
+                    "noticia_TSE": candidate.noticia_TSE,
+                    "noticia_TRE": candidate.noticia_TRE,
+                    "noticias_gerais": candidate.noticias_gerais,
+                },
+                "existing_filtered_out": dedupe_preserve_order(
+                    dropped_tse_urls + dropped_tre_urls + irrelevant_tse_urls + irrelevant_tre_urls
+                ),
+            },
+        )
+        return candidate
 
     def _repair_institutional_urls(
         self,
@@ -4088,7 +4518,8 @@ class GeminiNewsEnricher:
         artifact_name: str,
     ) -> tuple[BaseModel, list[str]]:
         last_error: Optional[Exception] = None
-        for attempt in range(1, GEMINI_CALL_RETRIES + 1):
+        max_attempts = max(1, int(getattr(self, "max_grounding_attempts", GEMINI_CALL_RETRIES) or 1))
+        for attempt in range(1, max_attempts + 1):
             try:
                 parsed, response_text, response_payload = call_gemini_generate_content_rest(
                     api_key=self.api_key,
@@ -4107,12 +4538,12 @@ class GeminiNewsEnricher:
                 self.logger.warning(
                     "Falha no enriquecimento com Google Search (tentativa %s/%s): %s",
                     attempt,
-                    GEMINI_CALL_RETRIES,
+                    max_attempts,
                     exc,
                 )
                 if should_disable_model(exc):
                     break
-                if attempt < GEMINI_CALL_RETRIES:
+                if attempt < max_attempts:
                     retry_delay = extract_retry_delay_seconds(exc)
                     time.sleep(max(GEMINI_RETRY_BASE_DELAY ** attempt, retry_delay))
         raise RuntimeError(f"Falha definitiva no enriquecimento de notícias: {last_error}") from last_error
@@ -4134,6 +4565,147 @@ class GeminiNewsEnricher:
         except Exception:
             return []
         return dedupe_preserve_order(urls)
+
+
+class GeminiThemePunchlineEnricher:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = DEFAULT_GEMINI_MODEL,
+        artifact_store: Optional[RunArtifacts] = None,
+        logger: Optional[logging.Logger] = None,
+        batch_size: int = 10,
+    ) -> None:
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY/GOOGLE_API_KEY não encontrado.")
+        self.api_key = api_key
+        self.model = model or DEFAULT_GEMINI_MODEL
+        self.artifact_store = artifact_store or RunArtifacts.for_youtube_url("unknown")
+        self.logger = logger or logging.getLogger(__name__)
+        self.batch_size = max(1, int(batch_size or 10))
+
+    def enrich_rows(self, rows: list[PublishPreviewRow]) -> list[PublishPreviewRow]:
+        enriched_rows: list[PublishPreviewRow] = []
+        for batch_number, start in enumerate(range(0, len(rows), self.batch_size), start=1):
+            batch = rows[start: start + self.batch_size]
+            payload = [
+                build_theme_punchline_repair_payload(row, key=f"row_{start + offset + 1:03d}")
+                for offset, row in enumerate(batch)
+            ]
+            cache_filename = f"04b_theme_punchline_{batch_number:02d}.json"
+            if self.artifact_store.exists(cache_filename):
+                cached_payload = self.artifact_store.read_json(cache_filename)
+                applied = cached_payload.get("applied")
+                if cached_payload.get("payload") == payload and applied:
+                    enriched_rows.extend(PublishPreviewRow.model_validate(item) for item in applied)
+                    continue
+
+            try:
+                parsed = self._call_batch(
+                    payload=payload,
+                    artifact_name=f"04b_theme_punchline_{batch_number:02d}.txt",
+                )
+                items_by_key = {normalize_model_text(item.key): item for item in parsed.items}
+                applied_rows = [
+                    self._apply_repair_item(row, items_by_key.get(normalize_model_text(item_payload["key"])))
+                    for row, item_payload in zip(batch, payload)
+                ]
+                self.artifact_store.write_json(
+                    cache_filename,
+                    {
+                        "payload": payload,
+                        "parsed": parsed.model_dump(mode="json"),
+                        "applied": [row.model_dump(mode="json") for row in applied_rows],
+                    },
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Falha no reparo editorial de tema/punchline; aplicando fallback local: %s",
+                    exc,
+                )
+                applied_rows = [self._apply_repair_item(row, None, error=str(exc)) for row in batch]
+                self.artifact_store.write_json(
+                    cache_filename,
+                    {
+                        "payload": payload,
+                        "error": str(exc),
+                        "applied": [row.model_dump(mode="json") for row in applied_rows],
+                    },
+                )
+            enriched_rows.extend(applied_rows)
+        return enriched_rows
+
+    def _call_batch(
+        self,
+        *,
+        payload: list[dict[str, Any]],
+        artifact_name: str,
+    ) -> ThemePunchlineRepairBatchResult:
+        prompt = (
+            "Revise os campos `tema` e `punchline` dos itens abaixo.\n"
+            "Preserve a fidelidade ao contexto fornecido e retorne JSON no schema solicitado.\n\n"
+            f"ITENS:\n{json.dumps({'items': payload}, ensure_ascii=False, indent=2)}"
+        )
+        last_error: Optional[Exception] = None
+        for attempt in range(1, GEMINI_CALL_RETRIES + 1):
+            try:
+                parsed, response_text, _ = call_gemini_generate_content_rest(
+                    api_key=self.api_key,
+                    model_name=self.model,
+                    contents=[{"parts": [_build_gemini_rest_part(text=prompt)]}],
+                    system_instruction=THEME_PUNCHLINE_REPAIR_SYSTEM_PROMPT,
+                    response_model=ThemePunchlineRepairBatchResult,
+                    temperature=0.2,
+                    timeout_seconds=DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
+                )
+                self.artifact_store.write_text(artifact_name, response_text)
+                return parsed
+            except Exception as exc:
+                last_error = exc
+                self.logger.warning(
+                    "Falha no reparo Gemini de tema/punchline (tentativa %s/%s): %s",
+                    attempt,
+                    GEMINI_CALL_RETRIES,
+                    exc,
+                )
+                if should_disable_model(exc):
+                    break
+                if attempt < GEMINI_CALL_RETRIES:
+                    retry_delay = extract_retry_delay_seconds(exc)
+                    time.sleep(max(GEMINI_RETRY_BASE_DELAY ** attempt, retry_delay))
+        raise RuntimeError(f"Falha definitiva no reparo Gemini de tema/punchline: {last_error}") from last_error
+
+    def _apply_repair_item(
+        self,
+        row: PublishPreviewRow,
+        item: ThemePunchlineRepairItem | None,
+        *,
+        error: str = "",
+    ) -> PublishPreviewRow:
+        candidate = row.model_copy(deep=True)
+        proposed_theme = clean_theme_punchline_theme(item.tema if item else "", candidate)
+        if not proposed_theme:
+            proposed_theme = build_fallback_tema(candidate)
+        if proposed_theme:
+            candidate.tema = proposed_theme
+
+        proposed_punchline = clean_theme_punchline_punchline(item.punchline if item else "", candidate)
+        if (
+            not proposed_punchline
+            or len(proposed_punchline) < 90
+            or theme_punchline_pair_too_similar(candidate.tema, proposed_punchline)
+        ):
+            proposed_punchline = build_editorial_punchline_fallback(candidate, candidate.tema)
+        if proposed_punchline:
+            candidate.punchline = proposed_punchline
+
+        if item and item.source_insufficient:
+            candidate.add_warning("Reparo de tema/punchline marcou fonte insuficiente; texto preserva apenas inferências locais.")
+        if error:
+            candidate.add_warning("Reparo Gemini de tema/punchline falhou; aplicado fallback local.")
+        if theme_punchline_pair_needs_rewrite(candidate):
+            candidate.add_warning("Tema/punchline ainda requerem revisão editorial manual.")
+        return candidate
 
 
 class GeminiProcessMetadataEnricher:
@@ -4334,7 +4906,29 @@ class NotionSessoesClient:
         self.base_url = "https://api.notion.com/v1"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        response = self.session.request(method, self.base_url + path, timeout=60, **kwargs)
+        response: requests.Response | None = None
+        for attempt in range(4):
+            try:
+                response = self.session.request(method, self.base_url + path, timeout=60, **kwargs)
+            except requests.RequestException:
+                if attempt >= 3:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if response.status_code == 429 and attempt < 3:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    sleep_seconds = float(retry_after) if retry_after else 1.5 * (attempt + 1)
+                except ValueError:
+                    sleep_seconds = 1.5 * (attempt + 1)
+                time.sleep(max(sleep_seconds, 0.5))
+                continue
+            if response.status_code >= 500 and attempt < 3:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+        if response is None:
+            raise RuntimeError("Notion API request failed without response.")
         if response.status_code >= 400:
             raise RuntimeError(f"Notion API error {response.status_code}: {response.text}")
         if not response.content:
@@ -4789,6 +5383,7 @@ class NotionSessoesClient:
         property_name: str,
         *,
         temp_name: Optional[str] = None,
+        sort_options: bool = False,
     ) -> dict[str, Any]:
         payload = self._request("GET", f"/data_sources/{self.data_source_id}")
         properties = payload.get("properties", {})
@@ -4810,6 +5405,25 @@ class NotionSessoesClient:
                 if value not in seen_option_names:
                     seen_option_names.add(value)
                     used_option_names.append(value)
+        if sort_options:
+            used_option_names = sorted(used_option_names, key=lambda value: normalize_class_text(value))
+            option_rank = {value: index for index, value in enumerate(used_option_names)}
+            page_values = [
+                (
+                    page_id,
+                    sorted(
+                        values,
+                        key=lambda value: (option_rank.get(value, len(option_rank)), normalize_class_text(value)),
+                    ),
+                )
+                for page_id, values in page_values
+            ]
+            page_values.sort(
+                key=lambda item: min(
+                    (option_rank.get(value, len(option_rank)) for value in item[1]),
+                    default=len(option_rank),
+                )
+            )
         options = prop.get("multi_select", {}).get("options", []) or []
         current_option_names = [option.get("name", "").strip() for option in options if option.get("name", "").strip()]
         nondefault_options = [option for option in options if (option.get("color") or "") != "default"]
@@ -5148,18 +5762,28 @@ def validate_preview_row(
         row.numero_processo = _merge_special_numero_processo(row.numero_processo, inferred_special_numero)
     row.classe_processo = normalize_classe_processo(row.classe_processo)
     row.eleicao = normalize_eleicao_value(row.eleicao)
+    raw_origem_value = str(row.origem or "")
+    raw_origem_key = normalize_class_text(raw_origem_value)
+    raw_tribunal_value = str(row.tribunal or "").strip().upper()
+    federal_origin_hint = (
+        raw_origem_key in {"tse", "tribunal superior eleitoral"}
+        or "tribunal superior eleitoral" in raw_origem_key
+        or raw_tribunal_value == "TSE"
+        or row.classe_processo == "CTA"
+    )
     row.origem = normalize_origem_value(row.origem)
     uf = extract_uf_from_text(row.origem)
-    row.tribunal = normalize_tre(row.tribunal, uf)
+    row.tribunal = "TSE" if federal_origin_hint else normalize_tre(row.tribunal, uf)
     if not row.origem:
         tribunal_value = str(row.tribunal or "").strip().upper()
         tre_match = re.match(r"^TRE-([A-Z]{2})$", tribunal_value)
         if tre_match:
-            row.origem = f"TRE/{tre_match.group(1)}"
+            row.origem = UF_CAPITALS.get(tre_match.group(1), "")
         elif tribunal_value == "TSE":
-            row.origem = "TSE"
+            row.origem = UF_CAPITALS["DF"]
         elif row.classe_processo == "CTA":
-            row.origem = "TSE"
+            row.origem = UF_CAPITALS["DF"]
+            row.tribunal = "TSE"
     row.relator = normalize_ministro_name(row.relator) if row.relator else ""
     row.pedido_vista = normalize_pedido_vista_value(row.pedido_vista)
     row.resultado = normalize_resultado_final(row.resultado, row.classe_processo)
@@ -5173,8 +5797,15 @@ def validate_preview_row(
         row.classe_processo = inferred_classe
     elif not row.classe_processo:
         row.classe_processo = inferred_classe
+    if row.classe_processo in {"ADI", "ADO"}:
+        row.add_warning("classe_processo ADI/ADO omitida: TSE não julga ADI/ADO como classe processual.")
+        row.classe_processo = ""
     if not row.resultado:
         row.resultado = infer_resultado_from_row_text(row)
+    if row.resultado == "Suspenso mas julgado depois" and row.votacao in {"", "Suspenso"}:
+        row.votacao = "Suspenso*"
+    if row.votacao == "Suspenso*" and row.resultado in {"", "Suspenso por vista"}:
+        row.resultado = "Suspenso mas julgado depois"
     if row.resultado == "Suspenso por vista" and not row.votacao:
         row.votacao = "Suspenso"
     if row_indicates_suspension_by_vista(row):
@@ -5203,15 +5834,25 @@ def validate_preview_row(
         row.add_warning("Número do processo textual inválido removido por falta de identificação confiável.")
 
     if row.noticia_TSE:
-        valid_tse_urls, dropped_tse_urls = filter_accessible_news_urls([row.noticia_TSE])
+        valid_tse_urls, dropped_tse_urls, irrelevant_tse_urls = filter_relevant_institutional_news_urls(
+            [row.noticia_TSE],
+            row,
+        )
         row.noticia_TSE = valid_tse_urls[0] if valid_tse_urls else ""
         if dropped_tse_urls:
             row.add_warning("noticia_TSE descartada por indisponibilidade da página.")
+        if irrelevant_tse_urls:
+            row.add_warning("noticia_TSE descartada por baixa aderência ao caso.")
     if row.noticia_TRE:
-        valid_tre_urls, dropped_tre_urls = filter_accessible_news_urls([row.noticia_TRE])
+        valid_tre_urls, dropped_tre_urls, irrelevant_tre_urls = filter_relevant_institutional_news_urls(
+            [row.noticia_TRE],
+            row,
+        )
         row.noticia_TRE = valid_tre_urls[0] if valid_tre_urls else ""
         if dropped_tre_urls:
             row.add_warning("noticia_TRE descartada por indisponibilidade da página.")
+        if irrelevant_tre_urls:
+            row.add_warning("noticia_TRE descartada por baixa aderência ao caso.")
 
     if not row.tema:
         row.add_error("Tema/título vazio.")
@@ -5342,7 +5983,7 @@ def build_preview_rows(
 ) -> list[PublishPreviewRow]:
     rows: list[PublishPreviewRow] = []
     session_composicao = normalize_composition_list(analysis.session.composicao)
-    session_composicao_fallback = session_composicao if 6 <= len(session_composicao) <= 7 else []
+    session_composicao_fallback = session_composicao if not composicao_regimental_issue(session_composicao) else []
     authoritative_session_date = normalize_session_date_to_iso(analysis.session.data_sessao)
     for bundle_index, bundle in enumerate(analysis.bundles, start=1):
         if bundle.should_ignore:
@@ -5769,16 +6410,19 @@ def enrich_preview_rows_with_news(
     rows: list[PublishPreviewRow],
     *,
     api_key: str,
-    model: str = DEFAULT_GEMINI_MODEL,
+    model: str = DEFAULT_NEWS_GEMINI_MODEL,
     artifact_store: Optional[RunArtifacts] = None,
     logger: Optional[logging.Logger] = None,
     enricher: Optional[GeminiNewsEnricher] = None,
+    allow_institutional_repair: bool = True,
 ) -> list[PublishPreviewRow]:
     news_enricher = enricher or GeminiNewsEnricher(
         api_key=api_key,
         model=model,
         artifact_store=artifact_store,
         logger=logger,
+        allow_institutional_repair=allow_institutional_repair,
+        max_grounding_attempts=1 if not allow_institutional_repair else GEMINI_CALL_RETRIES,
     )
     return news_enricher.enrich_rows(rows)
 
@@ -5800,6 +6444,26 @@ def enrich_preview_rows_with_process_metadata(
         logger=logger,
     )
     enriched_rows = metadata_enricher.enrich_rows(rows)
+    return [validate_preview_row(row, notion_schema) for row in enriched_rows]
+
+
+def enrich_preview_rows_with_theme_punchline(
+    rows: list[PublishPreviewRow],
+    *,
+    api_key: str,
+    model: str = DEFAULT_GEMINI_MODEL,
+    artifact_store: Optional[RunArtifacts] = None,
+    logger: Optional[logging.Logger] = None,
+    enricher: Optional[GeminiThemePunchlineEnricher] = None,
+    notion_schema: Optional[NotionDataSourceSchema] = None,
+) -> list[PublishPreviewRow]:
+    text_enricher = enricher or GeminiThemePunchlineEnricher(
+        api_key=api_key,
+        model=model,
+        artifact_store=artifact_store,
+        logger=logger,
+    )
+    enriched_rows = text_enricher.enrich_rows(rows)
     return [validate_preview_row(row, notion_schema) for row in enriched_rows]
 
 

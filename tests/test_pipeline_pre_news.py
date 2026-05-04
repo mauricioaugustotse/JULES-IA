@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 import json
+import sys
 from types import SimpleNamespace
 
 import pipeline_pre_news
@@ -122,3 +123,83 @@ def test_ensure_python_module_available_raises_clear_error(monkeypatch) -> None:
         assert "Módulo obrigatório ausente" in str(exc)
     else:
         raise AssertionError("Era esperado RuntimeError quando o módulo está ausente.")
+
+
+def test_residual_focal_closure_uses_manifest_after_rerun(tmp_path, monkeypatch) -> None:
+    playlist_url = "https://www.youtube.com/playlist?list=PL_TEST"
+    backfill_root = tmp_path / "backfill"
+    manifest_dir = backfill_root / "2022_PL_TEST"
+    manifest_dir.mkdir(parents=True)
+    manifest_path = manifest_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "playlist_url": playlist_url,
+                "videos": {
+                    "vid_error": {"position": 1, "status": "error"},
+                    "vid_done": {"position": 2, "status": "done"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline_pre_news, "BACKFILL_ROOT", backfill_root)
+
+    calls = []
+
+    def fake_run_stage(stage, run_root):
+        calls.append(stage)
+        if stage.name == "residual_rerun_round_1":
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload["videos"]["vid_error"]["status"] = "done"
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        return {
+            "name": stage.name,
+            "status": "done",
+            "returncode": 0,
+            "log_path": str(run_root / f"{stage.name}.log"),
+        }
+
+    monkeypatch.setattr(pipeline_pre_news, "run_stage", fake_run_stage)
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    summary = {"stages": []}
+    pipeline_pre_news._run_residual_focal_closure(
+        args=_args(residual_max_rounds=1),
+        run_root=run_root,
+        summary=summary,
+    )
+
+    assert [stage.name for stage in calls] == [
+        "residual_rerun_round_1",
+        "residual_repair_all_round_1",
+        "residual_schema_core_round_1",
+        "residual_identity_core_round_1",
+        "residual_identity_replay_round_1",
+        "residual_deterministic_core_round_1",
+        "residual_composition_core_round_1",
+        "residual_super_auditor_round_1",
+    ]
+    assert summary["stages"][0]["resolved_video_ids"] == ["vid_error"]
+    assert summary["stages"][0]["remaining_error_video_ids"] == []
+    for stage in calls[1:]:
+        video_args = [
+            stage.command[index + 1]
+            for index, value in enumerate(stage.command[:-1])
+            if value == "--video-id"
+        ]
+        assert video_args == ["vid_error"]
+
+
+def test_run_stage_includes_log_tail_on_failure(tmp_path) -> None:
+    stage = pipeline_pre_news.PipelineStage(
+        "failing_stage",
+        [sys.executable, "-c", "print('linha de diagnóstico'); raise SystemExit(2)"],
+    )
+
+    result = pipeline_pre_news.run_stage(stage, tmp_path)
+
+    assert result["status"] == "error"
+    assert result["returncode"] == 2
+    assert "linha de diagnóstico" in result["log_tail"]

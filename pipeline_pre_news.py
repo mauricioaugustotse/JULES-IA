@@ -15,8 +15,9 @@ from urllib.parse import parse_qs, urlparse
 
 
 LOGGER = logging.getLogger("pipeline_pre_news")
-ARTIFACT_ROOT = Path("artifacts/tse_youtube_notion/pipeline_pre_news")
-BACKFILL_ROOT = Path("artifacts/tse_youtube_notion/backfill_2025")
+REPO_ROOT = Path(__file__).resolve().parent
+ARTIFACT_ROOT = REPO_ROOT / "artifacts/tse_youtube_notion/pipeline_pre_news"
+BACKFILL_ROOT = REPO_ROOT / "artifacts/tse_youtube_notion/backfill_2025"
 DEFAULT_SUPER_MODEL = "gpt-5.4-mini"
 DEFAULT_SUPER_FOCUS = "quality-core"
 DEFAULT_SUPER_MIN_CONFIDENCE = "medium"
@@ -306,10 +307,10 @@ def build_stage_commands(args: argparse.Namespace) -> list[PipelineStage]:
 
 
 def _write_summary(run_root: Path, summary: dict[str, Any]) -> None:
-    (run_root / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    summary_path = run_root / "summary.json"
+    temp_path = summary_path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(summary_path)
 
 
 def _append_stage_result(summary: dict[str, Any], result: dict[str, Any], run_root: Path) -> None:
@@ -336,6 +337,7 @@ def _manifest_path_for(playlist_url: str, year: int) -> Path:
 def _repair_manifest_false_errors(manifest: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
     root_dir = manifest_path.parent
     videos = manifest.get("videos") or {}
+    changed = False
     for video_id, entry in videos.items():
         status = str(entry.get("status") or "")
         last_artifact = str(entry.get("last_artifact") or "")
@@ -352,7 +354,11 @@ def _repair_manifest_false_errors(manifest: dict[str, Any], manifest_path: Path)
         entry["last_step"] = "done"
         entry["finished_at"] = entry.get("finished_at") or time.strftime("%Y-%m-%dT%H:%M:%S")
         entry.pop("error", None)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        changed = True
+    if changed:
+        temp_path = manifest_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(manifest_path)
     return manifest
 
 
@@ -470,22 +476,23 @@ def _run_residual_focal_closure(
                 "BACKFILL_NO_PROGRESS_TIMEOUT_SECONDS": str(no_progress_seconds),
             },
         )
-        _manifest_path, manifest = _load_manifest(args.playlist_url, args.year)
         result = run_stage(rerun_stage, run_root)
+        manifest_path, manifest = _load_manifest(args.playlist_url, args.year)
         resolved_video_ids = [
             video_id
             for video_id in residual_before
             if str(((manifest.get("videos") or {}).get(video_id) or {}).get("status") or "") == "done"
         ]
+        counts = _manifest_status_counts(manifest)
+        result = dict(result)
+        result["manifest_status_counts"] = counts
+        result["remaining_error_video_ids"] = _manifest_error_video_ids(manifest)
+        result["resolved_video_ids"] = resolved_video_ids
         if result["status"] != "done":
-            counts = _manifest_status_counts(manifest)
             if int(counts.get("done", 0)) > 0:
                 tolerated = dict(result)
                 tolerated["status"] = "tolerated_error"
                 tolerated["tolerated"] = True
-                tolerated["manifest_status_counts"] = counts
-                tolerated["remaining_error_video_ids"] = _manifest_error_video_ids(manifest)
-                tolerated["resolved_video_ids"] = resolved_video_ids
                 result = tolerated
                 LOGGER.warning(
                     "[%s] falhou, mas o manifest preserva %s vídeos feitos e %s resíduos. "
@@ -636,7 +643,7 @@ def _run_residual_focal_closure(
                 if result["status"] != "done":
                     raise RuntimeError(f"Falha no residual focal ({stage.name}).")
 
-        _manifest_path, manifest = _load_manifest(args.playlist_url, args.year)
+        manifest_path, manifest = _load_manifest(args.playlist_url, args.year)
         remaining_video_ids = _manifest_error_video_ids(manifest)
         if not remaining_video_ids:
             return
@@ -644,7 +651,7 @@ def _run_residual_focal_closure(
     summary["residual_errors"] = {
         "count": len(remaining_video_ids),
         "video_ids": remaining_video_ids,
-        "manifest_path": str(_manifest_path),
+        "manifest_path": str(manifest_path),
     }
     LOGGER.warning(
         "Vídeos problemáticos remanescentes após o residual focal: %s. "
@@ -656,7 +663,7 @@ def _run_residual_focal_closure(
 def ensure_python_module_available(python_executable: str, module_name: str) -> None:
     probe = subprocess.run(
         [python_executable, "-c", f"import {module_name}"],
-        cwd=Path.cwd(),
+        cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -672,6 +679,13 @@ def ensure_python_module_available(python_executable: str, module_name: str) -> 
     )
 
 
+def _tail_log(log_path: Path, max_lines: int = 40) -> list[str]:
+    try:
+        return log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:]
+    except OSError:
+        return []
+
+
 def run_stage(stage: PipelineStage, run_root: Path) -> dict[str, Any]:
     log_path = run_root / f"{stage.name}.log"
     started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -679,12 +693,14 @@ def run_stage(stage: PipelineStage, run_root: Path) -> dict[str, Any]:
     if len(stage.command) > 1 and Path(stage.command[1]).name == "super_auditor.py":
         ensure_python_module_available(stage.command[0], "openai")
     env = os.environ.copy()
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
     if stage.env_overrides:
         env.update(stage.env_overrides)
     with log_path.open("w", encoding="utf-8") as handle:
         process = subprocess.run(
             stage.command,
-            cwd=Path.cwd(),
+            cwd=REPO_ROOT,
             stdout=handle,
             stderr=subprocess.STDOUT,
             text=True,
@@ -694,7 +710,7 @@ def run_stage(stage: PipelineStage, run_root: Path) -> dict[str, Any]:
         )
     finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     LOGGER.info("[%s] concluído com código %s. Log: %s", stage.name, process.returncode, log_path)
-    return {
+    result = {
         "name": stage.name,
         "command": stage.command,
         "started_at": started_at,
@@ -703,6 +719,9 @@ def run_stage(stage: PipelineStage, run_root: Path) -> dict[str, Any]:
         "log_path": str(log_path),
         "status": "done" if process.returncode == 0 else "error",
     }
+    if process.returncode != 0:
+        result["log_tail"] = _tail_log(log_path)
+    return result
 
 
 def main() -> None:
@@ -732,13 +751,15 @@ def main() -> None:
                 raise RuntimeError(stage.name)
 
         _run_residual_focal_closure(args=args, run_root=run_root, summary=summary)
-    except RuntimeError as exc:
-        failed_stage = str(exc) or "unknown"
+    except Exception as exc:
+        failed_stage = str(exc) or exc.__class__.__name__
         summary["status"] = "error"
         summary["failed_stage"] = failed_stage
+        summary["error_type"] = exc.__class__.__name__
         summary["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         _write_summary(run_root, summary)
-        raise SystemExit(1)
+        LOGGER.exception("Pipeline pré-notícias falhou: %s", failed_stage)
+        raise SystemExit(1) from exc
 
     summary["status"] = "done_with_residual_errors" if summary.get("residual_errors") else "done"
     summary["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")

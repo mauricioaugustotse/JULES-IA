@@ -8,6 +8,7 @@ from tse_youtube_notion_core import (
     GeminiSessionExtractor,
     GeminiNewsEnricher,
     GeminiProcessMetadataEnricher,
+    GeminiThemePunchlineEnricher,
     InstitutionalRepairResult,
     JudgmentBundleExtraction,
     JudgmentItemExtraction,
@@ -24,6 +25,7 @@ from tse_youtube_notion_core import (
     TranscriptSnippet,
     build_preview_rows,
     build_fallback_tema,
+    build_editorial_punchline_fallback,
     build_fundamentacao_column_text,
     build_gemini_http_options,
     build_raciocinio_column_text,
@@ -39,6 +41,8 @@ from tse_youtube_notion_core import (
     infer_votacao_from_row_text,
     normalize_party_list,
     punchline_looks_generic,
+    theme_punchline_pair_needs_rewrite,
+    theme_punchline_pair_too_similar,
     publish_preview_rows,
     should_replace_classe_processo,
     should_disable_model,
@@ -84,11 +88,18 @@ def make_schema() -> NotionDataSourceSchema:
             },
             "resultado": {
                 "type": "select",
-                "select": {"options": [{"name": "Aprovada"}, {"name": "Desprovido"}, {"name": "Suspenso por vista"}]},
+                "select": {
+                    "options": [
+                        {"name": "Aprovada"},
+                        {"name": "Desprovido"},
+                        {"name": "Suspenso por vista"},
+                        {"name": "Suspenso mas julgado depois"},
+                    ]
+                },
             },
             "votacao": {
                 "type": "select",
-                "select": {"options": [{"name": "Unânime"}, {"name": "Por maioria"}, {"name": "Suspenso"}]},
+                "select": {"options": [{"name": "Unânime"}, {"name": "Por maioria"}, {"name": "Suspenso"}, {"name": "Suspenso*"}]},
             },
             "partes": {
                 "type": "multi_select",
@@ -296,7 +307,7 @@ def test_build_preview_rows_prefers_session_composition_when_item_is_sparse():
                 "Ministra Isabel Gallotti",
                 "Ministro Kassio Nunes Marques",
                 "Ministro Floriano de Azevedo Marques",
-                "Ministro Alexandre de Moraes",
+                "Ministro Antônio Carlos Ferreira",
                 "Ministro Ramos Tavares",
             ],
             judgments=[],
@@ -332,7 +343,7 @@ def test_build_preview_rows_prefers_session_composition_when_item_is_sparse():
         "Min. Isabel Gallotti",
         "Min. Nunes Marques",
         "Min. Floriano de Azevedo Marques",
-        "Min. Alexandre de Moraes",
+        "Min. Antônio Carlos Ferreira",
         "Min. Ramos Tavares",
     ]
 
@@ -434,6 +445,29 @@ def test_build_preview_rows_ignores_invalid_session_composition_with_eight_names
 
     rows = build_preview_rows(analysis, "https://youtu.be/abc123", schema, notion)
     assert rows[0].composicao == ["Min. Cármen Lúcia", "Min. André Mendonça"]
+
+
+def test_choose_preferred_composition_rejects_regimentally_impossible_seven_names():
+    contaminated = [
+        "Min. Rosa Weber",
+        "Min. Luís Roberto Barroso",
+        "Min. Jorge Mussi",
+        "Min. Og Fernandes",
+        "Min. Tarcísio Vieira de Carvalho Neto",
+        "Min. Sérgio Banhos",
+        "Min. Admar Gonzaga",
+    ]
+    regimental = [
+        "Min. Rosa Weber",
+        "Min. Luís Roberto Barroso",
+        "Min. Edson Fachin",
+        "Min. Jorge Mussi",
+        "Min. Og Fernandes",
+        "Min. Admar Gonzaga",
+        "Min. Tarcísio Vieira de Carvalho Neto",
+    ]
+
+    assert core.choose_preferred_composition(contaminated, regimental) == regimental
 
 
 def test_build_preview_rows_prefers_session_date_over_item_date():
@@ -1050,8 +1084,8 @@ def test_infer_origin_from_row_text_falls_back_to_tre_sigla_and_tse():
     row_tse = PublishPreviewRow(
         analise_do_conteudo_juridico="Questão administrativa interna do Tribunal Superior Eleitoral."
     )
-    assert infer_origin_from_row_text(row_tre) == "TRE/SE"
-    assert infer_origin_from_row_text(row_tse) == "TSE"
+    assert infer_origin_from_row_text(row_tre) == "Aracaju/SE"
+    assert infer_origin_from_row_text(row_tse) == "Brasília/DF"
 
 
 def test_infer_origin_from_row_text_ignores_plural_tre_listing_noise():
@@ -1126,10 +1160,11 @@ def test_validate_preview_row_sets_tse_as_subsidiary_origin_for_cta():
 
     validated = validate_preview_row(row, schema)
 
-    assert validated.origem == "TSE"
+    assert validated.origem == "Brasília/DF"
+    assert validated.tribunal == "TSE"
 
 
-def test_normalize_party_list_keeps_role_at_end_and_drops_lawyers():
+def test_normalize_party_list_strips_process_role_and_drops_lawyers():
     values = normalize_party_list(
         [
             "Recorrente: Alice",
@@ -1139,7 +1174,7 @@ def test_normalize_party_list_keeps_role_at_end_and_drops_lawyers():
             "MPE",
         ]
     )
-    assert values == ["Alice (Recorrente)", "Bob (Agravante)"]
+    assert values == ["Alice", "Bob"]
 
 
 def test_normalize_party_list_parses_serialized_role_mapping():
@@ -1151,15 +1186,30 @@ def test_normalize_party_list_parses_serialized_role_mapping():
         ]
     )
     assert values == [
-        "Cláudia Aparecida dos Santos (Embargante)",
-        "Denilson Aparecido Martins (Embargado)",
-        "Federação Brasil da Esperança de Santa Luzia (Embargado)",
+        "Cláudia Aparecida dos Santos",
+        "Denilson Aparecido Martins",
+        "Federação Brasil da Esperança de Santa Luzia",
     ]
 
 
-def test_normalize_party_list_normalizes_suffix_role_label():
+def test_normalize_party_list_strips_suffix_role_label():
     values = normalize_party_list(["Thiago Soares de Godoy (agravante)"])
-    assert values == ["Thiago Soares de Godoy (Agravante)"]
+    assert values == ["Thiago Soares de Godoy"]
+
+
+def test_normalize_party_list_preserves_entity_acronym_but_strips_process_role():
+    values = normalize_party_list(
+        [
+            'Coligação "Bora Continuar Avançando" (Recorrente)',
+            "Partido Socialista Brasileiro (PSB) (Agravado)",
+            "Impetrado: Tribunal Regional Eleitoral do Rio de Janeiro (TRE-RJ)",
+        ]
+    )
+    assert values == [
+        "Coligação Bora Continuar Avançando",
+        "Partido Socialista Brasileiro (PSB)",
+        "Tribunal Regional Eleitoral do Rio de Janeiro (TRE-RJ)",
+    ]
 
 
 def test_validate_preview_row_strips_legacy_section_headings():
@@ -1765,6 +1815,21 @@ def test_validate_preview_row_overrides_result_when_judgment_is_suspended_by_vis
     assert validated.resultado == "Suspenso por vista"
 
 
+def test_validate_preview_row_preserves_suspenso_julgado_depois_marker():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        numero_processo="0613678-87",
+        classe_processo="AgRg-REspe",
+        resultado="Suspenso mas julgado depois",
+        votacao="Suspenso",
+        data_sessao="20/03/2026",
+    )
+    validated = validate_preview_row(row, schema)
+    assert validated.votacao == "Suspenso*"
+    assert validated.resultado == "Suspenso mas julgado depois"
+
+
 def test_validate_preview_row_replaces_generic_pa_with_arespe_when_text_supports_it():
     row = PublishPreviewRow(
         tema="Tema útil",
@@ -1916,7 +1981,10 @@ def test_validate_preview_row_normalizes_news_urls(monkeypatch):
             self.url = url
             self.status_code = 200
             self.headers = {"Content-Type": "text/html; charset=utf-8"}
-            self.content = b"<html><body>Noticia valida</body></html>"
+            self.content = (
+                b"<html><body>Noticia valida sobre Porto Alegre/RS no processo 0600249-07 "
+                b"julgado pelo TSE.</body></html>"
+            )
             self.text = self.content.decode("utf-8")
 
     def fake_get(url, *args, **kwargs):
@@ -2119,15 +2187,15 @@ def test_gemini_news_enricher_repairs_broken_tse_slug(monkeypatch):
             return InstitutionalRepairResult(urls=[fixed_url]), []
         raise AssertionError(response_model)
 
-    def fake_filter_accessible(urls):
+    def fake_filter_relevant(urls, _row):
         if broken_url in urls and fixed_url not in urls:
-            return [], [broken_url]
+            return [], [broken_url], []
         if fixed_url in urls:
-            return [fixed_url], []
-        return list(urls), []
+            return [fixed_url], [], []
+        return list(urls), [], []
 
     monkeypatch.setattr(enricher, "_call_grounded_json", fake_call_grounded_json)
-    monkeypatch.setattr(core, "filter_accessible_news_urls", fake_filter_accessible)
+    monkeypatch.setattr(core, "filter_relevant_institutional_news_urls", fake_filter_relevant)
 
     enriched = enricher.enrich_rows([row])
     assert enriched[0].noticia_TSE == fixed_url
@@ -2418,9 +2486,11 @@ def test_process_metadata_enricher_keeps_judged_process_when_local_chunks_use_pr
 
 def test_news_enricher_reuses_cached_artifact(tmp_path):
     artifact_store = RunArtifacts(tmp_path)
+    row = PublishPreviewRow(tema="Tema")
     artifact_store.write_json(
         "06_news_enrichment_01.json",
         {
+            "context": core.build_news_enrichment_context(row),
             "applied": {
                 "noticia_TSE": "https://www.tse.jus.br/noticia",
                 "noticia_TRE": "",
@@ -2431,10 +2501,77 @@ def test_news_enricher_reuses_cached_artifact(tmp_path):
     enricher = object.__new__(GeminiNewsEnricher)
     enricher.artifact_store = artifact_store
 
-    enriched = enricher.enrich_rows([PublishPreviewRow(tema="Tema")])
+    enriched = enricher.enrich_rows([row])
 
     assert enriched[0].noticia_TSE == "https://www.tse.jus.br/noticia"
     assert enriched[0].noticias_gerais == ["https://g1.globo.com/noticia"]
+
+
+def test_news_response_accepts_plain_url_list():
+    parsed = core._coerce_gemini_response_model(
+        NewsEnrichmentResult,
+        json.dumps(["https://www.poder360.com.br/noticia"]),
+    )
+
+    assert parsed.noticia_geral == ["https://www.poder360.com.br/noticia"]
+
+
+def test_news_enricher_ignores_stale_cached_artifact(tmp_path, monkeypatch):
+    artifact_store = RunArtifacts(tmp_path)
+    artifact_store.write_json(
+        "06_news_enrichment_01.json",
+        {
+            "context": "tema: outro contexto",
+            "applied": {
+                "noticia_TSE": "https://www.tse.jus.br/noticia-antiga",
+            },
+        },
+    )
+    row = PublishPreviewRow(tema="Tema atual", numero_processo="0600249-07")
+    enricher = object.__new__(GeminiNewsEnricher)
+    enricher.artifact_store = artifact_store
+    enricher.model = "gemini-2.5-flash-lite"
+
+    def fake_call_grounded_json(*, prompt, response_model, artifact_name):
+        return NewsEnrichmentResult(noticia_TSE=["https://www.tse.jus.br/noticia-nova"]), []
+
+    monkeypatch.setattr(enricher, "_call_grounded_json", fake_call_grounded_json)
+    monkeypatch.setattr(
+        core,
+        "filter_relevant_institutional_news_urls",
+        lambda urls, _row: (list(urls), [], []),
+    )
+    monkeypatch.setattr(core, "filter_general_news_urls", lambda urls, _row: list(urls))
+
+    enriched = enricher.enrich_rows([row])
+
+    assert enriched[0].noticia_TSE == "https://www.tse.jus.br/noticia-nova"
+
+
+def test_news_enricher_reuses_existing_valid_links_without_grounding(tmp_path, monkeypatch):
+    row = PublishPreviewRow(
+        tema="Conduta vedada por uso de bens públicos",
+        numero_processo="0600249-07",
+        noticia_TSE="https://www.tse.jus.br/noticia",
+    )
+    enricher = object.__new__(GeminiNewsEnricher)
+    enricher.artifact_store = RunArtifacts(tmp_path)
+
+    def should_not_call(*args, **kwargs):
+        raise AssertionError("grounding não deveria ser chamado quando já há notícia válida")
+
+    monkeypatch.setattr(enricher, "_call_grounded_json", should_not_call)
+    monkeypatch.setattr(
+        core,
+        "filter_relevant_institutional_news_urls",
+        lambda urls, _row: (list(urls), [], []),
+    )
+    monkeypatch.setattr(core, "filter_general_news_urls", lambda urls, _row: list(urls))
+
+    enriched = enricher.enrich_rows([row])
+
+    assert enriched[0].noticia_TSE == "https://www.tse.jus.br/noticia"
+    assert (tmp_path / "06_news_enrichment_01.json").exists()
 
 
 def test_filter_general_news_urls_discards_irrelevant_candidates(monkeypatch):
@@ -2489,6 +2626,77 @@ def test_filter_general_news_urls_discards_irrelevant_candidates(monkeypatch):
     assert filtered == [
         "https://blogdoedisonsilva.com.br/tse-mantem-decisao-do-tre-cearense-condenando-o-prefeito-de-potiretama/"
     ]
+
+
+def test_filter_relevant_institutional_news_urls_discards_unrelated_tse_page(monkeypatch):
+    row = PublishPreviewRow(
+        tema="Conduta vedada por uso de bens públicos",
+        origem="Potiretama/CE",
+        tribunal="TRE-CE",
+        numero_processo="0600368-79.2024.6.06.0086",
+        partes=["Luan Dantas Félix", "Solange Mary Holanda Campelo Balbino"],
+    )
+
+    def fake_snapshot(url):
+        if url.endswith("/relevante"):
+            return (
+                url,
+                200,
+                "text/html",
+                "<html><body>TSE mantém decisão sobre Luan Dantas Félix em Potiretama/CE no processo 0600368-79.</body></html>",
+            )
+        return (
+            url,
+            200,
+            "text/html",
+            "<html><body>TSE divulga calendário de atendimento biométrico nacional.</body></html>",
+        )
+
+    monkeypatch.setattr(core, "fetch_candidate_page_snapshot", fake_snapshot)
+
+    accepted, unavailable, irrelevant = core.filter_relevant_institutional_news_urls(
+        [
+            "https://www.tse.jus.br/relevante",
+            "https://www.tse.jus.br/irrelevante",
+        ],
+        row,
+    )
+
+    assert accepted == ["https://www.tse.jus.br/relevante"]
+    assert unavailable == []
+    assert irrelevant == ["https://www.tse.jus.br/irrelevante"]
+
+
+def test_filter_relevant_institutional_news_urls_discards_generic_homepage(monkeypatch):
+    row = PublishPreviewRow(
+        tema="Transporte especial de eleitores com deficiência",
+        origem="Brasília/DF",
+        tribunal="TSE",
+        numero_processo="0000276-65",
+    )
+
+    def fake_snapshot(url):
+        return (
+            url,
+            200,
+            "text/html",
+            "<html><body>TSE noticia processo 0000276-65 em Brasília/DF.</body></html>",
+        )
+
+    monkeypatch.setattr(core, "fetch_candidate_page_snapshot", fake_snapshot)
+
+    accepted, unavailable, irrelevant = core.filter_relevant_institutional_news_urls(
+        [
+            "https://www.tse.jus.br/",
+            "https://www.tse.jus.br/comunicacao/noticias",
+            "https://www.tse.jus.br/comunicacao/noticias/2026/Maio/noticia-especifica",
+        ],
+        row,
+    )
+
+    assert accepted == ["https://www.tse.jus.br/comunicacao/noticias/2026/Maio/noticia-especifica"]
+    assert unavailable == []
+    assert irrelevant == ["https://www.tse.jus.br/", "https://www.tse.jus.br/comunicacao/noticias"]
 
 
 def test_enrich_preview_rows_with_process_metadata_updates_full_number_and_blocks_precedent():
@@ -3304,7 +3512,7 @@ def test_validate_preview_row_promotes_full_cnj_and_fills_origin_from_tribunal()
     validated = validate_preview_row(row, schema)
 
     assert validated.numero_processo == "0600249-07.2024.6.02.0001"
-    assert validated.origem == "TRE/AP"
+    assert validated.origem == "Macapá/AP"
 
 
 def test_validate_preview_row_promotes_special_adi_number_from_text():
@@ -3318,7 +3526,7 @@ def test_validate_preview_row_promotes_special_adi_number_from_text():
     validated = validate_preview_row(row, schema)
 
     assert validated.numero_processo == "ADI 7228"
-    assert validated.classe_processo == "ADI"
+    assert validated.classe_processo == ""
 
 
 def test_infer_punchline_from_row_text_uses_contextual_sentence_not_decision_formula():
@@ -3425,6 +3633,61 @@ def test_infer_punchline_from_row_text_rebuilds_cota_genero_vista_sentence():
     )
 
 
+def test_theme_punchline_pair_needs_rewrite_flags_short_repetitive_pair():
+    row = PublishPreviewRow(
+        tema="Fraude à cota de gênero",
+        punchline="Fraude à cota de gênero.",
+        analise_do_conteudo_juridico="A discussão envolveu candidatura feminina fictícia e consequência na chapa proporcional.",
+    )
+
+    assert theme_punchline_pair_too_similar(row.tema, row.punchline)
+    assert theme_punchline_pair_needs_rewrite(row)
+
+
+def test_theme_punchline_enricher_applies_complementary_repair_item():
+    row = PublishPreviewRow(
+        tema="Julgamento",
+        punchline="Recurso provido.",
+        resultado="Provido",
+        analise_do_conteudo_juridico=(
+            "A controvérsia envolveu a utilização promocional de programa social por agente público durante "
+            "a campanha municipal, com debate sobre desequilíbrio eleitoral e alcance da sanção."
+        ),
+    )
+    repair_item = core.ThemePunchlineRepairItem(
+        key="row_001",
+        tema="Uso promocional de programa social em campanha municipal",
+        punchline=(
+            "A disputa examinou se a divulgação eleitoral de benefícios sociais pela gestão municipal comprometeu "
+            "a igualdade da disputa, e o TSE reconheceu o impacto concreto da conduta no desfecho do pleito."
+        ),
+    )
+    enricher = object.__new__(GeminiThemePunchlineEnricher)
+
+    repaired = enricher._apply_repair_item(row, repair_item)
+
+    assert repaired.tema == "Uso promocional de programa social em campanha municipal"
+    assert repaired.punchline.startswith("A disputa examinou")
+    assert not theme_punchline_pair_needs_rewrite(repaired)
+
+
+def test_build_editorial_punchline_fallback_adds_context_and_result():
+    row = PublishPreviewRow(
+        tema="Publicidade institucional em período vedado",
+        resultado="Desprovido",
+        analise_do_conteudo_juridico=(
+            "Prefeito manteve publicidade institucional em canais oficiais durante o período vedado das eleições "
+            "municipais, e a controvérsia examinou se a exposição beneficiou sua candidatura à reeleição."
+        ),
+    )
+
+    punchline = build_editorial_punchline_fallback(row, row.tema)
+
+    assert "publicidade institucional" in punchline.lower()
+    assert "desprovido" in punchline.lower()
+    assert len(punchline) >= 90
+
+
 def test_should_replace_classe_processo_rejects_speculative_adi_over_consulta():
     row = PublishPreviewRow(
         numero_processo="0601984-92.2022.6.00.0000",
@@ -3435,14 +3698,14 @@ def test_should_replace_classe_processo_rejects_speculative_adi_over_consulta():
     assert should_replace_classe_processo("CTA", "ADI", row) is False
 
 
-def test_should_replace_classe_processo_accepts_adi_when_numero_proves_it():
+def test_should_replace_classe_processo_rejects_adi_even_when_numero_mentions_it():
     row = PublishPreviewRow(
         numero_processo="ADI 7228",
         classe_processo="CTA",
         analise_do_conteudo_juridico="O voto discute a ADI 7228.",
     )
 
-    assert should_replace_classe_processo("CTA", "ADI", row) is True
+    assert should_replace_classe_processo("CTA", "ADI", row) is False
 
 
 def test_dedupe_preview_rows_preserves_overlay_class_same_process_same_video():

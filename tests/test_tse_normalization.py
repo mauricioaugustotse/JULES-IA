@@ -12,6 +12,7 @@ from tse_normalization import (
     normalize_pedido_vista_value,
     normalize_resultado_final,
     normalize_session_date_to_iso,
+    normalize_votacao,
     remove_mpe_from_partes,
 )
 
@@ -33,6 +34,8 @@ def test_normalize_classe_processo_canonicalizes_known_alias():
 
 def test_normalize_resultado_final_normalizes_suspenso_por_vista():
     assert normalize_resultado_final("julgamento suspenso por pedido de vista") == "Suspenso por vista"
+    assert normalize_resultado_final("suspenso mas julgado depois") == "Suspenso mas julgado depois"
+    assert normalize_votacao("Suspenso*") == "Suspenso*"
     assert normalize_resultado_final("Consulta respondida nos termos do voto do relator.") == "Aprovada"
 
 
@@ -50,22 +53,24 @@ def test_normalize_origem_and_date():
     assert normalize_origem_value("Porto Alegre - RS") == "Porto Alegre/RS"
     assert normalize_origem_value("São Gonçalo do Amarante, RN") == "São Gonçalo do Amarante/RN"
     assert normalize_origem_value("São Gonçalo do Amarante, Rio Grande do Norte") == "São Gonçalo do Amarante/RN"
-    assert normalize_origem_value("Tribunal Regional Eleitoral do Ceará") == "TRE/CE"
-    assert normalize_origem_value("Tribunal Regional Eleitoral de Sergipe/SE") == "TRE/SE"
-    assert normalize_origem_value("Tribunal Superior Eleitoral") == "TSE"
+    assert normalize_origem_value("Tribunal Regional Eleitoral do Ceará") == "Fortaleza/CE"
+    assert normalize_origem_value("Tribunal Regional Eleitoral de Sergipe/SE") == "Aracaju/SE"
+    assert normalize_origem_value("Tribunal Superior Eleitoral") == "Brasília/DF"
     assert normalize_origem_value("Tribunal de Justiça de São Paulo/SP") == "São Paulo/SP"
-    assert normalize_origem_value("Decisões do TRE/PR") == "TRE/PR"
-    assert normalize_origem_value("Jurisprudência do TRE/PR") == "TRE/PR"
+    assert normalize_origem_value("Decisões do TRE/PR") == "Curitiba/PR"
+    assert normalize_origem_value("Jurisprudência do TRE/PR") == "Curitiba/PR"
     assert normalize_origem_value("Municipal de Cascavel/CE") == "Cascavel/CE"
-    assert normalize_origem_value("TSE/CE") == "TRE/CE"
-    assert normalize_origem_value("TRE-SP") == "TRE/SP"
-    assert normalize_origem_value("Titular do TRE/MS") == "TRE/MS"
+    assert normalize_origem_value("TSE/CE") == "Fortaleza/CE"
+    assert normalize_origem_value("TRE-SP") == "São Paulo/SP"
+    assert normalize_origem_value("Titular do TRE/MS") == "Campo Grande/MS"
     assert normalize_origem_value("Eleitoral de Macapá/AP") == "Macapá/AP"
     assert normalize_origem_value("92ª Zona Eleitoral de Araruama/RJ") == "Araruama/RJ"
     assert normalize_origem_value("Tribunais Regionais Eleitorais do Pará, Paraná/RJ") == ""
     assert normalize_origem_value("Tribunais Regionais Eleitorais de Ceará, Sergipe/MA") == ""
     assert normalize_origem_value("Distrito Federal, Rio Grande do Sul, Rio Grande do Norte, Acre, Amapá/RO") == ""
-    assert normalize_origem_value("Amapá") == ""
+    assert normalize_origem_value("Amapá") == "Macapá/AP"
+    assert normalize_origem_value("SP") == "São Paulo/SP"
+    assert normalize_origem_value("Goiânia") == "Goiânia/GO"
     assert normalize_eleicao_value("Eleições 2024") == "2024"
     assert normalize_session_date_to_iso("20/03/2026") == "2026-03-20"
 

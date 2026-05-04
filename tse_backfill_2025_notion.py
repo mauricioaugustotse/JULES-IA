@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from html import unescape
@@ -19,9 +20,11 @@ import requests
 
 from tse_normalization import (
     STATE_UF,
+    UF_CAPITALS,
     build_video_only_youtube_link,
     build_timestamped_youtube_link,
     canonicalize_numero_processo,
+    composicao_regimental_issue,
     dedupe_preserve_order,
     extract_chunk_judgment_process_values,
     extract_full_cnj,
@@ -45,10 +48,13 @@ from tse_normalization import (
 from tse_youtube_notion_core import (
     ARTIFACT_ROOT,
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_NEWS_GEMINI_MODEL,
+    GEMINI_CALL_RETRIES,
     GENERAL_NEWS_LIMIT,
     GeminiNewsEnricher,
     GeminiProcessMetadataEnricher,
     GeminiSessionExtractor,
+    GeminiThemePunchlineEnricher,
     JudgmentBundleExtraction,
     JudgmentItemExtraction,
     NotionDataSourceSchema,
@@ -71,6 +77,7 @@ from tse_youtube_notion_core import (
     infer_relator_from_row_text,
     infer_resultado_from_row_text,
     infer_votacao_from_row_text,
+    is_generic_institutional_news_url,
     normalize_advogado_list,
     normalize_composition_list,
     normalize_party_list,
@@ -478,6 +485,30 @@ def load_existing_pages_for_year(
     return grouped
 
 
+def load_existing_pages_for_news(
+    client: NotionSessoesClient,
+    schema: NotionDataSourceSchema,
+    *,
+    year: int = 0,
+) -> list[ExistingPageRecord]:
+    records: list[ExistingPageRecord] = []
+    for page in client.query_data_source():
+        row = notion_page_to_row(client, schema, page)
+        date_value = normalize_session_date_to_iso(row.data_sessao)
+        if year and not date_value.startswith(f"{year}-"):
+            continue
+        video_id = extract_youtube_video_id(row.youtube_link) or ""
+        records.append(
+            ExistingPageRecord(
+                page_id=page.get("id", ""),
+                url=page.get("url", ""),
+                video_id=video_id,
+                row=row,
+            )
+        )
+    return records
+
+
 def _row_match_score(new_row: PublishPreviewRow, existing: ExistingPageRecord) -> int:
     score = 0
     new_process = canonicalize_numero_processo(new_row.numero_processo)
@@ -740,7 +771,20 @@ def _valid_playlist_video_ids(playlist_url: str, year: int) -> set[str]:
     }
 
 
-def _rerun_dir_matches_playlist(run_dir: Path, playlist_url: str, year: int, valid_video_ids: set[str]) -> bool:
+def _video_ids_from_artifact_run_dir(run_dir: Path) -> set[str]:
+    return {
+        path.name.split("_", 1)[-1]
+        for path in run_dir.glob("*_*")
+        if path.is_dir()
+    }
+
+
+def _rerun_dir_matches_playlist(
+    run_dir: Path,
+    playlist_url: str,
+    year: int,
+    valid_video_ids: set[str] | None,
+) -> bool:
     summary_path = run_dir / "summary.json"
     if summary_path.exists():
         try:
@@ -752,18 +796,43 @@ def _rerun_dir_matches_playlist(run_dir: Path, playlist_url: str, year: int, val
         if summary_playlist:
             return summary_playlist == playlist_url and summary_year in {0, year}
 
-    candidate_video_ids = {
-        path.name.split("_", 1)[-1]
-        for path in run_dir.glob("*_*")
-        if path.is_dir()
-    }
+    candidate_video_ids = _video_ids_from_artifact_run_dir(run_dir)
+    if valid_video_ids is None:
+        return bool(candidate_video_ids)
     return bool(candidate_video_ids & valid_video_ids)
 
 
 def iter_backfill_run_dirs(playlist_url: str, year: int) -> list[Path]:
     playlist_id = extract_playlist_id(playlist_url)
     run_dirs: list[Path] = []
-    valid_video_ids = _valid_playlist_video_ids(playlist_url, year)
+    current_dir = BACKFILL_ROOT / f"{year}_{playlist_id}"
+    archived_root = BACKFILL_ROOT / "_archived_runs"
+    archived_dirs: list[Path] = []
+    if archived_root.is_dir():
+        archived_dirs = sorted(
+            (path for path in archived_root.glob(f"{year}_{playlist_id}*") if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+
+    valid_video_ids: set[str] | None = set()
+    if current_dir.is_dir():
+        valid_video_ids.update(_video_ids_from_artifact_run_dir(current_dir))
+    for archived_dir in archived_dirs:
+        valid_video_ids.update(_video_ids_from_artifact_run_dir(archived_dir))
+    if not valid_video_ids:
+        try:
+            valid_video_ids = _valid_playlist_video_ids(playlist_url, year)
+        except Exception as exc:
+            LOGGER.warning(
+                "Não foi possível validar a playlist %s para filtrar reruns locais de %s; "
+                "usando apenas metadados e diretórios locais: %s",
+                playlist_url,
+                year,
+                exc,
+            )
+            valid_video_ids = None
+
     rerun_dirs = sorted(
         (
             path
@@ -774,17 +843,9 @@ def iter_backfill_run_dirs(playlist_url: str, year: int) -> list[Path]:
         reverse=True,
     )
     run_dirs.extend(rerun_dirs)
-    current_dir = BACKFILL_ROOT / f"{year}_{playlist_id}"
     if current_dir.is_dir():
         run_dirs.append(current_dir)
-    archived_root = BACKFILL_ROOT / "_archived_runs"
-    if archived_root.is_dir():
-        archived_dirs = sorted(
-            (path for path in archived_root.glob(f"{year}_{playlist_id}*") if path.is_dir()),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        run_dirs.extend(archived_dirs)
+    run_dirs.extend(archived_dirs)
     return run_dirs
 
 
@@ -1447,8 +1508,6 @@ def _select_unique_identity_target(
 def _safe_normalize_origem_for_repair(value: str, tribunal: str = "") -> str:
     normalized = normalize_origem_value(value)
     if normalized:
-        if normalized == "TSE":
-            return normalized
         if not re.search(r"/[A-Z]{2}$", normalized) and not normalized.startswith("TRE/"):
             tribunal_normalized = str(tribunal or "").strip().upper()
             match = re.match(r"^TRE-([A-Z]{2})$", tribunal_normalized)
@@ -1458,9 +1517,9 @@ def _safe_normalize_origem_for_repair(value: str, tribunal: str = "") -> str:
     tribunal_normalized = str(tribunal or "").strip().upper()
     match = re.match(r"^TRE-([A-Z]{2})$", tribunal_normalized)
     if match:
-        return f"TRE/{match.group(1)}"
+        return UF_CAPITALS.get(match.group(1), "")
     if tribunal_normalized == "TSE":
-        return "TSE"
+        return UF_CAPITALS["DF"]
     return normalized or ""
 
 
@@ -1473,7 +1532,7 @@ def _origin_from_artifact_item(item: JudgmentItemExtraction | None) -> str:
     tre_value = str(item.tre or "").strip().upper()
     match = re.match(r"^TRE-([A-Z]{2})$", tre_value)
     if match:
-        return f"TRE/{match.group(1)}"
+        return UF_CAPITALS.get(match.group(1), "")
     return ""
 
 
@@ -1531,7 +1590,7 @@ def _origin_specificity(value: str) -> int:
     if re.search(r"/[A-Z]{2}$", normalized) and not normalized.startswith("TRE/"):
         return 3
     if normalized == "TSE":
-        return 2
+        return 1
     if normalized.startswith("TRE/"):
         return 1
     return 0
@@ -1629,12 +1688,7 @@ def _extract_youtube_timestamp_seconds(youtube_link: str) -> int | None:
 
 
 def _composition_size_issue(values: list[str]) -> str:
-    count = len(normalize_composition_list(values))
-    if count > 7:
-        return "gt7"
-    if count < 6:
-        return "lt6"
-    return ""
+    return composicao_regimental_issue(normalize_composition_list(values))
 
 
 def _apply_deterministic_blank_completion_from_artifact(
@@ -2020,6 +2074,53 @@ def update_notion_row_with_retry(
     raise RuntimeError(f"Falha ao atualizar página {page_id} no Notion: {last_error}") from last_error
 
 
+def build_news_only_properties_payload(
+    schema: NotionDataSourceSchema,
+    row: PublishPreviewRow,
+) -> dict[str, Any]:
+    properties: dict[str, Any] = {}
+    if "noticia_TSE" in schema.properties:
+        properties["noticia_TSE"] = {"url": row.noticia_TSE or None}
+    if "noticia_TRE" in schema.properties:
+        properties["noticia_TRE"] = {"url": row.noticia_TRE or None}
+    for index in range(1, GENERAL_NEWS_LIMIT + 1):
+        property_name = f"noticia_geral_{index}"
+        if property_name not in schema.properties:
+            continue
+        url = row.noticias_gerais[index - 1] if index <= len(row.noticias_gerais) else ""
+        properties[property_name] = {"url": url or None}
+    return properties
+
+
+def update_notion_news_fields_with_retry(
+    notion_client: NotionSessoesClient,
+    notion_schema: NotionDataSourceSchema,
+    page_id: str,
+    row: PublishPreviewRow,
+    *,
+    retries: int = NOTION_REPAIR_UPDATE_RETRIES,
+    sleep_seconds: float = NOTION_REPAIR_UPDATE_RETRY_SLEEP_SECONDS,
+) -> dict[str, Any]:
+    payload = {"properties": build_news_only_properties_payload(notion_schema, row)}
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return notion_client._request("PATCH", f"/pages/{page_id}", json=payload)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retries or not _is_retryable_notion_update_error(exc):
+                raise
+            LOGGER.warning(
+                "Falha transitória ao atualizar notícias da página %s no Notion (tentativa %s/%s): %s",
+                page_id,
+                attempt,
+                retries,
+                exc,
+            )
+            time.sleep(sleep_seconds * attempt)
+    raise RuntimeError(f"Falha ao atualizar notícias da página {page_id}: {last_error}") from last_error
+
+
 SCHEMA_RESIDUE_PROPERTIES = [
     "probe_expand_default_large",
     "partes_default_tmp",
@@ -2144,6 +2245,8 @@ def _raw_origem_looks_invalid(value: str) -> bool:
         return True
     if raw in STATE_UF:
         return True
+    if raw == "tse" or re.fullmatch(r"(?:tre|tse)\s+[a-z]{2}", raw):
+        return True
     invalid_markers = [
         "tribunal de justica",
         "decisoes do tre",
@@ -2166,6 +2269,10 @@ def _row_has_wrong_youtube_video(row: PublishPreviewRow, expected_video_id: str)
 
 
 def _votacao_is_inconsistent(row: PublishPreviewRow) -> bool:
+    if row.resultado == "Suspenso mas julgado depois":
+        return row.votacao != "Suspenso*"
+    if row.votacao == "Suspenso*":
+        return row.resultado != "Suspenso mas julgado depois"
     if row.resultado == "Suspenso por vista" and row.votacao not in {"", "Suspenso"}:
         return True
     if row.votacao == "Suspenso" and row.resultado and row.resultado != "Suspenso por vista":
@@ -2173,9 +2280,108 @@ def _votacao_is_inconsistent(row: PublishPreviewRow) -> bool:
     return False
 
 
+SUSPENSO_JULGADO_DEPOIS_RESULTADO = "Suspenso mas julgado depois"
+SUSPENSO_JULGADO_DEPOIS_VOTACAO = "Suspenso*"
+
+
+def _suspended_resolution_process_key(row: PublishPreviewRow) -> str:
+    return (
+        canonicalize_numero_processo(row.numero_processo)
+        or _short_process_lookup_key(row.numero_processo)
+        or _special_process_lookup_key(row.numero_processo, row.classe_processo)
+    )
+
+
+def _is_suspended_for_later_resolution(row: PublishPreviewRow) -> bool:
+    return row.resultado == "Suspenso por vista" or row.votacao == "Suspenso"
+
+
+def _is_definitively_resolved_record(row: PublishPreviewRow) -> bool:
+    resultado = normalize_resultado_final(row.resultado, row.classe_processo)
+    votacao = normalize_votacao(row.votacao)
+    if not resultado:
+        return False
+    if resultado in {"Suspenso por vista", SUSPENSO_JULGADO_DEPOIS_RESULTADO}:
+        return False
+    if votacao in {"Suspenso", SUSPENSO_JULGADO_DEPOIS_VOTACAO}:
+        return False
+    return True
+
+
+def build_suspended_later_resolution_targets(
+    grouped: dict[str, list[ExistingPageRecord]],
+) -> dict[str, dict[str, str]]:
+    entries_by_process: dict[str, list[dict[str, Any]]] = {}
+    for video_id, records in grouped.items():
+        for position, record in enumerate(records):
+            process_key = _suspended_resolution_process_key(record.row)
+            session_date = normalize_session_date_to_iso(record.row.data_sessao)
+            if not process_key or not session_date:
+                continue
+            entries_by_process.setdefault(process_key, []).append(
+                {
+                    "video_id": video_id,
+                    "position": position,
+                    "record": record,
+                    "session_date": session_date,
+                }
+            )
+
+    targets: dict[str, dict[str, str]] = {}
+    for process_key, entries in entries_by_process.items():
+        definitive_entries = sorted(
+            [
+                entry
+                for entry in entries
+                if _is_definitively_resolved_record(entry["record"].row)
+            ],
+            key=lambda entry: (entry["session_date"], entry["video_id"], entry["position"]),
+        )
+        if not definitive_entries:
+            continue
+        for entry in entries:
+            record = entry["record"]
+            if not _is_suspended_for_later_resolution(record.row):
+                continue
+            later_entry = next(
+                (
+                    definitive
+                    for definitive in definitive_entries
+                    if definitive["session_date"] > entry["session_date"]
+                ),
+                None,
+            )
+            if later_entry is None:
+                continue
+            later_record = later_entry["record"]
+            targets[record.page_id] = {
+                "resultado": SUSPENSO_JULGADO_DEPOIS_RESULTADO,
+                "votacao": SUSPENSO_JULGADO_DEPOIS_VOTACAO,
+                "process_key": process_key,
+                "later_page_id": later_record.page_id,
+                "later_video_id": later_entry["video_id"],
+                "later_data_sessao": later_entry["session_date"],
+            }
+    return targets
+
+
+def _apply_suspended_later_resolution_marker(
+    row: PublishPreviewRow,
+    page_id: str,
+    targets: dict[str, dict[str, str]] | None,
+) -> bool:
+    if not targets or page_id not in targets:
+        return False
+    row.resultado = SUSPENSO_JULGADO_DEPOIS_RESULTADO
+    row.votacao = SUSPENSO_JULGADO_DEPOIS_VOTACAO
+    return True
+
+
 def _sanitize_classe_candidate(candidate: str) -> str:
     normalized = normalize_classe_processo(candidate)
     if not normalized:
+        return ""
+    if normalized in {"ADI", "ADO"}:
         return ""
     if re.search(r"\d", normalized):
         return ""
@@ -2251,6 +2457,7 @@ def repair_existing_video_rows(
     apply_updates: bool = True,
     best_composition_by_session_date: dict[str, list[str]] | None = None,
     identity_universe: IdentityRepairUniverse | None = None,
+    suspended_later_resolution_targets: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     artifact_context = load_repair_artifact_context(playlist_url, year, video_id)
     artifact_store = RunArtifacts(artifact_context.artifact_dir) if artifact_context.artifact_dir else None
@@ -2706,6 +2913,12 @@ def repair_existing_video_rows(
         if repair_focus != "identity-core":
             repaired.tipo_registro = f"Julgamento {index}"
             repaired = validate_preview_row(repaired, notion_schema)
+            if _apply_suspended_later_resolution_marker(
+                repaired,
+                repaired.page_id,
+                suspended_later_resolution_targets,
+            ):
+                repaired = validate_preview_row(repaired, notion_schema)
             repaired.origem = _prefer_specific_origem(
                 repaired.origem,
                 original.origem,
@@ -2898,6 +3111,7 @@ def audit_existing_year(
             for video in load_playlist_videos(playlist_url)
             if is_relevant_2025_session(video, year)
         }
+    suspended_later_resolution_targets = build_suspended_later_resolution_targets(grouped)
     stats = {
         "videos": len(grouped),
         "pages": 0,
@@ -2921,13 +3135,16 @@ def audit_existing_year(
         "resultado_empty": 0,
         "votacao_empty": 0,
         "votacao_inconsistent": 0,
+        "suspenso_julgado_depois_missing": 0,
         "relator_empty": 0,
         "classe_empty": 0,
+        "classe_invalid_stf": 0,
         "classe_mismatch": 0,
         "youtube_video_mismatch": 0,
         "composicao_incomplete": 0,
         "composicao_lt6": 0,
         "composicao_gt7": 0,
+        "composicao_regimental": 0,
         "possible_false_positive": 0,
     }
     offenders: dict[str, list[dict[str, str]]] = {
@@ -3074,10 +3291,33 @@ def audit_existing_year(
             elif _votacao_is_inconsistent(row):
                 stats["votacao_inconsistent"] += 1
                 offenders["votacao_inconsistent"].append({"video_id": video_id, "numero_processo": row.numero_processo, "page_id": record.page_id})
+            if record.page_id in suspended_later_resolution_targets:
+                stats["suspenso_julgado_depois_missing"] += 1
+                target = suspended_later_resolution_targets[record.page_id]
+                offenders["suspenso_julgado_depois_missing"].append(
+                    {
+                        "video_id": video_id,
+                        "numero_processo": row.numero_processo,
+                        "page_id": record.page_id,
+                        "later_video_id": target.get("later_video_id", ""),
+                        "later_data_sessao": target.get("later_data_sessao", ""),
+                    }
+                )
             if not row.relator:
                 stats["relator_empty"] += 1
                 offenders["relator_empty"].append({"video_id": video_id, "numero_processo": row.numero_processo, "page_id": record.page_id})
-            if not row.classe_processo:
+            classe_norm = normalize_classe_processo(row.classe_processo)
+            if classe_norm in {"ADI", "ADO"}:
+                stats["classe_invalid_stf"] += 1
+                offenders["classe_invalid_stf"].append(
+                    {
+                        "video_id": video_id,
+                        "numero_processo": row.numero_processo,
+                        "page_id": record.page_id,
+                        "classe_processo": row.classe_processo,
+                    }
+                )
+            elif not row.classe_processo:
                 stats["classe_empty"] += 1
                 offenders["classe_empty"].append({"video_id": video_id, "numero_processo": row.numero_processo, "page_id": record.page_id})
             else:
@@ -3103,6 +3343,16 @@ def audit_existing_year(
                 elif composition_issue == "gt7":
                     stats["composicao_gt7"] += 1
                     offenders["composicao_gt7"].append({"video_id": video_id, "numero_processo": row.numero_processo, "page_id": record.page_id})
+                else:
+                    stats["composicao_regimental"] += 1
+                    offenders["composicao_regimental"].append(
+                        {
+                            "video_id": video_id,
+                            "numero_processo": row.numero_processo,
+                            "page_id": record.page_id,
+                            "issue": composition_issue,
+                        }
+                    )
             publishability, _ = assess_row_publishability(row)
             if publishability == "skipped":
                 stats["possible_false_positive"] += 1
@@ -3190,6 +3440,12 @@ def run_repair_existing_year(args: argparse.Namespace) -> None:
         playlist_url=args.playlist_url,
     )
     best_composition_by_session_date = _build_best_composition_by_session_date(grouped)
+    suspended_later_resolution_targets = build_suspended_later_resolution_targets(grouped)
+    suspended_later_video_ids = {
+        video_id
+        for video_id, records in grouped.items()
+        if any(record.page_id in suspended_later_resolution_targets for record in records)
+    }
     identity_universe: IdentityRepairUniverse | None = None
     video_ids = sorted(grouped)
     repair_focus = getattr(args, "repair_focus", "all")
@@ -3214,6 +3470,7 @@ def run_repair_existing_year(args: argparse.Namespace) -> None:
                     or (not record.row.eleicao)
                     for record in grouped[video_id]
                 )
+                or video_id in suspended_later_video_ids
             ]
         elif repair_focus == "identity-core":
             audit = audit_existing_year(grouped, playlist_url=args.playlist_url, year=args.year)
@@ -3239,12 +3496,12 @@ def run_repair_existing_year(args: argparse.Namespace) -> None:
                 "tipo": {"tipo_blank", "tipo_duplicate", "tipo_out_of_order"},
                 "punchline": {"punchline_empty"},
                 "origem": {"origem_empty", "origem_state_only", "origem_tre_extenso", "origem_invalid_label", "origem_downgraded_tre"},
-                "classe": {"classe_empty", "classe_mismatch"},
-                "votacao": {"votacao_empty", "votacao_inconsistent"},
+                "classe": {"classe_empty", "classe_invalid_stf", "classe_mismatch"},
+                "votacao": {"votacao_empty", "votacao_inconsistent", "suspenso_julgado_depois_missing"},
                 "links": {"association_unproven", "youtube_timestamp_unvalidated", "youtube_video_mismatch"},
                 "numero": {"numero_needs_repair"},
                 "core-fields": {"tema_empty", "tema_generic", "resultado_empty", "votacao_empty", "relator_empty", "classe_empty"},
-                "composition": {"composicao_incomplete", "composicao_lt6", "composicao_gt7"},
+                "composition": {"composicao_incomplete", "composicao_lt6", "composicao_gt7", "composicao_regimental"},
             }
             offender_video_ids = {
                 item["video_id"]
@@ -3289,6 +3546,7 @@ def run_repair_existing_year(args: argparse.Namespace) -> None:
             apply_updates=not review_only,
             best_composition_by_session_date=best_composition_by_session_date,
             identity_universe=identity_universe,
+            suspended_later_resolution_targets=suspended_later_resolution_targets,
         )
         summaries.append(summary)
         (repair_root / f"{video_id}.json").write_text(
@@ -3313,6 +3571,213 @@ def run_repair_existing_year(args: argparse.Namespace) -> None:
 
 def run_repair_existing_2025(args: argparse.Namespace) -> None:
     run_repair_existing_year(args)
+
+
+def _news_fields_snapshot(row: PublishPreviewRow) -> dict[str, Any]:
+    return {
+        "noticia_TSE": row.noticia_TSE,
+        "noticia_TRE": row.noticia_TRE,
+        "noticias_gerais": list(row.noticias_gerais or []),
+    }
+
+
+def is_news_quota_exhausted_error(error: str) -> bool:
+    text = (error or "").lower()
+    return (
+        "resource_exhausted" in text
+        or "exceeded your current quota" in text
+        or "rate-limit" in text
+        or "rate limits" in text
+        or "gemini rest error 429" in text
+    )
+
+
+def load_completed_news_page_ids(resume_from: str | Path | None) -> set[str]:
+    if not resume_from:
+        return set()
+    resume_root = Path(resume_from)
+    if not resume_root.exists():
+        raise FileNotFoundError(f"Artefato de notícias para retomada não encontrado: {resume_root}")
+    page_ids: set[str] = set()
+    for summary_path in resume_root.glob("*/news_existing_summary.json"):
+        try:
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        page_id = str(payload.get("page_id") or "").strip()
+        after = payload.get("after") or {}
+        if any(
+            is_generic_institutional_news_url(str(after.get(field) or ""))
+            for field in ("noticia_TSE", "noticia_TRE")
+        ):
+            continue
+        if page_id:
+            page_ids.add(page_id)
+    return page_ids
+
+
+def run_enrich_existing_news(args: argparse.Namespace) -> None:
+    runtime = build_runtime_context()
+    notion_client = NotionSessoesClient(
+        api_key=runtime["notion_api_key"],
+        data_source_id=runtime["notion_data_source_id"],
+        logger=LOGGER,
+        normalize_multiselect_colors_post_write=False,
+    )
+    notion_schema = notion_client.fetch_schema()
+    target_year = 0 if bool(getattr(args, "all_years", False)) else int(args.year)
+    records = load_existing_pages_for_news(
+        notion_client,
+        notion_schema,
+        year=target_year,
+    )
+    resume_from = str(getattr(args, "news_resume_from", "") or "").strip()
+    completed_resume_page_ids = load_completed_news_page_ids(resume_from)
+    rows_loaded = len(records)
+    if completed_resume_page_ids:
+        records = [record for record in records if record.page_id not in completed_resume_page_ids]
+    if args.limit > 0:
+        records = records[:args.limit]
+    label = "all" if target_year == 0 else str(target_year)
+    news_root = BACKFILL_ROOT / f"_news_existing_{label}_{time.strftime('%Y%m%d_%H%M%S')}"
+    news_root.mkdir(parents=True, exist_ok=True)
+    review_only = bool(getattr(args, "review_only", False))
+    single_search = bool(getattr(args, "single_news_search", False))
+    news_workers = max(1, int(getattr(args, "news_workers", 1) or 1))
+    summary: dict[str, Any] = {
+        "scope": label,
+        "rows_loaded": rows_loaded,
+        "rows": len(records),
+        "resume_from": resume_from,
+        "skipped_already_completed": len(completed_resume_page_ids),
+        "review_only": review_only,
+        "single_news_search": single_search,
+        "news_workers": news_workers,
+        "updated_pages": 0,
+        "unchanged_pages": 0,
+        "failed_pages": 0,
+        "aborted_reason": "",
+        "grounding_calls_budgeted": 0,
+        "updated": [],
+        "failed": [],
+    }
+    summary_path = news_root / "summary.json"
+
+    def process_record(index: int, record: ExistingPageRecord) -> dict[str, Any]:
+        row_artifact_dir = news_root / f"{index:04d}_{record.page_id.replace('-', '')[:12]}"
+        row_artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_store = RunArtifacts(row_artifact_dir)
+        before = _news_fields_snapshot(record.row)
+        news_enricher = GeminiNewsEnricher(
+            api_key=runtime["gemini_api_key"],
+            model=DEFAULT_NEWS_GEMINI_MODEL,
+            artifact_store=artifact_store,
+            logger=LOGGER,
+            allow_institutional_repair=not single_search,
+            max_grounding_attempts=1 if single_search else GEMINI_CALL_RETRIES,
+        )
+        try:
+            enriched = news_enricher.enrich_rows([record.row])[0]
+            enriched.page_id = record.page_id
+            enriched.action = "update"
+            enriched = validate_preview_row(enriched, notion_schema)
+            after = _news_fields_snapshot(enriched)
+            artifact_payload = {
+                "page_id": record.page_id,
+                "url": record.url,
+                "numero_processo": record.row.numero_processo,
+                "before": before,
+                "after": after,
+                "warnings": enriched.warnings,
+            }
+            artifact_store.write_json("news_existing_summary.json", artifact_payload)
+            if before == after:
+                return {"status": "unchanged", "budgeted_grounding_calls": 1 if single_search else 0}
+            if not review_only:
+                update_notion_news_fields_with_retry(
+                    notion_client,
+                    notion_schema,
+                    record.page_id,
+                    enriched,
+                )
+            return {
+                "status": "updated",
+                "payload": artifact_payload,
+                "budgeted_grounding_calls": 1 if single_search else 0,
+            }
+        except Exception as exc:
+            error = str(exc)
+            failure = {
+                "page_id": record.page_id,
+                "url": record.url,
+                "numero_processo": record.row.numero_processo,
+                "error": error,
+            }
+            artifact_store.write_json("news_existing_failure.json", failure)
+            LOGGER.error("Falha ao enriquecer notícias da página %s: %s", record.page_id, exc)
+            return {
+                "status": "failed",
+                "payload": failure,
+                "fatal": is_news_quota_exhausted_error(error),
+                "budgeted_grounding_calls": 1 if single_search else 0,
+            }
+
+    def apply_result(result: dict[str, Any]) -> bool:
+        status = result.get("status")
+        summary["grounding_calls_budgeted"] += int(result.get("budgeted_grounding_calls") or 0)
+        if status == "updated":
+            summary["updated_pages"] += 1
+            summary["updated"].append(result.get("payload") or {})
+        elif status == "failed":
+            summary["failed_pages"] += 1
+            summary["failed"].append(result.get("payload") or {})
+        else:
+            summary["unchanged_pages"] += 1
+        fatal = bool(result.get("fatal"))
+        if fatal and not summary.get("aborted_reason"):
+            summary["aborted_reason"] = "quota_exhausted"
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        return fatal
+
+    if news_workers == 1:
+        for index, record in enumerate(records, start=1):
+            if apply_result(process_record(index, record)):
+                LOGGER.error("Quota da Gemini API esgotada; interrompendo enriquecimento de notícias.")
+                break
+    else:
+        with ThreadPoolExecutor(max_workers=news_workers) as executor:
+            record_iter = iter(enumerate(records, start=1))
+            futures: dict[Any, int] = {}
+            aborting = False
+
+            def submit_next() -> bool:
+                try:
+                    index, record = next(record_iter)
+                except StopIteration:
+                    return False
+                futures[executor.submit(process_record, index, record)] = index
+                return True
+
+            for _ in range(news_workers):
+                if not submit_next():
+                    break
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    futures.pop(future, None)
+                    if future.cancelled():
+                        continue
+                    if apply_result(future.result()):
+                        aborting = True
+                if aborting:
+                    for future in list(futures):
+                        future.cancel()
+                    continue
+                while len(futures) < news_workers and submit_next():
+                    pass
+            if aborting:
+                LOGGER.error("Quota da Gemini API esgotada; interrompendo enriquecimento de notícias.")
+    LOGGER.info("Enriquecimento retroativo de notícias concluído. Resumo: %s", news_root / "summary.json")
 
 
 def _load_existing_rerun_summary(
@@ -3351,6 +3816,7 @@ def _load_existing_rerun_summary(
 
 
 def run_rerun_error_videos(args: argparse.Namespace) -> None:
+    resume = bool(getattr(args, "resume", False))
     root_dir = BACKFILL_ROOT / f"{args.year}_{extract_playlist_id(args.playlist_url)}"
     manifest_path = root_dir / "manifest.json"
     if not manifest_path.exists():
@@ -3378,7 +3844,7 @@ def run_rerun_error_videos(args: argparse.Namespace) -> None:
     notion_client: NotionSessoesClient | None = None
     notion_schema: NotionDataSourceSchema | None = None
     existing_pages_by_video: dict[str, list[ExistingPageRecord]] | None = None
-    if not args.resume or not schema_snapshot_path.exists() or not existing_snapshot_path.exists():
+    if not resume or not schema_snapshot_path.exists() or not existing_snapshot_path.exists():
         runtime = build_runtime_context()
         notion_client = NotionSessoesClient(
             api_key=runtime["notion_api_key"],
@@ -3393,10 +3859,10 @@ def run_rerun_error_videos(args: argparse.Namespace) -> None:
             args.year,
             playlist_url=args.playlist_url,
         )
-    if not args.resume or not schema_snapshot_path.exists():
+    if not resume or not schema_snapshot_path.exists():
         assert notion_schema is not None
         dump_schema_snapshot(rerun_root, notion_schema)
-    if not args.resume or not existing_snapshot_path.exists():
+    if not resume or not existing_snapshot_path.exists():
         assert existing_pages_by_video is not None
         dump_existing_pages_snapshot(rerun_root, existing_pages_by_video)
 
@@ -3406,7 +3872,7 @@ def run_rerun_error_videos(args: argparse.Namespace) -> None:
     max_attempts = 3
     for video_id, entry in error_items:
         video = find_target_video(args.playlist_url, args.year, video_id, root_dir=root_dir)
-        if args.resume:
+        if resume:
             resumed_summary = _load_existing_rerun_summary(
                 rerun_root,
                 video_id=video_id,
@@ -3937,9 +4403,15 @@ def process_video(
         artifact_store=artifact_store,
         logger=LOGGER,
     )
-    news_enricher = GeminiNewsEnricher(
+    theme_punchline_enricher = GeminiThemePunchlineEnricher(
         api_key=gemini_api_key,
         model=model,
+        artifact_store=artifact_store,
+        logger=LOGGER,
+    )
+    news_enricher = GeminiNewsEnricher(
+        api_key=gemini_api_key,
+        model=DEFAULT_NEWS_GEMINI_MODEL,
         artifact_store=artifact_store,
         logger=LOGGER,
     )
@@ -3965,6 +4437,11 @@ def process_video(
     )
     rows = dedupe_preview_rows(rows, video.url)
     rows = [validate_preview_row(row, notion_schema) for row in rows]
+    if rows:
+        rows = theme_punchline_enricher.enrich_rows(rows)
+        rows = [validate_preview_row(row, notion_schema) for row in rows]
+        rows = dedupe_preview_rows(rows, video.url)
+        rows = [validate_preview_row(row, notion_schema) for row in rows]
     if not skip_news and rows:
         rows = news_enricher.enrich_rows(rows)
         rows = [validate_preview_row(row, notion_schema) for row in rows]
@@ -4111,6 +4588,32 @@ def main() -> None:
         help="Reroda focalmente os vídeos marcados como error no manifest do ano informado.",
     )
     parser.add_argument(
+        "--enrich-existing-news",
+        action="store_true",
+        help="Enriquece apenas as colunas de notícias das páginas já existentes no Notion.",
+    )
+    parser.add_argument(
+        "--all-years",
+        action="store_true",
+        help="Com --enrich-existing-news, processa todas as páginas da base em vez de filtrar por --year.",
+    )
+    parser.add_argument(
+        "--single-news-search",
+        action="store_true",
+        help="Com --enrich-existing-news, limita o pipeline a uma chamada grounded por linha e desativa reparos por nova busca.",
+    )
+    parser.add_argument(
+        "--news-workers",
+        type=int,
+        default=1,
+        help="Número de workers paralelos para --enrich-existing-news.",
+    )
+    parser.add_argument(
+        "--news-resume-from",
+        default="",
+        help="Com --enrich-existing-news, pula páginas já concluídas em um artefato anterior de notícias.",
+    )
+    parser.add_argument(
         "--no-theme-api",
         action="store_true",
         help="No modo de reparo, evita até mesmo o reparo textual barato de tema via Gemini.",
@@ -4152,6 +4655,10 @@ def main() -> None:
 
     if args.rerun_error_videos:
         run_rerun_error_videos(args)
+        return
+
+    if args.enrich_existing_news:
+        run_enrich_existing_news(args)
         return
 
     raw_playlist_videos = load_playlist_videos(args.playlist_url)

@@ -102,34 +102,114 @@ STATE_UF = {
     "tocantins": "TO",
 }
 STATE_NAME_KEYS = set(STATE_UF.keys())
+UF_CAPITALS = {
+    "AC": "Rio Branco/AC",
+    "AL": "Maceió/AL",
+    "AP": "Macapá/AP",
+    "AM": "Manaus/AM",
+    "BA": "Salvador/BA",
+    "CE": "Fortaleza/CE",
+    "DF": "Brasília/DF",
+    "ES": "Vitória/ES",
+    "GO": "Goiânia/GO",
+    "MA": "São Luís/MA",
+    "MT": "Cuiabá/MT",
+    "MS": "Campo Grande/MS",
+    "MG": "Belo Horizonte/MG",
+    "PA": "Belém/PA",
+    "PB": "João Pessoa/PB",
+    "PR": "Curitiba/PR",
+    "PE": "Recife/PE",
+    "PI": "Teresina/PI",
+    "RJ": "Rio de Janeiro/RJ",
+    "RN": "Natal/RN",
+    "RS": "Porto Alegre/RS",
+    "RO": "Porto Velho/RO",
+    "RR": "Boa Vista/RR",
+    "SC": "Florianópolis/SC",
+    "SP": "São Paulo/SP",
+    "SE": "Aracaju/SE",
+    "TO": "Palmas/TO",
+}
+
+
+def _early_normalize_class_text(value: str) -> str:
+    if not value:
+        return ""
+    text = unicodedata.normalize("NFD", str(value).lower())
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+CAPITAL_NAME_TO_VALUE = {
+    _early_normalize_class_text(value.rsplit("/", 1)[0]): value
+    for value in UF_CAPITALS.values()
+}
 
 MINISTRO_ALIAS_MAP = {
     "antonio carlos ferreira": "Min. Antônio Carlos Ferreira",
     "alexandre de moraes": "Min. Alexandre de Moraes",
     "andre mendonca": "Min. André Mendonça",
+    "admar gonzaga": "Min. Admar Gonzaga",
+    "amar gonzaga": "Min. Admar Gonzaga",
+    "arnaldo versiani": "Min. Arnaldo Versiani",
     "maria isabel gallotti": "Min. Isabel Gallotti",
     "isabel gallotti": "Min. Isabel Gallotti",
     "benedito goncalves": "Min. Benedito Gonçalves",
     "andre ramos tavares": "Min. Ramos Tavares",
     "ramos tavares": "Min. Ramos Tavares",
+    "carlos mario da silva velloso filho": "Min. Carlos Mário da Silva Velloso Filho",
     "carlos bastide horbach": "Min. Carlos Horbach",
     "carlos horbach": "Min. Carlos Horbach",
     "carmen lucia": "Min. Cármen Lúcia",
+    "cristiano zanin": "Min. Cristiano Zanin",
     "dias toffoli": "Min. Dias Toffoli",
     "edson fachin": "Min. Edson Fachin",
     "estela aranha": "Min. Estela Aranha",
+    "flavio dino": "Min. Flávio Dino",
     "floriano de azevedo marques": "Min. Floriano de Azevedo Marques",
+    "floriano de azevedo marques neto": "Min. Floriano de Azevedo Marques",
     "floriano marques": "Min. Floriano de Azevedo Marques",
+    "gilmar mendes": "Min. Gilmar Mendes",
+    "herman benjamin": "Min. Herman Benjamin",
+    "henrique neves": "Min. Henrique Neves da Silva",
+    "henrique neves da silva": "Min. Henrique Neves da Silva",
+    "humberto jacques de medeiros": "Min. Humberto Jacques de Medeiros",
+    "humberto martins": "Min. Humberto Martins",
+    "joao otavio de noronha": "Min. João Otávio de Noronha",
+    "joelson dias": "Min. Joelson Dias",
+    "jorge mussi": "Min. Jorge Mussi",
+    "laurita vaz": "Min. Laurita Vaz",
+    "luciana lossio": "Min. Luciana Lóssio",
+    "luis edson fachin": "Min. Edson Fachin",
+    "luiz edson fachin": "Min. Edson Fachin",
     "luis felipe salomao": "Min. Luís Felipe Salomão",
     "luiz felipe salomao": "Min. Luís Felipe Salomão",
+    "luis salomao": "Min. Luís Felipe Salomão",
+    "luiz salomao": "Min. Luís Felipe Salomão",
+    "luis fux": "Min. Luiz Fux",
+    "luiz fux": "Min. Luiz Fux",
     "luis roberto barroso": "Min. Luís Roberto Barroso",
     "luiz roberto barroso": "Min. Luís Roberto Barroso",
+    "marco aurelio": "Min. Marco Aurélio",
+    "maria claudia bucchianeri pinheiro": "Min. Maria Cláudia Bucchianeri",
+    "maria thereza": "Min. Maria Thereza de Assis Moura",
+    "maria thereza de assis moura": "Min. Maria Thereza de Assis Moura",
     "mauro campbell": "Min. Mauro Campbell Marques",
     "mauro campbell marques": "Min. Mauro Campbell Marques",
+    "napoleao maia": "Min. Napoleão Nunes Maia Filho",
+    "napoleao nunes maia": "Min. Napoleão Nunes Maia Filho",
+    "napoleao nunes maia filho": "Min. Napoleão Nunes Maia Filho",
     "nunes marques": "Min. Nunes Marques",
+    "og fernandes": "Min. Og Fernandes",
+    "paulo de tarso sanseverino": "Min. Paulo de Tarso Sanseverino",
+    "paulo tarso sanseverino": "Min. Paulo de Tarso Sanseverino",
     "raul araujo": "Min. Raul Araújo",
     "raul araujo filho": "Min. Raul Araújo",
+    "reynaldo soares da fonseca": "Min. Reynaldo Soares da Fonseca",
     "ricardo lewandowski": "Min. Ricardo Lewandowski",
+    "rosa weber": "Min. Rosa Weber",
     "vera lucia": "Min. Vera Lúcia Santana Araújo",
     "vera lucia santana araujo": "Min. Vera Lúcia Santana Araújo",
     "edilene lobo": "Min. Edilene Lôbo",
@@ -140,7 +220,64 @@ MINISTRO_ALIAS_MAP = {
     "sergio silveira banhos": "Min. Sérgio Banhos",
     "sebastiao reis junior": "Min. Sebastião Reis Júnior",
     "tarcisio vieira": "Min. Tarcísio Vieira de Carvalho Neto",
+    "tarcisio vieira de carvalho": "Min. Tarcísio Vieira de Carvalho Neto",
     "tarcisio vieira de carvalho neto": "Min. Tarcísio Vieira de Carvalho Neto",
+    "teori zavascki": "Min. Teori Zavascki",
+}
+MINISTROS_STF = {
+    "Min. Alexandre de Moraes",
+    "Min. André Mendonça",
+    "Min. Cármen Lúcia",
+    "Min. Cristiano Zanin",
+    "Min. Dias Toffoli",
+    "Min. Edson Fachin",
+    "Min. Flávio Dino",
+    "Min. Gilmar Mendes",
+    "Min. Luiz Fux",
+    "Min. Luís Roberto Barroso",
+    "Min. Marco Aurélio",
+    "Min. Nunes Marques",
+    "Min. Ricardo Lewandowski",
+    "Min. Rosa Weber",
+    "Min. Teori Zavascki",
+}
+MINISTROS_STJ = {
+    "Min. Antônio Carlos Ferreira",
+    "Min. Benedito Gonçalves",
+    "Min. Herman Benjamin",
+    "Min. Humberto Martins",
+    "Min. Isabel Gallotti",
+    "Min. João Otávio de Noronha",
+    "Min. Jorge Mussi",
+    "Min. Laurita Vaz",
+    "Min. Luís Felipe Salomão",
+    "Min. Maria Thereza de Assis Moura",
+    "Min. Mauro Campbell Marques",
+    "Min. Napoleão Nunes Maia Filho",
+    "Min. Og Fernandes",
+    "Min. Paulo de Tarso Sanseverino",
+    "Min. Raul Araújo",
+    "Min. Reynaldo Soares da Fonseca",
+    "Min. Ricardo Villas Bôas Cueva",
+    "Min. Sebastião Reis Júnior",
+}
+MINISTROS_JURISTAS = {
+    "Min. Admar Gonzaga",
+    "Min. Arnaldo Versiani",
+    "Min. Carlos Horbach",
+    "Min. Carlos Mário da Silva Velloso Filho",
+    "Min. Edilene Lôbo",
+    "Min. Estela Aranha",
+    "Min. Floriano de Azevedo Marques",
+    "Min. Henrique Neves da Silva",
+    "Min. Humberto Jacques de Medeiros",
+    "Min. Joelson Dias",
+    "Min. Luciana Lóssio",
+    "Min. Maria Cláudia Bucchianeri",
+    "Min. Ramos Tavares",
+    "Min. Sérgio Banhos",
+    "Min. Tarcísio Vieira de Carvalho Neto",
+    "Min. Vera Lúcia Santana Araújo",
 }
 MINISTRO_INVALID_NAME_TERMS = {
     "acompanhado",
@@ -285,6 +422,8 @@ PARTY_PROCESSUAL_ROLE_MAP = {
     "requeridas": "Requerida",
     "consulente": "Consulente",
     "consulentes": "Consulente",
+    "paciente": "Paciente",
+    "pacientes": "Paciente",
     "reu": "Réu",
     "réu": "Réu",
     "reus": "Réu",
@@ -503,6 +642,24 @@ PARTY_SPLIT_ORGANIZATION_REGEX = re.compile(
 )
 PARTY_NAME_CONNECTORS = {"e", "de", "da", "do", "das", "dos"}
 TRAILING_PAREN_GROUP_REGEX = re.compile(r"\s*\(([^()]*)\)\s*$")
+PARTY_DESCRIPTIVE_PARENTHETICAL_TERMS = {
+    "candidato",
+    "candidata",
+    "eleito",
+    "eleita",
+    "prefeito",
+    "prefeita",
+    "vice prefeito",
+    "vice prefeita",
+    "governador",
+    "governadora",
+    "senador",
+    "senadora",
+    "vereador",
+    "vereadora",
+    "deputado",
+    "deputada",
+}
 
 
 def _split_top_level_text(text: str, *, delimiters: str = "", split_conjunction: bool = False) -> list[str]:
@@ -553,6 +710,63 @@ def _rebuild_with_parenthetical_groups(base: str, groups: list[str]) -> str:
         if group:
             result = f"{result} ({group})" if result else f"({group})"
     return result.strip()
+
+
+def _is_party_entity_parenthetical_group(value: str) -> bool:
+    label = str(value or "").strip()
+    if not label:
+        return False
+    normalized = normalize_token(label)
+    if normalized in PARTY_PROCESSUAL_ROLE_MAP:
+        return False
+    if any(term in normalized for term in PARTY_DESCRIPTIVE_PARENTHETICAL_TERMS):
+        return False
+    if re.fullmatch(r"[A-Z0-9][A-Z0-9./&+ -]{1,40}", label):
+        return True
+    return bool(re.search(r"\b[A-Z]{2,}\b$", label))
+
+
+def canonicalize_party_option_label(value: str) -> str:
+    cleaned = normalize_mpe_reference(value or "")
+    cleaned = normalize_text(cleaned).strip().strip(" .;,:-")
+    if not cleaned or cleaned == "MPE" or is_mpe_noise_entry(cleaned) or PARTY_PLACEHOLDER_REGEX.match(cleaned):
+        return ""
+    cleaned = re.sub(r"(?i)^\s*part[ea]\s*[:\-]\s*", "", cleaned).strip()
+    prefix_match = PARTY_PROCESSUAL_ROLE_REGEX.match(cleaned)
+    if prefix_match:
+        cleaned = prefix_match.group("name").strip()
+    cleaned = re.sub(r"(?i)^\s*coliga(?:ção|cao)\s*[:\-]\s*", "Coligação ", cleaned).strip()
+    cleaned = re.sub(r"(?i)\b(coliga(?:ção|cao)\s+)['‘’]([^'‘’]+)['‘’]", r"\1\2", cleaned)
+    cleaned = re.sub(r"[\"“”]", "", cleaned)
+    if cleaned.count("(") < cleaned.count(")"):
+        cleaned = re.sub(r"\s*-\s*([A-Z0-9]{2,}(?:/[A-Z0-9]{2,})*)\)$", r" (\1)", cleaned)
+    base, groups = _strip_trailing_parenthetical_groups(cleaned)
+    kept_groups: list[str] = []
+    for group in groups:
+        normalized_group = normalize_token(group)
+        if normalized_group in PARTY_PROCESSUAL_ROLE_MAP:
+            continue
+        if any(term in normalized_group for term in PARTY_DESCRIPTIVE_PARENTHETICAL_TERMS):
+            continue
+        if _is_party_entity_parenthetical_group(group):
+            kept_groups.append(group)
+            continue
+        kept_groups.append(group)
+    cleaned = _rebuild_with_parenthetical_groups(base, kept_groups)
+    if cleaned.count("(") < cleaned.count(")"):
+        cleaned = re.sub(r"\s*-\s*([A-Z0-9]{2,}(?:/[A-Z0-9]{2,})*)\)$", r" (\1)", cleaned)
+    if cleaned.count("(") > cleaned.count(")"):
+        tail = cleaned.rsplit("(", 1)[-1].strip()
+        if re.fullmatch(r"[A-Z0-9./&+ -]{2,40}", tail) or re.search(r"\b[A-Z0-9]{2,}$", tail):
+            cleaned = f"{cleaned})"
+    cleaned = re.sub(r"(?i)\s+e\s+demais$", "", cleaned).strip()
+    cleaned = re.sub(r"(?i)\s+e\s+outr[oa]s?$", "", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;,:-")
+    if not cleaned or cleaned == "MPE" or is_mpe_noise_entry(cleaned) or PARTY_PLACEHOLDER_REGEX.match(cleaned):
+        return ""
+    if looks_like_advogado_party_entry(cleaned):
+        return ""
+    return cleaned
 
 
 def _looks_like_person_name_segment(value: str) -> bool:
@@ -1120,7 +1334,13 @@ def normalize_origem_value(value: str) -> str:
     if "tribunais regionais eleitorais" in normalized_key:
         return ""
     if normalized_key in {"tribunal superior eleitoral", "tse"}:
-        return "TSE"
+        return UF_CAPITALS["DF"]
+    if re.fullmatch(r"[A-Za-z]{2}", value) and value.upper() in UF_CAPITALS:
+        return UF_CAPITALS[value.upper()]
+    if normalized_key in STATE_NAME_KEYS:
+        return UF_CAPITALS.get(STATE_UF[normalized_key], "")
+    if normalized_key in CAPITAL_NAME_TO_VALUE:
+        return CAPITAL_NAME_TO_VALUE[normalized_key]
     zona_match = re.search(r"(?i)(?:\d+\S*\s+)?zona eleitoral de?\s+([^/]+)/([a-z]{2})", value)
     if zona_match:
         city = zona_match.group(1).strip(" ,.;:-")
@@ -1134,6 +1354,8 @@ def normalize_origem_value(value: str) -> str:
         r"(?i)^tribunal de justi[cç]a do estado d[eo]\s+(.+)$",
         r"(?i)^ju[ií]zo eleitoral d[eo]\s+(.+)$",
         r"(?i)^zona eleitoral d[ea]?\s+(.+)$",
+        r"(?i)^prefeitura(?:\s+municipal)?\s+de\s+(.+)$",
+        r"(?i)^prefeito(?:\s+e\s+vice-prefeito)?\s+de\s+(.+)$",
     ]
     for pattern in prefixed_patterns:
         match = re.match(pattern, value)
@@ -1148,30 +1370,28 @@ def normalize_origem_value(value: str) -> str:
         break
     tse_uf_match = re.match(r"(?i)^tse[-/\s]?([a-z]{2})$", value)
     if tse_uf_match:
-        return f"TRE/{tse_uf_match.group(1).upper()}"
+        return UF_CAPITALS.get(tse_uf_match.group(1).upper(), "")
     tre_context_match = re.match(
         r"(?i)^(?:titular|suplente|ju[ií]z(?:a)?|decisoes?|decisões|jurisprudencia|jurisprudência)\s+d[oa]\s+tre[-/\s]?([a-z]{2})$",
         value,
     )
     if tre_context_match:
-        return f"TRE/{tre_context_match.group(1).upper()}"
+        return UF_CAPITALS.get(tre_context_match.group(1).upper(), "")
     tit_tre_match = re.search(r"(?i)\btre[-/\s]?([a-z]{2})\b", value)
     if tit_tre_match and any(marker in normalized_key for marker in {"titular do tre", "suplente do tre", "juiz do tre"}):
-        return f"TRE/{tit_tre_match.group(1).upper()}"
-    if normalized_key in STATE_NAME_KEYS:
-        return ""
+        return UF_CAPITALS.get(tit_tre_match.group(1).upper(), "")
     eleitoral_match = re.match(r"(?i)^eleitoral\s+de\s+(.+)$", value)
     if eleitoral_match:
         value = eleitoral_match.group(1).strip()
         normalized_key = normalize_class_text(value)
         if normalized_key in STATE_NAME_KEYS:
-            return ""
+            return UF_CAPITALS.get(STATE_UF[normalized_key], "")
     if re.search(r"(?i)^tribunal regional eleitoral d(?:e|o|a)\s+", value):
         uf = extract_uf_from_text(value)
-        return f"TRE/{uf}" if uf else ""
+        return UF_CAPITALS.get(uf, "") if uf else ""
     tre_match = re.match(r"(?i)^tre[-/\s]?([a-z]{2})$", value)
     if tre_match:
-        return f"TRE/{tre_match.group(1).upper()}"
+        return UF_CAPITALS.get(tre_match.group(1).upper(), "")
     if re.match(r"^.+\([^)]+\)\s*$", value):
         uf = extract_uf_from_text(value)
         city = re.sub(r"\s*\([^)]+\)\s*$", "", value).strip()
@@ -1207,7 +1427,8 @@ def normalize_origem_value(value: str) -> str:
             "zona eleitoral",
         ]
     ):
-        return ""
+        uf = extract_uf_from_text(value)
+        return UF_CAPITALS.get(uf, "") if uf else ""
     return value
 
 
@@ -1329,6 +1550,67 @@ def normalize_composicao(value: str) -> str:
             seen.add(name)
             normalized.append(name)
     return ", ".join(normalized)
+
+
+def normalize_ministro_list(values: Iterable[str] | str) -> list[str]:
+    if isinstance(values, str):
+        raw_values = [part.strip() for part in values.replace(";", ",").split(",") if part.strip()]
+    else:
+        raw_values = [str(value or "").strip() for value in values if str(value or "").strip()]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        if is_mpe_noise_entry(value):
+            continue
+        name = normalize_ministro_name(value)
+        if name and name not in seen:
+            seen.add(name)
+            normalized.append(name)
+    return normalized
+
+
+def ministro_institutional_group(name: str) -> str:
+    normalized = normalize_ministro_name(name)
+    if normalized in MINISTROS_STF:
+        return "STF"
+    if normalized in MINISTROS_STJ:
+        return "STJ"
+    if normalized in MINISTROS_JURISTAS:
+        return "JURISTA"
+    return ""
+
+
+def composicao_institution_counts(values: Iterable[str] | str) -> dict[str, int]:
+    counts = {"STF": 0, "STJ": 0, "JURISTA": 0, "DESCONHECIDO": 0}
+    for name in normalize_ministro_list(values):
+        group = ministro_institutional_group(name) or "DESCONHECIDO"
+        counts[group] += 1
+    return counts
+
+
+def composicao_regimental_issue(values: Iterable[str] | str) -> str:
+    normalized = normalize_ministro_list(values)
+    count = len(normalized)
+    if count > 7:
+        return "gt7"
+    if count < 6:
+        return "lt6"
+    counts = composicao_institution_counts(normalized)
+    if counts["STF"] > 3 or counts["STJ"] > 2 or counts["JURISTA"] > 2:
+        return "category_excess"
+    if count == 7 and counts["DESCONHECIDO"]:
+        return "unknown_institution"
+    if count == 7 and (counts["STF"], counts["STJ"], counts["JURISTA"]) != (3, 2, 2):
+        return "distribution"
+    return ""
+
+
+def is_regimentally_valid_composicao(values: Iterable[str] | str) -> bool:
+    normalized = normalize_ministro_list(values)
+    if len(normalized) != 7:
+        return False
+    counts = composicao_institution_counts(normalized)
+    return (counts["STF"], counts["STJ"], counts["JURISTA"], counts["DESCONHECIDO"]) == (3, 2, 2, 0)
 
 
 def normalize_classe_processo(value: str) -> str:
@@ -1475,6 +1757,8 @@ def normalize_resultado_final(value: str, classe_processo: str = "") -> str:
     canonical_direct = data["result_norm_map"].get(normalized)
     if canonical_direct and (not allowed or canonical_direct in allowed):
         return canonical_direct
+    if "suspens" in normalized and ("julgado depois" in normalized or "julgada depois" in normalized or "julgamento posterior" in normalized):
+        return "Suspenso mas julgado depois"
     if "suspens" in normalized and "vista" in normalized:
         return "Suspenso por vista"
     if re.search(r"\bprovido\b", normalized) and "nao conhec" in normalized and "desprov" not in normalized:
@@ -1497,9 +1781,12 @@ def normalize_resultado_final(value: str, classe_processo: str = "") -> str:
 
 
 def normalize_votacao(value: str) -> str:
+    raw_text = str(value or "")
     lowered = normalize_class_text(value)
     if not lowered:
         return ""
+    if "suspens" in lowered and "*" in raw_text:
+        return "Suspenso*"
     if lowered in {"nao especificada", "em curso"}:
         return ""
     if "unanim" in lowered or "unanime" in lowered:

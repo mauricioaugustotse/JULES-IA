@@ -504,6 +504,68 @@ def test_audit_existing_year_flags_origin_class_votacao_and_link_anomalies():
     assert summary["stats"]["youtube_video_mismatch"] == 1
 
 
+def test_audit_existing_year_flags_adi_ado_as_invalid_tse_classes():
+    grouped = {
+        "video-1": [
+            backfill.ExistingPageRecord(
+                page_id="page-adi",
+                url="https://www.notion.so/page-adi",
+                video_id="video-1",
+                row=PublishPreviewRow(
+                    tema="Tema útil",
+                    numero_processo="ADI 7228",
+                    classe_processo="ADI",
+                    data_sessao="2024-05-01",
+                ),
+            )
+        ]
+    }
+
+    summary = backfill.audit_existing_year(grouped)
+
+    assert summary["stats"]["classe_invalid_stf"] == 1
+    assert summary["offenders"]["classe_invalid_stf"][0]["page_id"] == "page-adi"
+
+
+def test_build_suspended_later_resolution_targets_marks_prior_suspension():
+    grouped = {
+        "video-old": [
+            backfill.ExistingPageRecord(
+                page_id="page-old",
+                url="https://www.notion.so/page-old",
+                video_id="video-old",
+                row=PublishPreviewRow(
+                    tema="Tema útil",
+                    numero_processo="0600001-01.2024.6.00.0000",
+                    resultado="Suspenso por vista",
+                    votacao="Suspenso",
+                    data_sessao="2024-05-01",
+                ),
+            )
+        ],
+        "video-new": [
+            backfill.ExistingPageRecord(
+                page_id="page-new",
+                url="https://www.notion.so/page-new",
+                video_id="video-new",
+                row=PublishPreviewRow(
+                    tema="Tema útil",
+                    numero_processo="0600001-01.2024.6.00.0000",
+                    resultado="Desprovido",
+                    votacao="Unânime",
+                    data_sessao="2024-05-08",
+                ),
+            )
+        ],
+    }
+
+    targets = backfill.build_suspended_later_resolution_targets(grouped)
+
+    assert targets["page-old"]["resultado"] == "Suspenso mas julgado depois"
+    assert targets["page-old"]["votacao"] == "Suspenso*"
+    assert targets["page-old"]["later_page_id"] == "page-new"
+
+
 def test_audit_existing_year_flags_composition_lt6_and_gt7():
     lt6_composition = [
         "Min. Alexandre de Moraes",
@@ -807,7 +869,7 @@ def test_repair_existing_video_rows_reorders_and_sanitizes(monkeypatch, tmp_path
     assert by_page["page-1"].tipo_registro == "Julgamento 2"
     assert by_page["page-1"].tema == "Fraude à cota de gênero"
     assert by_page["page-2"].tema == "Conduta vedada por uso de bem público"
-    assert by_page["page-1"].partes == ["Alice (Recorrente)"]
+    assert by_page["page-1"].partes == ["Alice"]
     assert by_page["page-1"].raciocinio_juridico == "Fundamento 1."
     assert by_page["page-1"].fundamentacao_normativa == "Art. 10, § 3º."
     assert len(by_page["page-2"].composicao) == 7
@@ -1258,6 +1320,20 @@ def test_repair_existing_video_rows_composition_focus_uses_valid_artifact_same_d
     assert notion.updated[0][1].composicao == valid_seven
 
 
+def test_composition_size_issue_flags_regimental_category_excess():
+    contaminated = [
+        "Min. Rosa Weber",
+        "Min. Luís Roberto Barroso",
+        "Min. Jorge Mussi",
+        "Min. Og Fernandes",
+        "Min. Tarcísio Vieira de Carvalho Neto",
+        "Min. Sérgio Banhos",
+        "Min. Admar Gonzaga",
+    ]
+
+    assert backfill._composition_size_issue(contaminated) == "category_excess"
+
+
 def test_repair_existing_video_rows_composition_focus_uses_nearest_valid_session_date(monkeypatch, tmp_path):
     monkeypatch.setattr(backfill, "BACKFILL_ROOT", tmp_path / "artifacts")
     playlist_url = "https://www.youtube.com/playlist?list=PLtest"
@@ -1509,7 +1585,7 @@ def test_repair_existing_video_rows_uses_artifact_fields_for_missing_metadata(mo
                 "tema": {"type": "title", "title": {}},
                 "classe_processo": {"type": "select", "select": {"options": [{"name": "AgRg-REspe"}]}},
                 "tipo_registro": {"type": "select", "select": {"options": [{"name": "Julgamento 1"}]}},
-                "origem": {"type": "select", "select": {"options": [{"name": "TRE/SE"}]}},
+                "origem": {"type": "select", "select": {"options": [{"name": "Aracaju/SE"}]}},
                 "tribunal": {"type": "select", "select": {"options": [{"name": "TRE-SE"}]}},
                 "numero_processo": {"type": "rich_text", "rich_text": {}},
                 "youtube_link": {"type": "url", "url": {}},
@@ -1561,7 +1637,7 @@ def test_repair_existing_video_rows_uses_artifact_fields_for_missing_metadata(mo
     assert summary["updated_pages"] == 1
     repaired = notion.updated[0][1]
     assert repaired.classe_processo == "AgRg-REspe"
-    assert repaired.origem == "TRE/SE"
+    assert repaired.origem == "Aracaju/SE"
     assert repaired.relator == "Min. Alexandre de Moraes"
     assert repaired.votacao == "Unânime"
 
@@ -1689,7 +1765,7 @@ def test_repair_existing_video_rows_promotes_special_process_number_from_artifac
                 "tema": {"type": "title", "title": {}},
                 "classe_processo": {"type": "select", "select": {"options": [{"name": "ADI"}]}},
                 "tipo_registro": {"type": "select", "select": {"options": [{"name": "Julgamento 1"}]}},
-                "origem": {"type": "select", "select": {"options": [{"name": "TSE"}]}},
+                "origem": {"type": "select", "select": {"options": [{"name": "Brasília/DF"}]}},
                 "numero_processo": {"type": "rich_text", "rich_text": {}},
                 "youtube_link": {"type": "url", "url": {}},
                 "data_sessao": {"type": "date", "date": {}},
@@ -1739,7 +1815,8 @@ def test_repair_existing_video_rows_promotes_special_process_number_from_artifac
     assert summary["updated_pages"] == 1
     repaired = notion.updated[0][1]
     assert repaired.numero_processo == "ADI 7228"
-    assert repaired.origem == "TSE"
+    assert repaired.classe_processo == ""
+    assert repaired.origem == "Brasília/DF"
 
 
 def test_repair_existing_video_rows_overrides_wrong_item_date_with_session_date(monkeypatch, tmp_path):
@@ -2468,8 +2545,8 @@ def test_numero_processo_needs_repair_accepts_blank_pa_and_special_stf_classes()
     assert backfill._numero_processo_needs_repair(PublishPreviewRow(numero_processo="7228", classe_processo="ADI")) is True
 
 
-def test_safe_normalize_origem_for_repair_preserves_tse_without_appending_uf():
-    assert backfill._safe_normalize_origem_for_repair("TSE", "TRE-RS") == "TSE"
+def test_safe_normalize_origem_for_repair_converts_tse_to_brasilia():
+    assert backfill._safe_normalize_origem_for_repair("TSE", "TRE-RS") == "Brasília/DF"
 
 
 def test_video_has_incomplete_composition():

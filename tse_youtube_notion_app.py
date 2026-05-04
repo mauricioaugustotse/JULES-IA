@@ -10,6 +10,7 @@ import streamlit as st
 
 from tse_youtube_notion_core import (
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_NEWS_GEMINI_MODEL,
     DEFAULT_NOTION_DATABASE_URL,
     GeminiSessionExtractor,
     NotionSessoesClient,
@@ -17,6 +18,7 @@ from tse_youtube_notion_core import (
     build_preview_rows,
     build_runtime_context,
     enrich_preview_rows_with_process_metadata,
+    enrich_preview_rows_with_theme_punchline,
     enrich_preview_rows_with_news,
     publish_preview_rows,
     rows_from_editor_records,
@@ -81,6 +83,14 @@ def analyze_video(youtube_url: str, model_name: str) -> None:
         logger=LOGGER,
         notion_schema=notion_schema,
     )
+    rows = enrich_preview_rows_with_theme_punchline(
+        rows,
+        api_key=gemini_key,
+        model=model_name,
+        artifact_store=artifact_store,
+        logger=LOGGER,
+        notion_schema=notion_schema,
+    )
 
     artifact_store.write_json("03_analysis.json", analysis.model_dump(mode="json"))
     artifact_store.write_json(
@@ -128,7 +138,7 @@ def enrich_current_rows_with_news() -> None:
     enriched_rows = enrich_preview_rows_with_news(
         rows,
         api_key=gemini_key,
-        model=DEFAULT_GEMINI_MODEL,
+        model=DEFAULT_NEWS_GEMINI_MODEL,
         artifact_store=artifact_store,
         logger=LOGGER,
     )
