@@ -23,6 +23,7 @@ from tse_youtube_notion_core import (
     StartRefinementResult,
     TranscriptChunk,
     TranscriptSnippet,
+    ThemePunchlineRepairBatchResult,
     build_preview_rows,
     build_fallback_tema,
     build_editorial_punchline_fallback,
@@ -2514,6 +2515,64 @@ def test_news_response_accepts_plain_url_list():
     )
 
     assert parsed.noticia_geral == ["https://www.poder360.com.br/noticia"]
+
+
+def test_optional_enrichment_response_accepts_empty_text():
+    assert core._coerce_gemini_response_model(NewsEnrichmentResult, "").noticia_geral == []
+    assert core._coerce_gemini_response_model(InstitutionalRepairResult, "").urls == []
+    assert core._coerce_gemini_response_model(ThemePunchlineRepairBatchResult, "").items == []
+
+
+def test_institutional_repair_response_accepts_plain_url_list():
+    parsed = core._coerce_gemini_response_model(
+        InstitutionalRepairResult,
+        json.dumps(["https://www.tre-mt.jus.br/noticia"]),
+    )
+
+    assert parsed.urls == ["https://www.tre-mt.jus.br/noticia"]
+
+
+def test_theme_punchline_batch_response_accepts_plain_item_list():
+    parsed = core._coerce_gemini_response_model(
+        ThemePunchlineRepairBatchResult,
+        json.dumps(
+            [
+                {
+                    "key": "row_001",
+                    "tema": "Conduta vedada",
+                    "punchline": "O tribunal manteve a sanção por uso indevido de bens públicos.",
+                    "confidence": "medium",
+                }
+            ],
+            ensure_ascii=False,
+        ),
+    )
+
+    assert len(parsed.items) == 1
+    assert parsed.items[0].key == "row_001"
+    assert parsed.items[0].tema == "Conduta vedada"
+
+
+def test_news_enricher_keeps_row_when_grounding_fails(tmp_path, monkeypatch):
+    row = PublishPreviewRow(
+        tema="Conduta vedada por uso de bens públicos",
+        numero_processo="0600249-07",
+    )
+    enricher = object.__new__(GeminiNewsEnricher)
+    enricher.artifact_store = RunArtifacts(tmp_path)
+    enricher.model = "gemini-3.1-flash-lite"
+
+    def fake_call_grounded_json(*, prompt, response_model, artifact_name):
+        raise RuntimeError("empty grounded response")
+
+    monkeypatch.setattr(enricher, "_call_grounded_json", fake_call_grounded_json)
+
+    enriched = enricher.enrich_rows([row])
+
+    assert len(enriched) == 1
+    assert enriched[0].tema == row.tema
+    assert any("Enriquecimento de notícias falhou" in warning for warning in enriched[0].warnings)
+    assert (tmp_path / "06_news_enrichment_01.json").exists()
 
 
 def test_news_enricher_ignores_stale_cached_artifact(tmp_path, monkeypatch):

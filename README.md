@@ -34,6 +34,24 @@ No Windows com o `.venv` do projeto:
 .venv\Scripts\streamlit.exe run tse_youtube_notion_app.py
 ```
 
+## Executar lote GUI de ate 10 links
+
+No Windows, use o atalho criado na area de trabalho ou rode:
+
+```bash
+TSE_YOUTUBE_NOTION_BATCH.cmd
+```
+
+A janela recebe ate 10 links do YouTube, processa cada video ate a etapa pos-noticias e publica direto no data source configurado do Notion.
+
+Se uma execução for interrompida, use `Retomar artifacts` na própria janela e selecione a pasta do lote em `artifacts/tse_youtube_notion/batch_gui`.
+
+Para recriar o atalho:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\CRIAR_ATALHO_TSE_YOUTUBE_NOTION_BATCH.ps1
+```
+
 ## O que a app faz
 
 1. Recebe a URL pública de uma sessão do TSE no YouTube.

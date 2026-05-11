@@ -58,7 +58,7 @@ from tse_normalization import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ARTIFACT_ROOT = SCRIPT_DIR / "artifacts" / "tse_youtube_notion"
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_NEWS_GEMINI_MODEL = os.getenv("GEMINI_NEWS_MODEL") or DEFAULT_GEMINI_MODEL
 GEMINI_REST_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_NOTION_VERSION = os.getenv("NOTION_VERSION") or "2025-09-03"
@@ -67,11 +67,11 @@ DEFAULT_NOTION_DATA_SOURCE_ID = (
 )
 DEFAULT_NOTION_DATABASE_URL = (
     os.getenv("NOTION_DATABASE_URL")
-    or "https://www.notion.so/2eb721955c64809796bec75a81f9555f?v=6c1e9572d78647038c5dec9e68f688fc"
+    or "https://www.notion.so/2eb721955c64809796bec75a81f9555f?v=ffe93c7f3ae4415699545f93f566d152"
 )
 GEMINI_CALL_RETRIES = 3
 GEMINI_RETRY_BASE_DELAY = 2.0
-DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS = int(os.getenv("GEMINI_HTTP_TIMEOUT_SECONDS") or "90")
+DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS = int(os.getenv("GEMINI_HTTP_TIMEOUT_SECONDS") or "240")
 GENERIC_THEME_CLASS_RESULT_REGEX = re.compile(
     r"^(?:"
     r"(?:ed\s+)?(?:agrg\s+)?(?:arespe|respe)"
@@ -3119,12 +3119,19 @@ def _normalize_news_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _coerce_gemini_response_model(response_model: type[BaseModel], response_text: str) -> BaseModel:
+    model_name = response_model.__name__
+    if not normalize_model_text(response_text):
+        if model_name in {
+            "NewsEnrichmentResult",
+            "InstitutionalRepairResult",
+            "ThemePunchlineRepairBatchResult",
+        }:
+            return response_model.model_validate({})
     try:
         payload = json.loads(response_text)
     except Exception:
         return response_model.model_validate_json(response_text)
 
-    model_name = response_model.__name__
     if isinstance(payload, list):
         if model_name == "SessionExtraction" and all(isinstance(item, dict) for item in payload):
             merged_payload = {"data_sessao": "", "composicao": [], "judgments": []}
@@ -3147,6 +3154,10 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
                 "noticia_TRE": [],
                 "noticia_geral": [str(item) for item in payload if isinstance(item, str)],
             }
+        elif model_name == "InstitutionalRepairResult":
+            payload = {"urls": [str(item) for item in payload if isinstance(item, str)]}
+        elif model_name == "ThemePunchlineRepairBatchResult" and all(isinstance(item, dict) for item in payload):
+            payload = {"items": payload}
         elif len(payload) == 1 and isinstance(payload[0], dict):
             payload = payload[0]
 
@@ -3161,6 +3172,17 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
             payload = _normalize_process_metadata_payload(payload)
         elif model_name == "NewsEnrichmentResult":
             payload = _normalize_news_payload(payload)
+        elif model_name == "InstitutionalRepairResult":
+            urls = payload.get("urls", payload.get("url", []))
+            if isinstance(urls, str):
+                payload["urls"] = split_csv_like_text(urls)
+            else:
+                payload["urls"] = [str(item) for item in list(urls or []) if str(item).strip()]
+        elif model_name == "ThemePunchlineRepairBatchResult":
+            items = payload.get("items", payload.get("results", payload.get("repairs", [])))
+            if isinstance(items, dict):
+                items = [items]
+            payload["items"] = list(items or [])
 
     return response_model.model_validate(payload)
 
@@ -4329,7 +4351,7 @@ class GeminiNewsEnricher:
             cache_filename = f"06_news_enrichment_{index:02d}.json"
             if self.artifact_store.exists(cache_filename):
                 cached_payload = self.artifact_store.read_json(cache_filename)
-                if cached_payload.get("context") == context:
+                if cached_payload.get("context") == context and not cached_payload.get("error"):
                     candidate = row.model_copy(deep=True)
                     applied = cached_payload.get("applied") or {}
                     candidate.noticia_TSE = str(applied.get("noticia_TSE", "") or "")
@@ -4353,11 +4375,30 @@ class GeminiNewsEnricher:
                 "Retorne apenas URLs realmente relacionadas ao mesmo caso.\n\n"
                 f"Contexto:\n{context}"
             )
-            response, grounding_urls = self._call_grounded_json(
-                prompt=prompt,
-                response_model=NewsEnrichmentResult,
-                artifact_name=f"06_news_enrichment_{index:02d}.txt",
-            )
+            try:
+                response, grounding_urls = self._call_grounded_json(
+                    prompt=prompt,
+                    response_model=NewsEnrichmentResult,
+                    artifact_name=f"06_news_enrichment_{index:02d}.txt",
+                )
+            except Exception as exc:
+                candidate = row.model_copy(deep=True)
+                candidate.add_warning("Enriquecimento de notícias falhou; mantendo linha sem novas notícias.")
+                enriched_rows.append(candidate)
+                self.artifact_store.write_json(
+                    f"06_news_enrichment_{index:02d}.json",
+                    {
+                        "context": context,
+                        "error": str(exc),
+                        "applied": {
+                            "noticia_TSE": candidate.noticia_TSE,
+                            "noticia_TRE": candidate.noticia_TRE,
+                            "noticias_gerais": candidate.noticias_gerais,
+                        },
+                        "model": getattr(self, "model", DEFAULT_NEWS_GEMINI_MODEL),
+                    },
+                )
+                continue
             tse_urls, tre_urls, general_urls = classify_news_urls(
                 response.noticia_TSE + response.noticia_TRE + response.noticia_geral + grounding_urls
             )
