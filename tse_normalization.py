@@ -20,7 +20,7 @@ CANON_CSV_FILENAME = "padrões para canonizar.csv"
 CANON_DATA: Optional[dict[str, Any]] = None
 
 CLASSE_PROCESSO_MAP = [
-    (r"\bembargos de declaracao\b.*\b(agravo regimental|agravo interno|agrg)\b.*\b(agravo em recurso especial eleitoral|arespe)\b", "ED-AgRg-AREspe"),
+    (r"\bembargos de declaracao\b.*\b(agravo regimental|agravo interno|agrg|agr)\b.*\b(agravo em recurso especial eleitoral|arespe)\b", "ED-AgRg-AREspe"),
     (r"\bed\s+agrg\s+arespe\b", "ED-AgRg-AREspe"),
     (r"\bembargos de declaracao\b.*\b(agravo em recurso especial eleitoral|arespe)\b", "ED-AREspe"),
     (r"\bembargos de declaracao\b.*\b(recurso especial eleitoral|respe)\b", "ED-REspe"),
@@ -28,11 +28,11 @@ CLASSE_PROCESSO_MAP = [
     (r"\bembargos de declaracao\b.*\b(prestacao de contas|pc)\b", "ED-PC"),
     (r"\bembargos de declaracao\b.*\b(lista triplice|lt)\b", "ED-Lista Tríplice"),
     (r"\bed\s+lt\b", "ED-Lista Tríplice"),
-    (r"\b(agravo regimental|agravo interno|agrg)\b.*\b(recurso especial eleitoral|respe)\b", "AgRg-REspe"),
-    (r"\b(agravo regimental|agravo interno|agrg)\b.*\b(agravo em recurso especial eleitoral|arespe)\b", "AgRg-AREspe"),
-    (r"\b(agravo regimental|agravo interno|agrg)\b.*\b(recurso ordinario|ro)\b", "AgRg-RO"),
-    (r"\b(agravo regimental|agravo interno|agrg)\b.*\b(mandado de seguranca|ms)\b", "AgRg-MS"),
-    (r"\b(agravo regimental|agravo interno|agrg)\b.*\b(prestacao de contas|pc)\b", "AgRg-PC"),
+    (r"\b(agravo regimental|agravo interno|agrg|agr)\b.*\b(recurso especial eleitoral|respe)\b", "AgRg-REspe"),
+    (r"\b(agravo regimental|agravo interno|agrg|agr)\b.*\b(agravo em recurso especial eleitoral|arespe)\b", "AgRg-AREspe"),
+    (r"\b(agravo regimental|agravo interno|agrg|agr)\b.*\b(recurso ordinario|ro)\b", "AgRg-RO"),
+    (r"\b(agravo regimental|agravo interno|agrg|agr)\b.*\b(mandado de seguranca|ms)\b", "AgRg-MS"),
+    (r"\b(agravo regimental|agravo interno|agrg|agr)\b.*\b(prestacao de contas|pc)\b", "AgRg-PC"),
     (r"\breferend\w*\b.*\b(tutela cautelar antecedente|tutcautant)\b", "Ref-TutCautAnt"),
     (r"\bref\s*tutcautant\b", "Ref-TutCautAnt"),
     (r"\breferend\w*\b.*\b(mandado de seguranca|ms)\b", "Ref.-MS"),
@@ -151,6 +151,9 @@ MINISTRO_ALIAS_MAP = {
     "antonio carlos ferreira": "Min. Antônio Carlos Ferreira",
     "alexandre de moraes": "Min. Alexandre de Moraes",
     "andre mendonca": "Min. André Mendonça",
+    "andre luiz mendonca": "Min. André Mendonça",
+    "stella aranha": "Min. Estela Aranha",
+    "antonio carlos": "Min. Antônio Carlos Ferreira",
     "admar gonzaga": "Min. Admar Gonzaga",
     "amar gonzaga": "Min. Admar Gonzaga",
     "arnaldo versiani": "Min. Arnaldo Versiani",
@@ -610,6 +613,56 @@ def _normalize_party_role_label(value: str) -> str:
     return PARTY_PROCESSUAL_ROLE_MAP.get(normalized, value.strip())
 
 
+_ROLE_ONLY_TOKENS = {
+    "candidato", "candidata", "candidatos", "candidatas", "deputado", "deputada",
+    "federal", "estadual", "distrital", "vereador", "vereadora", "prefeito", "prefeita",
+    "vice", "governador", "governadora", "senador", "senadora", "suplente", "presidente",
+    "conselheiro", "conselheira", "do", "da", "de", "e", "cargo", "ao", "a", "o", "os", "as",
+}
+
+
+def is_descriptive_role_noise(value: str) -> bool:
+    """True quando o valor é uma FRASE DESCRITIVA de cargo/candidatura, não um nome
+    de pessoa (ex.: 'Candidato ao cargo de Deputado Estadual de Roraima nas eleições
+    2018', 'Deputado Federal e Vereador'). Não considera ruído entidades como
+    'Município de ...' ou nomes próprios com sufixo de papel."""
+    norm = normalize_class_text(value)
+    if not norm:
+        return False
+    if re.search(r"\b(ao cargo de|nas eleicoes|na eleicao de)\b", norm):
+        return True
+    if re.match(r"^candidat[oa]s?\s+a[o]?\s+(cargo|vereador|prefeit|deputad|governador|senador|presiden|chefe|conselheir|membro)", norm):
+        return True
+    tokens = norm.split()
+    return bool(tokens) and all(token in _ROLE_ONLY_TOKENS for token in tokens)
+
+
+def standardize_tribunal_party_name(value: str) -> str:
+    """Padroniza referências a tribunal eleitoral como PARTE: 'Tribunal Regional
+    Eleitoral de Sergipe (TRE-SE)' -> 'TRE/SE'; 'Tribunal Superior Eleitoral' ->
+    'TSE'. Retorna '' quando não é exatamente o tribunal (ex.: 'Corregedoria...',
+    'Presidente do TRE...' permanecem como estão)."""
+    raw = normalize_text(str(value or "")).strip()
+    if not raw:
+        return ""
+    low = normalize_class_text(raw)
+    if low.startswith("tribunal superior eleitoral") or re.fullmatch(r"tse(\s*\(tse\))?", low):
+        return "TSE"
+    if low.startswith("tribunal regional eleitoral"):
+        sigla = re.search(r"\btre[\s/_-]*([a-z]{2})\b", low)
+        if sigla:
+            return f"TRE/{sigla.group(1).upper()}"
+        state_match = re.search(r"tribunal regional eleitoral d[eoa]s?\s+(.+?)(?:\s*\(|$)", low)
+        if state_match:
+            state = state_match.group(1).strip()
+            # Match EXATO do nome do estado (mais longos primeiro) para não confundir
+            # "Pará" (PA) com "Paraíba" (PB) via substring.
+            for name, uf in sorted(STATE_UF.items(), key=lambda kv: -len(kv[0])):
+                if state == name or state.startswith(name + " "):
+                    return f"TRE/{uf}"
+    return ""
+
+
 def normalize_party_entry(value: str) -> str:
     if not value:
         return ""
@@ -617,6 +670,11 @@ def normalize_party_entry(value: str) -> str:
     cleaned = re.sub(r"(?i)^\s*part[ea]\s*[:\-]\s*", "", cleaned).strip()
     if not cleaned or cleaned == "MPE" or is_mpe_noise_entry(cleaned) or PARTY_PLACEHOLDER_REGEX.match(cleaned):
         return ""
+    if is_descriptive_role_noise(cleaned):
+        return ""
+    tribunal = standardize_tribunal_party_name(cleaned)
+    if tribunal:
+        return tribunal
     match = PARTY_PROCESSUAL_ROLE_REGEX.match(cleaned)
     if match:
         role_label = _normalize_party_role_label(match.group("label"))

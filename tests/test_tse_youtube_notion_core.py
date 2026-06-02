@@ -25,6 +25,7 @@ from tse_youtube_notion_core import (
     TranscriptSnippet,
     ThemePunchlineRepairBatchResult,
     build_preview_rows,
+    compute_suspenso_star_updates,
     build_fallback_tema,
     build_editorial_punchline_fallback,
     build_fundamentacao_column_text,
@@ -568,6 +569,133 @@ def test_build_preview_rows_warns_when_published_composition_is_regimentally_off
     rows = build_preview_rows(analysis, "https://youtu.be/abc123", schema, notion)
     assert len(rows[0].composicao) == 7
     assert any("divergencia regimental" in warning for warning in rows[0].warnings)
+
+
+def test_infer_origin_keeps_compound_municipality_name():
+    # A origem composta "Santo Antônio do Tauá/PA" não pode ser truncada para
+    # "Antônio do Tauá/PA" (perdendo "Santo") pela regex de topônimos.
+    row = PublishPreviewRow(
+        numero_processo="0601309-60",
+        origem="Tribunal Regional Eleitoral do Pará",
+        analise_do_conteudo_juridico=(
+            "Agravo contra decisão do TRE/PA que manteve a desaprovação das contas de "
+            "candidato a vereador em Santo Antônio do Tauá/PA nas eleições de 2024."
+        ),
+    )
+    assert core.infer_origin_from_row_text(row) == "Santo Antônio do Tauá/PA"
+
+
+def test_validate_preview_row_prefers_municipality_over_tre_capital():
+    # Quando a origem veio como referência ao tribunal (normalizada para a capital
+    # "Belém/PA"), deve ceder ao município citado no texto do caso.
+    row = PublishPreviewRow(
+        numero_processo="0601309-60",
+        origem="Tribunal Regional Eleitoral do Pará",
+        tema="Desaprovação de contas de campanha",
+        analise_do_conteudo_juridico=(
+            "Agravo em recurso especial contra decisão do TRE/PA sobre contas de "
+            "candidato a vereador em Santo Antônio do Tauá/PA nas eleições de 2024."
+        ),
+    )
+    out = validate_preview_row(row, None)
+    assert out.origem == "Santo Antônio do Tauá/PA"
+    assert out.tribunal == "TRE-PA"
+
+
+def test_validate_preview_row_keeps_specific_municipality_from_model():
+    # Controle: se o modelo já trouxe um município específico, não sobrescreve com
+    # outro nome que apareça no texto.
+    row = PublishPreviewRow(
+        numero_processo="0601",
+        origem="Belém/PA",
+        tema="Tema",
+        analise_do_conteudo_juridico="Processo de Belém/PA.",
+    )
+    assert validate_preview_row(row, None).origem == "Belém/PA"
+
+
+def test_compute_suspenso_star_updates_flips_prior_suspension_when_later_definitive():
+    records = [
+        {"page_id": "p1", "numero_processo": "0600100-10", "votacao": "Suspenso", "data_sessao": "2025-03-01"},
+        {"page_id": "p2", "numero_processo": "0600100-10", "votacao": "Unânime", "data_sessao": "2025-05-01"},
+    ]
+    updates = compute_suspenso_star_updates(records)
+    assert [u["page_id"] for u in updates] == ["p1"]
+
+
+def test_compute_suspenso_star_updates_ignores_process_without_definitive_vote():
+    records = [
+        {"page_id": "p1", "numero_processo": "0600100-10", "votacao": "Suspenso", "data_sessao": "2025-03-01"},
+        {"page_id": "p2", "numero_processo": "0600100-10", "votacao": "Suspenso", "data_sessao": "2025-05-01"},
+    ]
+    assert compute_suspenso_star_updates(records) == []
+
+
+def test_compute_suspenso_star_updates_does_not_flip_new_suspension_after_definitive():
+    # Suspensão POSTERIOR ao julgamento definitivo é uma nova suspensão: não rebaixa.
+    records = [
+        {"page_id": "p1", "numero_processo": "0600100-10", "votacao": "Unânime", "data_sessao": "2025-03-01"},
+        {"page_id": "p2", "numero_processo": "0600100-10", "votacao": "Suspenso", "data_sessao": "2025-09-01"},
+    ]
+    assert compute_suspenso_star_updates(records) == []
+
+
+def test_parse_youtube_chapter_timestamps_extracts_numero_and_seconds():
+    desc = "\n".join(
+        [
+            "Sessão Plenária - 12 de Fevereiro 2026",
+            "00:00:00 Início da transmissão",
+            "00:26:22 Abertura da sessão",
+            "00:47:42 RO - 060290922",
+            "01:20:17 AgR no AREspe - 060006171",
+            "01:32:17 Julgamento em lista",
+            "01:33:54 Rp - 060018305 / Rp - 06009479",
+        ]
+    )
+    result = core.parse_youtube_chapter_timestamps(desc)
+    assert result["0602909-22"] == 47 * 60 + 42
+    assert result["0600061-71"] == 1 * 3600 + 20 * 60 + 17
+    # linha com dois processos: ambos recebem o mesmo timestamp
+    assert result["0600183-05"] == 1 * 3600 + 33 * 60 + 54
+    # linhas administrativas/de lista não viram processo
+    assert all("lista" not in key for key in result)
+
+
+def test_enrich_preview_rows_with_youtube_chapters(monkeypatch):
+    description = "\n".join(
+        [
+            "00:47:42 RO - 060290922",
+            "01:20:17 AgR no AREspe - 060006171",
+        ]
+    )
+    monkeypatch.setattr(core, "fetch_youtube_description", lambda *args, **kwargs: description)
+    rows = [
+        PublishPreviewRow(numero_processo="0602909-22", classe_processo="", youtube_link="https://www.youtube.com/watch?v=VID"),
+        PublishPreviewRow(numero_processo="0600061-71", classe_processo="PA", youtube_link="https://www.youtube.com/watch?v=VID&t=10"),
+    ]
+    out = core.enrich_preview_rows_with_youtube_chapters(rows, youtube_url="https://www.youtube.com/watch?v=VID")
+    # classe vazia preenchida e link sem timestamp recebe &t=2862 (47:42)
+    assert out[0].classe_processo == "RO"
+    assert out[0].youtube_link.endswith("&t=2862")
+    # 'PA' corrigido para a classe do capítulo; link que já tinha timestamp é preservado
+    assert out[1].classe_processo == "AgRg-AREspe"
+    assert out[1].youtube_link.endswith("&t=10")
+
+
+def test_classe_is_specificity_downgrade_guards_internal_recourse():
+    assert core.classe_is_specificity_downgrade("ED-AgRg-AREspe", "AgRg-AREspe") is True
+    assert core.classe_is_specificity_downgrade("AgRg-REspe", "REspe") is True
+    assert core.classe_is_specificity_downgrade("REspe", "AgRg-REspe") is False
+    assert core.classe_is_specificity_downgrade("AIJE", "RO") is False
+
+
+def test_compute_suspenso_star_updates_separates_distinct_processes():
+    records = [
+        {"page_id": "a1", "numero_processo": "0600100-10", "votacao": "Suspenso", "data_sessao": "2025-03-01"},
+        {"page_id": "a2", "numero_processo": "0600100-10", "votacao": "Por maioria", "data_sessao": "2025-05-01"},
+        {"page_id": "b1", "numero_processo": "0600200-20", "votacao": "Suspenso", "data_sessao": "2025-03-01"},
+    ]
+    assert [u["page_id"] for u in compute_suspenso_star_updates(records)] == ["a1"]
 
 
 def test_build_preview_rows_prefers_session_date_over_item_date():

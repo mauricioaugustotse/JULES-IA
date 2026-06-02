@@ -11,7 +11,7 @@ from functools import lru_cache
 from html import unescape
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from pydantic import BaseModel, Field, ValidationError
@@ -481,6 +481,8 @@ ORIENTAÇÕES OBRIGATÓRIAS POR CAMPO:
 - `raciocinio_juridico`: mencione barreiras processuais, como vedação ao reexame de fatos e provas, apenas quando elas forem efetivamente usadas como razão de decidir no voto.
 - `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta, como "conduta vedada por uso de bens públicos" ou "fraude à cota de gênero em chapa proporcional". Não descreva o resultado, não repita número do processo, não use nomes das partes como eixo principal e nunca use apenas rótulos genéricos como "Processo", "Julgamento" ou só a classe processual. Se o vídeo não permitir identificar o tema com segurança, deixe o campo vazio.
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
+- `classe_processo`: leia a classe processual exatamente como aparece na autuação/cabeçalho exibido na tela e no pregão do caso (ex.: "AgR-AREspe nº 0601309-60"). Capture a classe COMPLETA, preservando os prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED), antes da classe-base. Não reduza um "AgR-AREspe" a "AREspe" nem um "ED-REspe" a "REspe". Se houver agravo regimental sendo julgado pelo colegiado contra decisão monocrática, a classe é a forma com AgRg-. Se a tela não exibir a classe com clareza, deixe o campo vazio em vez de adivinhar a classe-base.
+- `origem`: informe o MUNICÍPIO de origem do processo no formato "Cidade/UF" (ex.: "Santo Antônio do Tauá/PA"), tal como citado no caso. Não preencha origem com o tribunal ("Tribunal Regional Eleitoral do Pará", "TRE-PA") nem com a capital do estado quando o município específico aparecer no vídeo; o nome do tribunal de origem pertence a outro contexto, não à coluna origem.
 """
 
 TRANSCRIPT_DETAIL_SYSTEM_PROMPT = """
@@ -499,6 +501,8 @@ TAREFA:
 - Extraia os mesmos campos exigidos na etapa detalhada do vídeo, preservando fidelidade máxima ao conteúdo efetivamente transcrito.
 - `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta. Nunca use número do processo, "Processo", "Julgamento", nomes das partes como eixo principal ou apenas a classe processual. Se não houver base suficiente na transcrição, deixe vazio.
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
+- `classe_processo`: capture a classe COMPLETA como anunciada/transcrita, preservando prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED). Não reduza "AgR-AREspe" a "AREspe". Se a transcrição não trouxer a classe com clareza, deixe vazio.
+- `origem`: informe o MUNICÍPIO no formato "Cidade/UF" como citado no caso, não o tribunal (TRE) nem a capital quando o município específico aparecer.
 """
 
 NEWS_ENRICHMENT_SYSTEM_PROMPT = """
@@ -1932,6 +1936,37 @@ def infer_classe_from_row_text(row: "PublishPreviewRow") -> str:
     return ""
 
 
+# Tokens que denunciam que o trecho capturado "Nome/UF" não é um município, e sim
+# uma instituição/órgão (tribunal, autarquia, partido, etc.). Filtrados por TOKEN
+# (não substring) para não rejeitar municípios como "Três Rios" (token "tres" != "tre").
+ORIGEM_NON_MUNICIPALITY_TOKENS = {
+    "tribunal",
+    "tre",
+    "tse",
+    "stf",
+    "stj",
+    "oab",
+    "incra",
+    "ibama",
+    "instituto",
+    "resolucao",
+    "camara",
+    "diretorio",
+    "conselho",
+    "ministerio",
+    "procuradoria",
+    "comarca",
+    "partido",
+    "federacao",
+    "coligacao",
+}
+
+
+def _city_capture_is_institutional(normalized_city: str) -> bool:
+    tokens = set(normalized_city.split())
+    return bool(tokens & ORIGEM_NON_MUNICIPALITY_TOKENS)
+
+
 def infer_origin_from_row_text(row: "PublishPreviewRow") -> str:
     text = _build_row_inference_text(row)
     if not text:
@@ -1939,13 +1974,18 @@ def infer_origin_from_row_text(row: "PublishPreviewRow") -> str:
     normalized_text = normalize_class_text(text)
     if "tribunais regionais eleitorais" in normalized_text:
         return ""
+    # Aceita topônimos compostos com palavras capitalizadas e conectores
+    # intercalados (ex.: "Santo Antônio do Tauá", "São Gonçalo do Amarante",
+    # "Campos dos Goytacazes"). O padrão anterior separava conectores e palavras
+    # capitalizadas em grupos distintos e falhava quando duas palavras
+    # capitalizadas vinham sem conector entre elas ("Santo Antônio"), truncando o
+    # nome para "Antônio do Tauá/PA".
+    city_word = r"[A-ZÁÀÃÂÉÊÍÓÔÕÚÜÇ][A-Za-zÁÀÃÂÉÊÍÓÔÕÚÜÇáàãâéêíóôõúüç'`´.\-]+"
     city_pattern = (
         r"\b("
-        r"[A-ZÁÀÃÂÉÊÍÓÔÕÚÇ][A-Za-zÁÀÃÂÉÊÍÓÔÕÚÇáàãâéêíóôõúç'`´.\-]+"
-        r"(?:\s+(?:de|do|da|dos|das|e)\s+"
-        r"[A-ZÁÀÃÂÉÊÍÓÔÕÚÇ][A-Za-zÁÀÃÂÉÊÍÓÔÕÚÇáàãâéêíóôõúç'`´.\-]+)*"
-        r"(?:\s+[A-ZÁÀÃÂÉÊÍÓÔÕÚÇ][A-Za-zÁÀÃÂÉÊÍÓÔÕÚÇáàãâéêíóôõúç'`´.\-]+)*"
-        r")/([A-Z]{2})\b"
+        + city_word
+        + r"(?:\s+(?:de|do|da|dos|das|e|" + city_word + r"))*"
+        + r")/([A-Z]{2})\b"
     )
     matches = list(re.finditer(city_pattern, text))
     for match in reversed(matches):
@@ -1957,6 +1997,7 @@ def infer_origin_from_row_text(row: "PublishPreviewRow") -> str:
             and not city.upper().startswith("TRE")
             and "," not in city
             and normalized_city not in STATE_NAME_KEYS
+            and not _city_capture_is_institutional(normalized_city)
         ):
             return f"{city}/{uf}"
     tre_sigla = re.search(r"\bTRE[-/ ]([A-Z]{2})\b", text, flags=re.IGNORECASE)
@@ -1974,6 +2015,32 @@ def infer_origin_from_row_text(row: "PublishPreviewRow") -> str:
     if re.search(r"(?i)\bTribunal Superior Eleitoral\b|\bTSE\b", text):
         return UF_CAPITALS["DF"]
     return ""
+
+
+def _origem_is_court_reference(value: str) -> bool:
+    """True quando a origem informada é apenas uma referência a tribunal (TRE/TSE)
+    ou está vazia. Nesses casos a coluna não traz o município de fato, e deve ceder
+    ao município efetivamente citado no texto do julgamento (ex.: o modelo devolveu
+    "Tribunal Regional Eleitoral do Pará", normalizado para a capital "Belém/PA",
+    quando o caso era de "Santo Antônio do Tauá/PA")."""
+    key = normalize_class_text(value)
+    if not key:
+        return True
+    return bool(
+        re.search(r"\btribunal\b|\btre\b|\btse\b|regional eleitoral|superior eleitoral", key)
+    )
+
+
+def _municipio_from_case_text(row: "PublishPreviewRow") -> str:
+    """Município no formato 'Cidade/UF' inferido do texto do julgamento, normalizado.
+    Retorna "" quando o texto não traz um município específico (a inferência cai para
+    a capital do TRE, que não acrescenta especificidade)."""
+    inferred = normalize_origem_value(infer_origin_from_row_text(row))
+    if not inferred:
+        return ""
+    if not re.search(r"/[A-Z]{2}$", inferred) or inferred.upper().startswith("TRE"):
+        return ""
+    return inferred
 
 
 def row_indicates_suspension_by_vista(row: "PublishPreviewRow") -> bool:
@@ -1994,6 +2061,334 @@ def row_indicates_suspension_by_vista(row: "PublishPreviewRow") -> bool:
         )
         return bool(row.pedido_vista) or ("vista" in combined)
     return False
+
+
+DEFINITIVE_VOTACAO = {"Unânime", "Por maioria"}
+
+
+def compute_suspenso_star_updates(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Identifica registros cuja votação deve passar de 'Suspenso' para 'Suspenso*'.
+
+    Regra: quando o MESMO processo (mesmo número canônico) foi julgado de forma
+    DEFINITIVA ('Unânime' ou 'Por maioria') em data igual ou posterior à da
+    suspensão, a etiqueta 'Suspenso' do registro anterior vira 'Suspenso*'. Assim o
+    Notion reflete que aquela suspensão foi posteriormente resolvida quando o
+    processo voltou à pauta e foi definitivamente votado.
+
+    Cada registro é um dict com pelo menos: page_id, numero_processo, votacao,
+    data_sessao. Retorna a sublista de registros que devem ser atualizados.
+    """
+    by_proc: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        key = canonicalize_numero_processo(str(record.get("numero_processo", "")))
+        if key:
+            by_proc.setdefault(key, []).append(record)
+
+    updates: list[dict[str, Any]] = []
+    for group in by_proc.values():
+        definitive_dates = sorted(
+            date
+            for date in (
+                normalize_session_date_to_iso(str(r.get("data_sessao", "")))
+                for r in group
+                if normalize_votacao(str(r.get("votacao", ""))) in DEFINITIVE_VOTACAO
+            )
+            if date
+        )
+        has_definitive = any(
+            normalize_votacao(str(r.get("votacao", ""))) in DEFINITIVE_VOTACAO for r in group
+        )
+        if not has_definitive:
+            continue
+        latest_definitive = definitive_dates[-1] if definitive_dates else ""
+        for record in group:
+            if normalize_votacao(str(record.get("votacao", ""))) != "Suspenso":
+                continue
+            suspended_date = normalize_session_date_to_iso(str(record.get("data_sessao", "")))
+            # Só rebaixa para 'Suspenso*' quando a suspensão é anterior ou simultânea a
+            # um julgamento definitivo; não marca uma suspensão nova que seja posterior
+            # a todos os julgamentos definitivos conhecidos do processo.
+            if not suspended_date or not latest_definitive or suspended_date <= latest_definitive:
+                updates.append(record)
+    return updates
+
+
+def reconcile_suspenso_marks(
+    notion_client: "NotionSessoesClient",
+    notion_schema: "NotionDataSourceSchema",
+    *,
+    numero_processos: Optional[set[str]] = None,
+    pages: Optional[list[dict[str, Any]]] = None,
+    apply: bool = True,
+) -> list[dict[str, Any]]:
+    """Aplica (ou simula, com apply=False) a reconciliação 'Suspenso' -> 'Suspenso*'.
+
+    Quando `pages` não é fornecido, busca no Notion: se `numero_processos` vier
+    preenchido, filtra por esses números (barato, usado na publicação); caso
+    contrário varre toda a base (usado no script standalone). Retorna a lista de
+    mudanças, cada uma com status 'updated'/'failed' (apply=True) ou 'would_update'
+    (apply=False).
+    """
+    if pages is None:
+        pages = []
+        if numero_processos:
+            seen_ids: set[str] = set()
+            for numero in sorted({n for n in numero_processos if n}):
+                condition = notion_client.build_filter_condition(notion_schema, "numero_processo", numero)
+                if not condition:
+                    continue
+                for page in notion_client.query_data_source(condition):
+                    pid = str(page.get("id", ""))
+                    if pid and pid not in seen_ids:
+                        seen_ids.add(pid)
+                        pages.append(page)
+        else:
+            pages = notion_client.query_data_source()
+
+    records: list[dict[str, Any]] = []
+    for page in pages:
+        records.append(
+            {
+                "page_id": str(page.get("id", "")),
+                "url": str(page.get("url", "")),
+                "numero_processo": notion_client._extract_property_text(page, notion_schema, "numero_processo"),
+                "votacao": notion_client._extract_property_text(page, notion_schema, "votacao"),
+                "data_sessao": notion_client._extract_property_text(page, notion_schema, "data_sessao"),
+            }
+        )
+
+    changes: list[dict[str, Any]] = []
+    for record in compute_suspenso_star_updates(records):
+        change = {
+            "page_id": record["page_id"],
+            "url": record.get("url", ""),
+            "numero_processo": record.get("numero_processo", ""),
+            "data_sessao": record.get("data_sessao", ""),
+            "old_votacao": "Suspenso",
+            "new_votacao": "Suspenso*",
+            "status": "would_update",
+        }
+        if apply and record["page_id"]:
+            try:
+                notion_client._request(
+                    "PATCH",
+                    f"/pages/{record['page_id']}",
+                    json={"properties": {"votacao": {"select": {"name": "Suspenso*"}}}},
+                )
+                change["status"] = "updated"
+            except Exception as exc:  # pragma: no cover - rede
+                change["status"] = "failed"
+                change["error"] = str(exc)
+        changes.append(change)
+    return changes
+
+
+def audit_label_colors(
+    notion_client: "NotionSessoesClient",
+    property_names: list[str],
+) -> dict[str, Any]:
+    """Relata, por coluna (select/multi_select), quantas opções estão com cor
+    diferente de 'default' e quais são.
+
+    IMPORTANTE: a API do Notion NÃO permite alterar a cor de uma opção de select já
+    existente (responde 400 "Cannot update color of select ..."). Por isso esta
+    função é apenas de auditoria; a recoloração de etiquetas existentes precisa ser
+    feita manualmente na interface do Notion. Opções novas criadas ao gravar páginas
+    recebem cor atribuída pelo próprio Notion (não controlável pela API).
+    """
+    schema = notion_client.fetch_schema()
+    properties = schema.raw_payload.get("properties", {})
+    report: dict[str, Any] = {}
+    for name in property_names:
+        prop = properties.get(name)
+        if not prop:
+            report[name] = {"status": "missing", "total_options": 0, "non_default": 0, "examples": []}
+            continue
+        prop_type = prop.get("type")
+        if prop_type not in {"select", "multi_select"}:
+            report[name] = {"status": "not_select", "total_options": 0, "non_default": 0, "examples": []}
+            continue
+        options = prop.get(prop_type, {}).get("options", []) or []
+        colored = [
+            {"name": str(option.get("name", "")), "color": str(option.get("color") or "default")}
+            for option in options
+            if str(option.get("color") or "default") != "default"
+        ]
+        report[name] = {
+            "status": "already_default" if not colored else "needs_manual_recolor",
+            "total_options": len(options),
+            "non_default": len(colored),
+            "examples": colored[:50],
+        }
+    return report
+
+
+_CHAPTER_LINE_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s+(.*\S)\s*$")
+_CHAPTER_SKIP_TERMS = (
+    "abertura",
+    "encerramento",
+    "transmiss",
+    "julgamento em lista",
+    "sessao administrativa",
+    "intervalo",
+    "leitura de ata",
+    "posse",
+)
+
+
+def parse_youtube_chapter_entries(description: str) -> dict[str, dict[str, Any]]:
+    """Extrai, da descrição (capítulos) de um vídeo de sessão do TSE, um mapa
+    ``{numero_processo_canônico: {"seconds": int, "classe_raw": str, "classe": str}}``.
+
+    As descrições do TSE listam capítulos no formato ``HH:MM:SS <classe> <numero>``
+    (ex.: ``00:27:45 AREspe 060078521``, ``01:20:17 AgR no AREspe - 060006171``,
+    ``01:33:54 Rp - 060018305 / Rp - 06009479``). Cada segmento separado por "/" é
+    tratado isoladamente. Linhas administrativas/cerimoniais são ignoradas. Mantém a
+    PRIMEIRA ocorrência de cada processo. ``classe`` é a classe já canonizada.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for raw_line in (description or "").splitlines():
+        match = _CHAPTER_LINE_RE.match(raw_line)
+        if not match:
+            continue
+        if match.group(3) is not None:
+            hours, minutes, seconds = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        else:
+            hours, minutes, seconds = 0, int(match.group(1)), int(match.group(2))
+        total_seconds = hours * 3600 + minutes * 60 + seconds
+        rest = match.group(4)
+        if any(term in normalize_class_text(rest) for term in _CHAPTER_SKIP_TERMS):
+            continue
+        for segment in rest.split("/"):
+            tokens = re.findall(r"\d[\d.\-]{4,}\d", segment)
+            if not tokens:
+                continue
+            numero = canonicalize_numero_processo(tokens[-1])
+            if not numero or numero in result:
+                continue
+            classe_raw = segment[: segment.rfind(tokens[-1])].strip(" -nNºª.")
+            result[numero] = {
+                "seconds": total_seconds,
+                "classe_raw": classe_raw,
+                "classe": normalize_classe_processo(classe_raw),
+            }
+    return result
+
+
+def parse_youtube_chapter_timestamps(description: str) -> dict[str, int]:
+    """Compat: mapa {numero_processo_canônico: segundos_de_início} derivado de
+    :func:`parse_youtube_chapter_entries`."""
+    return {numero: entry["seconds"] for numero, entry in parse_youtube_chapter_entries(description).items()}
+
+
+_YOUTUBE_DESC_RE_PRIMARY = re.compile(r'"shortDescription":"(.*?)","isCrawlable"', re.DOTALL)
+_YOUTUBE_DESC_RE_FALLBACK = re.compile(r'"shortDescription":"(.*?)"', re.DOTALL)
+
+
+def fetch_youtube_description(video_id: str, session: Optional["requests.Session"] = None) -> str:
+    """Busca a descrição (com os capítulos) de um vídeo do YouTube via HTML público.
+    Retorna "" em caso de falha. Usado para enriquecer a extração com a classe e o
+    timestamp que o próprio TSE publica nos capítulos da descrição."""
+    if not video_id:
+        return ""
+    getter = session.get if session is not None else requests.get
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    for attempt in range(1, 4):
+        try:
+            response = getter(
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR,pt;q=0.9"},
+                timeout=30,
+            )
+            text = getattr(response, "text", "") or ""
+            match = _YOUTUBE_DESC_RE_PRIMARY.search(text) or _YOUTUBE_DESC_RE_FALLBACK.search(text)
+            if not match:
+                return ""
+            return match.group(1).encode("utf-8").decode("unicode_escape", errors="replace")
+        except Exception:
+            if attempt == 3:
+                return ""
+            time.sleep(1.0 * attempt)
+    return ""
+
+
+def _youtube_link_has_timestamp(url: str) -> bool:
+    parsed = urlparse(url or "")
+    query = parse_qs(parsed.query)
+    if query.get("t") or query.get("start"):
+        return True
+    return parsed.fragment.startswith("t=")
+
+
+def classe_is_specificity_downgrade(current: str, chapter: str) -> bool:
+    """True quando a classe do capítulo é apenas a BASE de uma classe atual mais
+    específica (segmentos separados por '-'; ex.: atual 'ED-AgRg-AREspe' vs capítulo
+    'AgRg-AREspe'). Nesses casos o capítulo omite um recurso interno (ED/AgRg) que a
+    etiqueta atual carrega — não rebaixamos."""
+    current_segments = (current or "").split("-")
+    chapter_segments = (chapter or "").split("-")
+    return (
+        len(chapter_segments) < len(current_segments)
+        and current_segments[-len(chapter_segments):] == chapter_segments
+    )
+
+
+def enrich_preview_rows_with_youtube_chapters(
+    rows: list["PublishPreviewRow"],
+    youtube_url: str,
+    notion_schema: Optional["NotionDataSourceSchema"] = None,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> list["PublishPreviewRow"]:
+    """Enriquece os preview rows com os CAPÍTULOS da descrição do vídeo (fonte
+    autoritativa do TSE): define a ``classe_processo`` (preenchendo vazio, corrigindo
+    'PA' e divergências reais — sem rebaixar) e preenche o marcador de tempo do
+    ``youtube_link`` quando ausente. Faz parte do fluxo principal para que novas
+    extrações já saiam corretas sem reparos posteriores."""
+    video_id = extract_youtube_video_id(youtube_url)
+    if not video_id or not rows:
+        return rows
+    try:
+        description = fetch_youtube_description(video_id)
+    except Exception as exc:  # pragma: no cover - rede
+        if logger:
+            logger.warning("Falha ao buscar capítulos do YouTube: %s", exc)
+        return rows
+    entries = parse_youtube_chapter_entries(description) if description else {}
+    if not entries:
+        return rows
+    valid_classes: Optional[set[str]] = None
+    if notion_schema is not None:
+        prop = notion_schema.raw_payload.get("properties", {}).get("classe_processo", {})
+        valid_classes = {
+            str(option.get("name", "")).strip()
+            for option in prop.get("select", {}).get("options", []) or []
+            if str(option.get("name", "")).strip()
+        }
+    applied_classe = 0
+    applied_ts = 0
+    for row in rows:
+        entry = entries.get(canonicalize_numero_processo(row.numero_processo))
+        if not entry:
+            continue
+        chapter_classe = str(entry.get("classe", "") or "")
+        if chapter_classe and (valid_classes is None or chapter_classe in valid_classes):
+            current = str(row.classe_processo or "")
+            if (
+                not current
+                or current == "PA"
+                or (current != chapter_classe and not classe_is_specificity_downgrade(current, chapter_classe))
+            ):
+                if row.classe_processo != chapter_classe:
+                    row.classe_processo = chapter_classe
+                    applied_classe += 1
+        seconds = entry.get("seconds")
+        if isinstance(seconds, int) and seconds >= 0 and not _youtube_link_has_timestamp(row.youtube_link):
+            row.youtube_link = build_timestamped_youtube_link(row.youtube_link, seconds)
+            applied_ts += 1
+    if logger and (applied_classe or applied_ts):
+        logger.info("Capítulos do YouTube: classe corrigida em %s, timestamp preenchido em %s.", applied_classe, applied_ts)
+    return rows
 
 
 def format_transcript_snippet(snippet: TranscriptSnippet) -> str:
@@ -2746,9 +3141,22 @@ class TranscriptChunk:
 class JudgmentItemExtraction(BaseModel):
     data_sessao: str = ""
     eleicao: str = ""
-    classe_processo: str = ""
+    classe_processo: str = Field(
+        default="",
+        description=(
+            "Classe processual como na autuacao/cabecalho (ex.: 'AgR-AREspe', 'ED-REspe'). "
+            "Preserve prefixos de recurso interno (AgR/AgRg, ED) antes da classe-base; "
+            "nao reduza 'AgR-AREspe' a 'AREspe'."
+        ),
+    )
     numero_processo: str = ""
-    origem: str = ""
+    origem: str = Field(
+        default="",
+        description=(
+            "Municipio de origem no formato 'Cidade/UF' (ex.: 'Santo Antonio do Taua/PA'). "
+            "Nao use o tribunal (TRE) nem a capital quando o municipio aparecer no caso."
+        ),
+    )
     uf: str = ""
     tre: str = ""
     partes: list[str] = Field(default_factory=list)
@@ -5846,6 +6254,15 @@ def validate_preview_row(
         elif row.classe_processo == "CTA":
             row.origem = UF_CAPITALS["DF"]
             row.tribunal = "TSE"
+    # Quando a origem veio de uma referência a tribunal (TRE/TSE) — e portanto virou a
+    # capital por fallback, não o município real — prefira o município efetivamente
+    # citado no texto do julgamento. Não sobrescreve uma origem que o modelo já trouxe
+    # como município específico.
+    if not federal_origin_hint and _origem_is_court_reference(raw_origem_value):
+        municipio = _municipio_from_case_text(row)
+        if municipio and municipio != row.origem:
+            row.origem = municipio
+            row.tribunal = normalize_tre(row.tribunal, extract_uf_from_text(municipio))
     row.relator = normalize_ministro_name(row.relator) if row.relator else ""
     row.pedido_vista = normalize_pedido_vista_value(row.pedido_vista)
     row.resultado = normalize_resultado_final(row.resultado, row.classe_processo)
@@ -6565,6 +6982,7 @@ def publish_preview_rows(
     notion_schema: NotionDataSourceSchema,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    definitive_processos: set[str] = set()
     for row in rows:
         row = validate_preview_row(row, notion_schema)
         disposition, reasons = assess_row_publishability(row)
@@ -6596,6 +7014,8 @@ def publish_preview_rows(
         else:
             response = notion_client.create_row(notion_schema, row)
             status = "created"
+        if row.votacao in DEFINITIVE_VOTACAO and row.numero_processo:
+            definitive_processos.add(row.numero_processo)
         results.append(
             {
                 "tema": row.tema,
@@ -6607,6 +7027,33 @@ def publish_preview_rows(
                 "warnings": row.warnings,
             }
         )
+
+    # Quando um processo foi definitivamente julgado (Unânime/Por maioria) nesta
+    # publicação, rebaixa para 'Suspenso*' os registros 'Suspenso' anteriores do
+    # mesmo processo. Best-effort: não falha a publicação se a reconciliação falhar.
+    if definitive_processos and hasattr(notion_client, "query_data_source"):
+        try:
+            reconciled = reconcile_suspenso_marks(
+                notion_client,
+                notion_schema,
+                numero_processos=definitive_processos,
+                apply=True,
+            )
+        except Exception as exc:  # pragma: no cover - rede
+            results.append({"status": "votacao_reconcile_failed", "errors": [str(exc)], "warnings": []})
+        else:
+            for change in reconciled:
+                results.append(
+                    {
+                        "numero_processo": change.get("numero_processo", ""),
+                        "status": "votacao_reconciled",
+                        "page_id": change.get("page_id", ""),
+                        "url": change.get("url", ""),
+                        "detail": f"{change.get('old_votacao')} -> {change.get('new_votacao')} ({change.get('status')})",
+                        "errors": [] if change.get("status") != "failed" else [str(change.get("error", ""))],
+                        "warnings": [],
+                    }
+                )
     return results
 
 

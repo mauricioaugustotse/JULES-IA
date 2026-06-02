@@ -11,7 +11,9 @@ from tse_normalization import (
     normalize_numero_processo_display,
     normalize_origem_value,
     normalize_partes_list,
+    normalize_party_entry,
     normalize_pedido_vista_value,
+    standardize_tribunal_party_name,
     normalize_resultado_final,
     normalize_session_date_to_iso,
     normalize_votacao,
@@ -32,6 +34,40 @@ def test_canonicalize_numero_processo_extracts_short_number():
 
 def test_normalize_classe_processo_canonicalizes_known_alias():
     assert normalize_classe_processo("agravo regimental no recurso especial eleitoral") == "AgRg-REspe"
+
+
+def test_normalize_ministro_name_dedup_aliases_for_same_person():
+    assert normalize_ministro_name("Min. Stella Aranha") == "Min. Estela Aranha"
+    assert normalize_ministro_name("Min. André Luiz Mendonça") == "Min. André Mendonça"
+    assert normalize_ministro_name("Min. Antônio Carlos") == "Min. Antônio Carlos Ferreira"
+
+
+def test_standardize_tribunal_party_name_maps_state_to_uf():
+    assert standardize_tribunal_party_name("Tribunal Regional Eleitoral de Sergipe (TRE-SE)") == "TRE/SE"
+    assert standardize_tribunal_party_name("Tribunal Regional Eleitoral da Paraíba") == "TRE/PB"
+    assert standardize_tribunal_party_name("Tribunal Regional Eleitoral do Pará") == "TRE/PA"
+    assert standardize_tribunal_party_name("Tribunal Regional Eleitoral do Rio Grande do Norte") == "TRE/RN"
+    assert standardize_tribunal_party_name("Tribunal Superior Eleitoral") == "TSE"
+    # Corregedoria/Presidente não são o tribunal-parte e permanecem como estão.
+    assert standardize_tribunal_party_name("Corregedoria Regional Eleitoral de São Paulo (CRE-SP)") == ""
+
+
+def test_normalize_party_entry_drops_role_noise_and_standardizes_tribunal():
+    assert normalize_party_entry("Candidato ao cargo de Deputado Estadual de Roraima nas eleições 2018") == ""
+    assert normalize_party_entry("Deputado Federal e Vereador") == ""
+    assert normalize_party_entry("Tribunal Regional Eleitoral de Sergipe (TRE-SE)") == "TRE/SE"
+    # entidade legítima (município) é preservada
+    assert normalize_party_entry("Município de Governador Edison Lobão") == "Município de Governador Edison Lobão"
+
+
+def test_normalize_classe_processo_preserves_agravo_regimental_official_abbrev():
+    # 'AgR-' é a sigla oficial do TSE para agravo regimental e deve canonizar para a
+    # forma 'AgRg-' usada na base; antes era reduzida indevidamente à classe-base.
+    assert normalize_classe_processo("AgR-AREspe") == "AgRg-AREspe"
+    assert normalize_classe_processo("AgR-REspe") == "AgRg-REspe"
+    assert normalize_classe_processo("AgR-RO") == "AgRg-RO"
+    # 'AgR-HC' é uma classe canônica própria da base e deve ser preservada como está.
+    assert normalize_classe_processo("AgR-HC") == "AgR-HC"
 
 
 def test_normalize_resultado_final_normalizes_suspenso_por_vista():

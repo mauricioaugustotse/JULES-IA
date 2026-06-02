@@ -30,6 +30,7 @@ from tse_youtube_notion_core import (
     enrich_preview_rows_with_news,
     enrich_preview_rows_with_process_metadata,
     enrich_preview_rows_with_theme_punchline,
+    enrich_preview_rows_with_youtube_chapters,
     extract_youtube_video_id,
     normalize_youtube_link,
     publish_preview_rows,
@@ -145,6 +146,14 @@ def process_single_video(
         youtube_url=video.url,
         notion_schema=notion_schema,
         notion_client=notion_client,
+    )
+
+    progress("enriquecendo via capítulos do YouTube")
+    rows = enrich_preview_rows_with_youtube_chapters(
+        rows,
+        youtube_url=video.url,
+        notion_schema=notion_schema,
+        logger=LOGGER,
     )
 
     progress("enriquecendo metadados")
