@@ -2842,10 +2842,17 @@ def repair_existing_video_rows(
             original.origem,
             original.tribunal or repaired.tribunal,
         )
-        if repair_focus == "composition" and original_composition_issue and _composition_size_issue(repaired.composicao):
-            repaired.composicao = list(original.composicao)
-        if repair_focus == "composition" and not original_composition_issue:
-            repaired.composicao = list(original.composicao)
+        if repair_focus == "composition":
+            if not original_composition_issue:
+                # Original ja estava regimentalmente OK: preserve-o exatamente, sem
+                # troca-lo por uma bancada de maior score porem com ruido.
+                repaired.composicao = list(original.composicao)
+            elif _composition_size_issue(repaired.composicao):
+                # Original tinha problema E o reparo nao alcancou composicao
+                # aproveitavel: nao-regressao por qualidade em vez de reverter
+                # cegamente ao original (que costuma estar vazio). Assim 6 nomes
+                # corretos ou 7 com 1 desconhecido nao sao descartados.
+                repaired.composicao = choose_preferred_composition(repaired.composicao, original.composicao)
 
         needs_theme_repair = tema_looks_generic(repaired.tema, repaired) or not repaired.tema
         if needs_theme_repair:
@@ -2890,11 +2897,6 @@ def repair_existing_video_rows(
                 original.origem,
                 original.tribunal or repaired.tribunal,
             )
-        if repair_focus == "composition" and original_composition_issue and _composition_size_issue(repaired.composicao):
-            repaired.composicao = list(original.composicao)
-        if repair_focus == "composition" and not original_composition_issue:
-            repaired.composicao = list(original.composicao)
-
         repaired_rows.append(repaired)
         per_page.append(
             {

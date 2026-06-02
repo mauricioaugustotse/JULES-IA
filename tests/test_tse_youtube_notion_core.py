@@ -471,6 +471,105 @@ def test_choose_preferred_composition_rejects_regimentally_impossible_seven_name
     assert core.choose_preferred_composition(contaminated, regimental) == regimental
 
 
+def test_build_preview_rows_keeps_seven_names_with_one_unrostered_minister():
+    # Regressao guard (Fix #1): uma composicao de sessao com 7 nomes, sendo 1
+    # ministro fora do roster (ex.: recem-empossado / grafia sem alias), NAO pode
+    # zerar a coluna composicao. Antes do fix, o gate regimental ("unknown_institution")
+    # descartava todo o fallback e a coluna saia VAZIA mesmo com os 7 nomes corretos.
+    schema = make_schema()
+    notion = FakeNotionClient()
+    analysis = AnalysisResult(
+        session=SessionExtraction(
+            data_sessao="20/03/2026",
+            composicao=[
+                "Ministra Cármen Lúcia",
+                "Ministro André Mendonça",
+                "Ministro Nunes Marques",
+                "Ministra Isabel Gallotti",
+                "Ministro Antônio Carlos Ferreira",
+                "Ministro Floriano de Azevedo Marques",
+                "Ministro Joaquim Pereira Lima",
+            ],
+            judgments=[],
+        ),
+        bundles=[
+            JudgmentBundleExtraction(
+                start_seconds=120,
+                items=[
+                    JudgmentItemExtraction(
+                        data_sessao="20/03/2026",
+                        eleicao="2024",
+                        classe_processo="PA",
+                        numero_processo="0600001-01.2024.6.00.0000",
+                        origem="Brasília/DF",
+                        tre="TSE",
+                        partes=["Alice"],
+                        composicao=[],
+                        relator="Ministro André Mendonça",
+                        tema="Tema útil",
+                        punchline="Resumo",
+                        resultado_final="Aprovada",
+                        votacao="Unânime",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    rows = build_preview_rows(analysis, "https://youtu.be/abc123", schema, notion)
+    assert len(rows[0].composicao) == 7
+    assert "Min. Joaquim Pereira Lima" in rows[0].composicao
+
+
+def test_build_preview_rows_warns_when_published_composition_is_regimentally_off():
+    # Fix #1: composicoes de tamanho plausivel mas com divergencia regimental real
+    # (ex.: 2 nomes nao classificados) continuam sendo publicadas (nao mais vazias),
+    # porem com um aviso explicito na linha para revisao humana.
+    schema = make_schema()
+    notion = FakeNotionClient()
+    analysis = AnalysisResult(
+        session=SessionExtraction(
+            data_sessao="20/03/2026",
+            composicao=[
+                "Ministra Cármen Lúcia",
+                "Ministro André Mendonça",
+                "Ministro Nunes Marques",
+                "Ministra Isabel Gallotti",
+                "Ministro Antônio Carlos Ferreira",
+                "Ministro Joaquim Pereira Lima",
+                "Ministro Tadeu Soares Quintino",
+            ],
+            judgments=[],
+        ),
+        bundles=[
+            JudgmentBundleExtraction(
+                start_seconds=120,
+                items=[
+                    JudgmentItemExtraction(
+                        data_sessao="20/03/2026",
+                        eleicao="2024",
+                        classe_processo="PA",
+                        numero_processo="0600001-01.2024.6.00.0000",
+                        origem="Brasília/DF",
+                        tre="TSE",
+                        partes=["Alice"],
+                        composicao=[],
+                        relator="Ministro André Mendonça",
+                        tema="Tema útil",
+                        punchline="Resumo",
+                        resultado_final="Aprovada",
+                        votacao="Unânime",
+                    )
+                ],
+            ),
+        ],
+    )
+
+    rows = build_preview_rows(analysis, "https://youtu.be/abc123", schema, notion)
+    assert len(rows[0].composicao) == 7
+    assert any("divergencia regimental" in warning for warning in rows[0].warnings)
+
+
 def test_build_preview_rows_prefers_session_date_over_item_date():
     schema = make_schema()
     notion = FakeNotionClient()

@@ -427,12 +427,14 @@ Use exclusivamente o conteúdo do vídeo fornecido. Não use qualquer fonte exte
 
 Nesta primeira etapa, sua função é segmentar a sessão:
 - identificar a data da sessão;
-- identificar a composição do colegiado presente;
+- identificar a composição do colegiado presente (os ministros que efetivamente participam dos julgamentos);
 - listar cada julgamento com seu timestamp inicial em segundos;
 - estimar o timestamp final quando possível;
 - marcar explicitamente blocos que devam ser ignorados, especialmente o julgamento em lista ao final da sessão.
 
 Se houver julgamento conjunto, mantenha um único bloco para o trecho conjunto, mas liste os números de processo percebidos.
+
+Sobre a composição: o TSE julga em colegiado de até 7 ministros (3 oriundos do STF, 2 do STJ e 2 juristas/advogados da classe). Liste cada ministro presente pelo nome, no formato "Min. <Nome>". Pode haver 6 nomes em caso de ausência, ou substitutos. NÃO inclua ministros citados apenas como autores de votos ou precedentes de outros processos, nem partes, advogados ou procuradores. A composição costuma ser lida uma única vez na abertura da sessão e vale para todos os julgamentos daquela mesma sessão.
 """
 
 TRANSCRIPT_GLOBAL_SYSTEM_PROMPT = """
@@ -442,12 +444,14 @@ Use apenas a transcrição fornecida no prompt. Não use qualquer fonte externa.
 
 Nesta etapa, sua função é segmentar a sessão:
 - identificar a data da sessão;
-- identificar a composição do colegiado presente;
+- identificar a composição do colegiado presente (os ministros que efetivamente participam dos julgamentos);
 - listar cada julgamento com seu timestamp inicial em segundos;
 - estimar o timestamp final quando possível;
 - marcar explicitamente blocos que devam ser ignorados, especialmente julgamento em lista, leitura de ata ou trechos meramente cerimoniais/administrativos.
 
 Se houver julgamento conjunto, mantenha um único bloco para o trecho conjunto, mas liste os números de processo percebidos.
+
+Sobre a composição: o TSE julga em colegiado de até 7 ministros (3 oriundos do STF, 2 do STJ e 2 juristas/advogados da classe). Liste cada ministro presente pelo nome, no formato "Min. <Nome>". Pode haver 6 nomes em caso de ausência, ou substitutos. NÃO inclua ministros citados apenas como autores de votos ou precedentes de outros processos, nem partes, advogados ou procuradores. A composição costuma ser lida uma única vez na abertura da sessão e vale para todos os julgamentos daquela mesma sessão.
 """
 
 DETAIL_SYSTEM_PROMPT = """
@@ -2712,7 +2716,15 @@ class SessionWindow(BaseModel):
 
 class SessionExtraction(BaseModel):
     data_sessao: str = ""
-    composicao: list[str] = Field(default_factory=list)
+    composicao: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ministros que compoem o colegiado e participam dos julgamentos da sessao "
+            "(tipicamente 7: 3 do STF, 2 do STJ, 2 juristas; pode haver 6 por ausencia). "
+            "Formato 'Min. <Nome>'. Nao inclua ministros citados apenas em votos/precedentes "
+            "de outros processos, nem partes, advogados ou procuradores."
+        ),
+    )
     judgments: list[SessionWindow] = Field(default_factory=list)
 
 
@@ -2741,7 +2753,14 @@ class JudgmentItemExtraction(BaseModel):
     tre: str = ""
     partes: list[str] = Field(default_factory=list)
     advogados: list[str] = Field(default_factory=list)
-    composicao: list[str] = Field(default_factory=list)
+    composicao: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ministros que participaram do julgamento deste processo; normalmente igual a "
+            "composicao da sessao. Formato 'Min. <Nome>'. Nao deixe vazio quando a composicao "
+            "da sessao for conhecida."
+        ),
+    )
     relator: str = ""
     pedido_vista: str = ""
     indicados_lista_triplice: list[str] = Field(default_factory=list)
@@ -3909,6 +3928,7 @@ Contexto global:
 - Se for julgamento conjunto, duplique as informações comuns em cada item.
 - Se o bloco for apenas julgamento em lista, marque should_ignore=true e explique.
 - Seja fiel ao vídeo e deixe em branco o que não estiver explícito.
+- Exceção quanto à composição: preencha o campo composicao de CADA item com a lista de ministros indicada em "Composição da sessão" acima (os que participaram deste julgamento), no formato "Min. <Nome>", mesmo que o trecho não a repita. Só altere se o trecho mostrar entrada, saída, ausência ou substituição de ministro para ESTE processo. Nunca deixe composicao vazia quando a composição da sessão for conhecida.
 """
         try:
             bundle = self._call_gemini(
@@ -3976,6 +3996,7 @@ Regras:
 - Se for julgamento conjunto, duplique as informações comuns em cada item.
 - Se o trecho for apenas julgamento em lista, marque should_ignore=true e explique.
 - Seja fiel apenas ao que estiver explicitamente transcrito.
+- Exceção quanto à composição: preencha o campo composicao de CADA item com a lista de ministros indicada em "Composição da sessão" acima (os que participaram deste julgamento), no formato "Min. <Nome>", mesmo que a transcrição do trecho não a repita. Só altere se a transcrição mostrar entrada, saída, ausência ou substituição de ministro para ESTE processo. Nunca deixe composicao vazia quando a composição da sessão for conhecida.
 """
         return self._call_gemini_text(
             prompt=transcript_prompt,
@@ -6024,7 +6045,15 @@ def build_preview_rows(
 ) -> list[PublishPreviewRow]:
     rows: list[PublishPreviewRow] = []
     session_composicao = normalize_composition_list(analysis.session.composicao)
-    session_composicao_fallback = session_composicao if not composicao_regimental_issue(session_composicao) else []
+    # Aproveita a composicao da sessao como fallback sempre que ela tiver tamanho
+    # plausivel (6 ou 7 ministros). Antes, QUALQUER divergencia regimental
+    # (ex.: um ministro fora do roster, distribuicao institucional atipica) zerava
+    # TODO o fallback e deixava a coluna composicao vazia, mesmo havendo os 7 nomes
+    # corretos extraidos. O ranking _composition_quality continua preferindo
+    # composicoes regimentalmente plenas (3+2+2); a divergencia vira aviso na linha,
+    # nao motivo de descarte. Listas com 8+ ou <=5 nomes seguem descartadas porque
+    # exigem reconciliacao/cap (fora deste escopo) antes de serem confiaveis.
+    session_composicao_fallback = session_composicao if 6 <= len(session_composicao) <= 7 else []
     authoritative_session_date = normalize_session_date_to_iso(analysis.session.data_sessao)
     for bundle_index, bundle in enumerate(analysis.bundles, start=1):
         if bundle.should_ignore:
@@ -6071,6 +6100,13 @@ def build_preview_rows(
                 source_item_index=item_index,
             )
             row = validate_preview_row(row, notion_schema)
+            row_composition_issue = composicao_regimental_issue(row.composicao)
+            if row.composicao and row_composition_issue:
+                row.add_warning(
+                    "composicao com divergencia regimental ("
+                    + row_composition_issue
+                    + "); confira os 7 ministros participantes do julgamento."
+                )
             if notion_client and notion_schema and row.numero_processo and row.youtube_link:
                 match = notion_client.find_existing_row(
                     notion_schema,

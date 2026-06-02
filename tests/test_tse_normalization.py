@@ -2,6 +2,8 @@ from tse_normalization import (
     build_video_only_youtube_link,
     build_timestamped_youtube_link,
     canonicalize_numero_processo,
+    composicao_regimental_issue,
+    is_regimentally_valid_composicao,
     normalize_advogados_list,
     normalize_classe_processo,
     normalize_eleicao_value,
@@ -229,3 +231,59 @@ def test_normalize_advogados_list_propagates_shared_suffix_after_conjunction_spl
         "Dr. João da Silva (pelo recorrente), "
         "Dra. Maria Souza (pelo recorrente)"
     )
+
+
+_COMPOSICAO_PLENA_3_2_2 = [
+    "Min. Cármen Lúcia",
+    "Min. André Mendonça",
+    "Min. Nunes Marques",
+    "Min. Isabel Gallotti",
+    "Min. Antônio Carlos Ferreira",
+    "Min. Floriano de Azevedo Marques",
+    "Min. Ramos Tavares",
+]
+
+
+def test_composicao_regimental_issue_accepts_full_3_2_2_bench():
+    assert composicao_regimental_issue(_COMPOSICAO_PLENA_3_2_2) == ""
+    assert is_regimentally_valid_composicao(_COMPOSICAO_PLENA_3_2_2) is True
+
+
+def test_composicao_regimental_issue_tolerates_single_unrostered_minister():
+    # Fix #2a: 7 nomes com 1 ministro fora do roster (recem-empossado/substituto)
+    # continua sendo uma bancada aproveitavel: nao deve disparar issue.
+    bench = _COMPOSICAO_PLENA_3_2_2[:-1] + ["Min. Joaquim Pereira Lima"]
+    assert composicao_regimental_issue(bench) == ""
+    # Mas nao e uma plenaria regimental "perfeita" (3,2,2,0) para fins de auditoria.
+    assert is_regimentally_valid_composicao(bench) is False
+
+
+def test_composicao_regimental_issue_flags_two_or_more_unrostered():
+    bench = _COMPOSICAO_PLENA_3_2_2[:-2] + [
+        "Min. Joaquim Pereira Lima",
+        "Min. Tadeu Soares Quintino",
+    ]
+    assert composicao_regimental_issue(bench) == "unknown_institution"
+
+
+def test_composicao_regimental_issue_flags_size_bounds():
+    assert composicao_regimental_issue(_COMPOSICAO_PLENA_3_2_2 + ["Min. Excedente Extra"]) == "gt7"
+    assert composicao_regimental_issue(_COMPOSICAO_PLENA_3_2_2[:5]) == "lt6"
+
+
+def test_composicao_regimental_issue_flags_category_excess():
+    contaminated = [
+        "Min. Rosa Weber",
+        "Min. Luís Roberto Barroso",
+        "Min. Jorge Mussi",
+        "Min. Og Fernandes",
+        "Min. Tarcísio Vieira de Carvalho Neto",
+        "Min. Sérgio Banhos",
+        "Min. Admar Gonzaga",
+    ]
+    assert composicao_regimental_issue(contaminated) == "category_excess"
+
+
+def test_composicao_regimental_issue_accepts_valid_six_member_bench():
+    assert composicao_regimental_issue(_COMPOSICAO_PLENA_3_2_2[:6]) == ""
+    assert is_regimentally_valid_composicao(_COMPOSICAO_PLENA_3_2_2[:6]) is False

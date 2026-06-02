@@ -1598,9 +1598,16 @@ def composicao_regimental_issue(values: Iterable[str] | str) -> str:
     counts = composicao_institution_counts(normalized)
     if counts["STF"] > 3 or counts["STJ"] > 2 or counts["JURISTA"] > 2:
         return "category_excess"
-    if count == 7 and counts["DESCONHECIDO"]:
+    # Tolera ate UM unico ministro nao classificado no roster (tipicamente um
+    # ministro recem-empossado/substituto, ou uma grafia ainda sem alias): a
+    # bancada de 7 continua aproveitavel. So sinaliza quando ha 2+ desconhecidos.
+    if count == 7 and counts["DESCONHECIDO"] >= 2:
         return "unknown_institution"
-    if count == 7 and (counts["STF"], counts["STJ"], counts["JURISTA"]) != (3, 2, 2):
+    # So acusa distribuicao incorreta quando TODOS os 7 nomes sao reconhecidos. Com
+    # 1 desconhecido nao da para afirmar que a distribuicao esta errada: o nome fora
+    # do roster pode justamente ocupar a vaga aparentemente faltante (e qualquer
+    # desvio real de (3,2,2) sem desconhecidos ja teria caido em category_excess).
+    if count == 7 and counts["DESCONHECIDO"] == 0 and (counts["STF"], counts["STJ"], counts["JURISTA"]) != (3, 2, 2):
         return "distribution"
     return ""
 
