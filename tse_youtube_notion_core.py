@@ -3715,6 +3715,15 @@ def _normalize_news_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def coerce_record_text(value: Any) -> str:
+    """Texto de um campo de registro do editor para colunas rich_text. Junta listas por
+    ', ' em vez de gerar o repr da lista — evita ruído tipo "['a', 'b']" gravado na
+    célula quando o valor chega como lista."""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "")
+
+
 def _coerce_gemini_response_model(response_model: type[BaseModel], response_text: str) -> BaseModel:
     model_name = response_model.__name__
     if not normalize_model_text(response_text):
@@ -3813,11 +3822,11 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
             advogados=parse_multi_value_text(record.get("advogados", "")),
             composicao=parse_multi_value_text(record.get("composicao", "")),
             punchline=str(record.get("punchline", "") or ""),
-            analise_do_conteudo_juridico=str(record.get("analise_do_conteudo_juridico", "") or ""),
-            fundamentacao_normativa=str(record.get("fundamentacao_normativa", "") or ""),
-            precedentes_citados=str(record.get("precedentes_citados", "") or ""),
-            raciocinio_juridico=str(record.get("raciocinio_juridico", "") or ""),
-            resolucoes_citadas=str(record.get("resolucoes_citadas", "") or ""),
+            analise_do_conteudo_juridico=coerce_record_text(record.get("analise_do_conteudo_juridico")),
+            fundamentacao_normativa=coerce_record_text(record.get("fundamentacao_normativa")),
+            precedentes_citados=coerce_record_text(record.get("precedentes_citados")),
+            raciocinio_juridico=coerce_record_text(record.get("raciocinio_juridico")),
+            resolucoes_citadas=coerce_record_text(record.get("resolucoes_citadas")),
             materia_semelhante=parse_multi_value_text(record.get("materia_semelhante", "")),
             noticia_TSE=str(record.get("noticia_TSE", "") or ""),
             noticia_TRE=str(record.get("noticia_TRE", "") or ""),

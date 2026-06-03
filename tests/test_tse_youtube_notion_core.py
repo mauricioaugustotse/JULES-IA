@@ -712,6 +712,18 @@ def test_enrich_preview_rows_with_cnj(monkeypatch):
     assert out[2].classe_processo == "REspe"
 
 
+def test_coerce_record_text_joins_lists_without_repr():
+    f = core.coerce_record_text
+    # lista -> itens juntados por ', ' (sem colchetes/aspas do repr)
+    assert f(["Resolução TSE 23.520/2017", "Resolução TSE 23.422/2014"]) == "Resolução TSE 23.520/2017, Resolução TSE 23.422/2014"
+    assert f(["só um item"]) == "só um item"
+    assert f([" a ", "", "  ", "b"]) == "a, b"  # ignora vazios e apara
+    # strings/None passam direto
+    assert f("texto simples") == "texto simples"
+    assert f(None) == ""
+    assert f("") == ""
+
+
 def test_is_non_news_system_url_rejects_databases_and_viewers():
     f = core.is_non_news_system_url
     # índice temático de jurisprudência e visualizador de processo (PJe) -> nunca notícia
