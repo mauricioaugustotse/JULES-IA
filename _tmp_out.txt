@@ -1,0 +1,17 @@
+NUMERO: 0001554-73
+
+CLASSE: RPP
+
+TEMA: Adequação estatutária de partido político às normas de transparência e governança
+
+VOTACAO: Unânime
+
+==== ANALISE ====
+O processo trata do registro de alterações estatutárias formuladas pelo Diretório Nacional do Partido Democratas. O relator, Ministro André Mendonça, analisa o cumprimento de cinco determinações impostas anteriormente pela Corte Superior, visando a adequação do estatuto partidário. As determinações incluíam: a criação de mecanismos de contraditório e ampla defesa para órgãos partidários afetados por intervenções; a eliminação de requisitos desproporcionais para órgãos provisórios; a inserção de disciplina específica sobre violência política contra a mulher; o esclarecimento sobre a ausência de artigos específicos no texto estatutário; e o ajuste na redação do artigo 96 para renomear o órgão 
+
+==== RACIOCINIO ====
+O relator aplicou o entendimento do STF na ADI 5785 para limitar a duração dos órgãos provisórios a quatro anos, rejeitando a redação anterior que não observava esse limite. Além disso, fundamentou a necessidade de ajuste estatutário para garantir que a contribuição financeira partidária seja expressamente classificada como voluntária, em conformidade com a autonomia partidária e a legislação vigente.
+
+==== PUNCHLINE ====
+O TSE deferiu parcialmente o registro de alterações estatutárias, determinando que o partido limite a duração de órgãos provisórios a quatro anos, conforme jurisprudência do STF, e explicite o caráter voluntário das contribuições financeiras para garantir a conformidade legal.
+

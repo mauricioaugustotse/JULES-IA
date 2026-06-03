@@ -350,10 +350,16 @@ PARTY_PLACEHOLDER_REGEX = re.compile(
     r"n[ãa]o\s+especificad\w*|"
     r"n[ãa]o\s+informad\w*|"
     r"n[ãa]o\s+identificad\w*|"
+    r"n[ãa]o\s+mencionad\w*|"
+    r"n[ãa]o\s+consta\w*|"
+    r"n[ãa]o\s+declarad\w*|"
+    r"n[ãa]o\s+aplic[aá]ve\w*|"
+    r"n[ãa]o\s+h[áa]\b.*|"
     r"desconhecid\w*|"
     r"ignorado\w*|"
     r"sem\s+identifica[cç][aã]o|"
-    r"sem\s+informa[cç][aã]o"
+    r"sem\s+informa[cç][aã]o|"
+    r"n/?a"
     r")\s*$"
 )
 PARTY_PROCESSUAL_ROLE_MAP = {
@@ -613,28 +619,46 @@ def _normalize_party_role_label(value: str) -> str:
     return PARTY_PROCESSUAL_ROLE_MAP.get(normalized, value.strip())
 
 
-_ROLE_ONLY_TOKENS = {
-    "candidato", "candidata", "candidatos", "candidatas", "deputado", "deputada",
-    "federal", "estadual", "distrital", "vereador", "vereadora", "prefeito", "prefeita",
-    "vice", "governador", "governadora", "senador", "senadora", "suplente", "presidente",
-    "conselheiro", "conselheira", "do", "da", "de", "e", "cargo", "ao", "a", "o", "os", "as",
+_ROLE_TITLE_TOKENS = {
+    "candidato", "candidata", "candidatos", "candidatas",
+    "prefeito", "prefeita", "prefeitos", "prefeitas",
+    "vice", "vereador", "vereadora", "vereadores", "vereadoras",
+    "deputado", "deputada", "deputados", "deputadas", "federal", "estadual", "distrital",
+    "governador", "governadora", "senador", "senadora",
+    "conselheiro", "conselheira", "suplente", "suplentes", "presidente", "presidenta", "chefe",
 }
+_ROLE_LEADING_TOKENS = _ROLE_TITLE_TOKENS | {"e", "a", "ao", "o", "os", "as", "cargo"}
+_PLACE_LEADING_TOKENS = {"de", "do", "da", "dos", "das", "em", "no", "na", "nos", "nas"}
 
 
 def is_descriptive_role_noise(value: str) -> bool:
-    """True quando o valor é uma FRASE DESCRITIVA de cargo/candidatura, não um nome
-    de pessoa (ex.: 'Candidato ao cargo de Deputado Estadual de Roraima nas eleições
-    2018', 'Deputado Federal e Vereador'). Não considera ruído entidades como
-    'Município de ...' ou nomes próprios com sufixo de papel."""
+    """True quando o valor é uma FRASE DESCRITIVA de cargo/candidatura, sem nome de
+    pessoa (ex.: 'Candidato ao cargo de Deputado...', 'Prefeito e Vice-Prefeito de
+    Baixo Guandu/ES', 'Deputado Federal e Vereador'). NÃO considera ruído nomes
+    próprios com cargo ('Prefeito João Silva') nem entidades ('Município de ...')."""
     norm = normalize_class_text(value)
     if not norm:
         return False
     if re.search(r"\b(ao cargo de|nas eleicoes|na eleicao de)\b", norm):
         return True
-    if re.match(r"^candidat[oa]s?\s+a[o]?\s+(cargo|vereador|prefeit|deputad|governador|senador|presiden|chefe|conselheir|membro)", norm):
-        return True
+    # Referência a instituição (tribunal, TRE, OAB, ministério, federação...) é parte
+    # legítima — ex.: 'Presidente do TRE-RR (autoridade coatora)'. Não expurga.
+    if re.search(r"\b(tribunal|tre|tse|stf|stj|oab|incra|minist[eé]rio|procuradoria|conselho|assembleia|federa[cç])\b", norm):
+        return False
     tokens = norm.split()
-    return bool(tokens) and all(token in _ROLE_ONLY_TOKENS for token in tokens)
+    index = 0
+    started_with_role = False
+    while index < len(tokens) and tokens[index] in _ROLE_LEADING_TOKENS:
+        if tokens[index] in _ROLE_TITLE_TOKENS:
+            started_with_role = True
+        index += 1
+    if not started_with_role:
+        return False
+    remaining = tokens[index:]
+    if not remaining:
+        return True  # só cargos/conectores (ex.: 'Deputado Federal e Vereador')
+    # cargo seguido de "de <lugar>" (ex.: 'Prefeito ... de Baixo Guandu') é descrição.
+    return remaining[0] in _PLACE_LEADING_TOKENS
 
 
 def standardize_tribunal_party_name(value: str) -> str:

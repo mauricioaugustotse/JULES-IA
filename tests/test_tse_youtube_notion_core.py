@@ -682,6 +682,85 @@ def test_enrich_preview_rows_with_youtube_chapters(monkeypatch):
     assert out[1].youtube_link.endswith("&t=10")
 
 
+def test_enrich_preview_rows_with_cnj(monkeypatch):
+    import cnj_datajud
+    from cnj_datajud import CnjProcess
+
+    def fake_lookup(numero, tribunal="", year="", session=None):
+        digits = "".join(c for c in str(numero) if c.isdigit())
+        if digits.startswith("0600785"):
+            return CnjProcess(numero_completo="0600785-21.2024.6.08.0007", classe_sigla="")
+        if digits.startswith("0601084"):
+            return CnjProcess(numero_completo="0601084-84.2024.6.19.0138", classe_sigla="AREspe")
+        return None
+
+    monkeypatch.setattr(cnj_datajud, "lookup_process", fake_lookup)
+    rows = [
+        PublishPreviewRow(numero_processo="0600785-21", classe_processo="RO"),
+        PublishPreviewRow(numero_processo="0601084-84", classe_processo="PA"),
+        PublishPreviewRow(numero_processo="0600061-71", classe_processo="REspe"),
+    ]
+    out = core.enrich_preview_rows_with_cnj(rows)
+    # numero curto completado para o CNJ de 20 dígitos; classe específica preservada
+    assert out[0].numero_processo == "0600785-21.2024.6.08.0007"
+    assert out[0].classe_processo == "RO"
+    # 'PA' corrigido para a classe oficial do CNJ e numero completado
+    assert out[1].numero_processo == "0601084-84.2024.6.19.0138"
+    assert out[1].classe_processo == "AREspe"
+    # sem correspondência no CNJ -> registro inalterado
+    assert out[2].numero_processo == "0600061-71"
+    assert out[2].classe_processo == "REspe"
+
+
+def test_is_non_news_system_url_rejects_databases_and_viewers():
+    f = core.is_non_news_system_url
+    # índice temático de jurisprudência e visualizador de processo (PJe) -> nunca notícia
+    assert f("https://temasselecionados.tse.jus.br/temas-selecionados/inelegibilidades-e-condicoes-de-elegibilidade/parte-iii-procedimentos-judiciais/representacao-ou-investigacao-judicial-eleitoral") is True
+    assert f("https://consultaunificadapje.tse.jus.br/consulta-publica-unificada/documento?extensaoArquivo=text/html&path=regional/mg/2024/10/14/17/7/15/abc") is True
+    assert f("https://pje.tre-mg.jus.br/consulta/documento?id=123") is True
+    assert f("https://divulgacandcontas.tse.jus.br/divulga/") is True
+    # bases/viewers/portais adicionais detectados na auditoria da base
+    assert f("https://sadppush.tse.jus.br/sadpPush/ExibirDadosProcesso.do?nprot=1220") is True
+    assert f("https://sessoespub.tre-rs.jus.br/votos/29434/show_text?membro_id=10026") is True
+    assert f("https://apps.tre-go.jus.br/internet/verba-legis/2017/Artigos-07") is True
+    assert f("https://resultados.tre-rs.jus.br/eleicoes/2020/426/cand_11_13.html") is True
+    # matéria real de imprensa institucional (host canônico TSE/TRE) ou geral -> mantida
+    assert f("https://www.tse.jus.br/comunicacao/noticias/2026/Fevereiro/tse-aprova-sete-resolucoes") is False
+    assert f("https://www.tre-sp.jus.br/comunicacao/noticias/2024/Agosto/tre-sp-recomenda") is False
+    assert f("https://g1.globo.com/politica/noticia/2024/caso") is False
+    # revistas institucionais/acadêmicas e subdomínios não-canônicos .jus.br -> sistema
+    assert f("https://resenhaeleitoral.tre-sc.jus.br/revista/article/view/43") is True
+    assert f("https://seer.ufrgs.br/index.php/revista/article/view/123") is True
+
+
+def test_classify_news_urls_drops_system_databases():
+    tse, tre, geral = core.classify_news_urls([
+        "https://temasselecionados.tse.jus.br/temas-selecionados/parte-iii/representacao",
+        "https://consultaunificadapje.tse.jus.br/consulta-publica-unificada/documento?path=x",
+        "https://www.tse.jus.br/comunicacao/noticias/2026/Fevereiro/tse-aprova-sete-resolucoes",
+    ])
+    # os dois links de sistema somem; só a matéria real fica em TSE
+    assert tse == ["https://www.tse.jus.br/comunicacao/noticias/2026/Fevereiro/tse-aprova-sete-resolucoes"]
+    assert tre == []
+    assert geral == []
+    # e a checagem institucional também os trata como genéricos/descartáveis
+    assert core.is_generic_institutional_news_url("https://temasselecionados.tse.jus.br/temas-selecionados/x") is True
+
+
+def test_is_generic_institutional_news_url_filters_sections_not_articles():
+    g = core.is_generic_institutional_news_url
+    # seções/índices genéricos do domínio eleitoral -> expurgar
+    assert g("https://www.tre-es.jus.br/jurisprudencia/decisoes-em-destaque/decisoes-por-anos-e-assunto") is True
+    assert g("https://www.tse.jus.br/comunicacao/noticias") is True
+    assert g("https://www.tse.jus.br/comunicacao/noticias/2026") is True
+    assert g("https://www.tse.jus.br/institucional/ministros/agenda/agenda-do-ministro") is True
+    # matéria específica -> manter, mesmo com "resolucoes"/"consulta" no slug
+    assert g("https://www.tse.jus.br/comunicacao/noticias/2026/Fevereiro/tse-aprova-sete-resolucoes") is False
+    assert g("https://www.tre-mg.jus.br/comunicacao/noticias/2024/caso-especifico") is False
+    # imprensa geral (não-jus) não é institucional genérica
+    assert g("https://g1.globo.com/politica/noticia/2024/caso") is False
+
+
 def test_classe_is_specificity_downgrade_guards_internal_recourse():
     assert core.classe_is_specificity_downgrade("ED-AgRg-AREspe", "AgRg-AREspe") is True
     assert core.classe_is_specificity_downgrade("AgRg-REspe", "REspe") is True

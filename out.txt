@@ -1,0 +1,10 @@
+numero: 140-73
+classe: REspe
+votacao_atual: ''
+resultado: Provido
+---PUNCHLINE---
+O Tribunal proveu o recurso para determinar o recebimento da denúncia, aplicando o princípio in dubio pro societate para garantir que a instrução processual permita a apuração da autoria e materialidade delitiva na esfera penal.
+---ANALISE---
+O ministro relator Napoleão Nunes Maia Filho anuncia o julgamento do Recurso Especial Eleitoral (REspe) 14073, oriundo de Piracuruca, Piauí, envolvendo o MPE como recorrente e Raimundo Alves Filho como recorrido.
+---RACIOCINIO---
+O relator aplica o princípio 'in dubio pro societate', entendendo que, diante da dúvida sobre a autoria e materialidade, a denúncia deve ser recebida para que a instrução processual ocorra e a verdade dos fatos seja apurada na esfera penal.

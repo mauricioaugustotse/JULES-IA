@@ -30,6 +30,7 @@ from tse_youtube_notion_core import (
     enrich_preview_rows_with_news,
     enrich_preview_rows_with_process_metadata,
     enrich_preview_rows_with_theme_punchline,
+    enrich_preview_rows_with_cnj,
     enrich_preview_rows_with_youtube_chapters,
     extract_youtube_video_id,
     normalize_youtube_link,
@@ -152,6 +153,13 @@ def process_single_video(
     rows = enrich_preview_rows_with_youtube_chapters(
         rows,
         youtube_url=video.url,
+        notion_schema=notion_schema,
+        logger=LOGGER,
+    )
+
+    progress("enriquecendo via CNJ DataJud")
+    rows = enrich_preview_rows_with_cnj(
+        rows,
         notion_schema=notion_schema,
         logger=LOGGER,
     )

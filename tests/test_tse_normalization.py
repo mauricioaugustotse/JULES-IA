@@ -55,9 +55,15 @@ def test_standardize_tribunal_party_name_maps_state_to_uf():
 def test_normalize_party_entry_drops_role_noise_and_standardizes_tribunal():
     assert normalize_party_entry("Candidato ao cargo de Deputado Estadual de Roraima nas eleições 2018") == ""
     assert normalize_party_entry("Deputado Federal e Vereador") == ""
+    assert normalize_party_entry("Prefeito e Vice-Prefeito de Baixo Guandu/ES") == ""
+    assert normalize_party_entry("Não mencionado") == ""
+    assert normalize_party_entry("N/A") == ""
     assert normalize_party_entry("Tribunal Regional Eleitoral de Sergipe (TRE-SE)") == "TRE/SE"
-    # entidade legítima (município) é preservada
+    # entidades/pessoas legítimas são preservadas
     assert normalize_party_entry("Município de Governador Edison Lobão") == "Município de Governador Edison Lobão"
+    assert normalize_party_entry("Prefeito João Silva") == "Prefeito João Silva"
+    # autoridade coatora referenciando tribunal permanece (parte legítima)
+    assert normalize_party_entry("Presidente do TRE-RR (autoridade coatora)") == "Presidente do TRE-RR (autoridade coatora)"
 
 
 def test_normalize_classe_processo_preserves_agravo_regimental_official_abbrev():

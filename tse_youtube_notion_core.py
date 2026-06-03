@@ -287,13 +287,17 @@ def call_gemini_generate_content_rest(
     use_google_search: bool = False,
     timeout_seconds: int = DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
 ) -> tuple[BaseModel, str, dict[str, Any]]:
+    generation_config: dict[str, Any] = {"temperature": temperature}
+    # IMPORTANTE: o Gemini DESABILITA o Grounding with Google Search quando o output
+    # é forçado para JSON (responseMimeType). Em chamadas grounded, omitimos o
+    # responseMimeType para a busca realmente rodar; os URLs vêm do groundingMetadata
+    # e da extração de URLs do texto (ver _coerce_gemini_response_model).
+    if not use_google_search:
+        generation_config["responseMimeType"] = "application/json"
     payload: dict[str, Any] = {
         "contents": contents,
         "systemInstruction": {"parts": [{"text": system_instruction}]},
-        "generationConfig": {
-            "temperature": temperature,
-            "responseMimeType": "application/json",
-        },
+        "generationConfig": generation_config,
     }
     if use_google_search:
         payload["tools"] = [{"googleSearch": {}}]
@@ -483,6 +487,8 @@ ORIENTAÇÕES OBRIGATÓRIAS POR CAMPO:
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 - `classe_processo`: leia a classe processual exatamente como aparece na autuação/cabeçalho exibido na tela e no pregão do caso (ex.: "AgR-AREspe nº 0601309-60"). Capture a classe COMPLETA, preservando os prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED), antes da classe-base. Não reduza um "AgR-AREspe" a "AREspe" nem um "ED-REspe" a "REspe". Se houver agravo regimental sendo julgado pelo colegiado contra decisão monocrática, a classe é a forma com AgRg-. Se a tela não exibir a classe com clareza, deixe o campo vazio em vez de adivinhar a classe-base.
 - `origem`: informe o MUNICÍPIO de origem do processo no formato "Cidade/UF" (ex.: "Santo Antônio do Tauá/PA"), tal como citado no caso. Não preencha origem com o tribunal ("Tribunal Regional Eleitoral do Pará", "TRE-PA") nem com a capital do estado quando o município específico aparecer no vídeo; o nome do tribunal de origem pertence a outro contexto, não à coluna origem.
+- `resultado_final`: registre SEMPRE o desfecho objetivo proclamado para este processo, conforme a classe. Recurso (REspe/AREspe/RO/AgRg-*/RHC/RMS): "Provido", "Desprovido", "Provido em parte", "Não conhecido"/"Não conhecida", "Prejudicado". Consulta: "Aprovada" (consulta respondida). Lista tríplice formada/encaminhada: "Aprovada". Prestação de contas: "Aprovada"/"Aprovada com ressalvas"/"Rejeitada". Registro (RPP/RCand/DRAP): "Deferido"/"Indeferido". Representação/AIJE: "Procedente"/"Procedente em parte"/"Improcedente". Use o gênero correto (recurso=masculino; consulta/contas=feminino). Se o julgamento foi suspenso por pedido de vista, use "Suspenso por vista". Não deixe vazio quando o presidente proclamar o resultado.
+- `votacao`: registre como o colegiado votou — "Unânime" (decidido sem divergência; ninguém vencido), "Por maioria" (houve voto vencido/divergência aberta/"X votos a Y") ou "Suspenso" (julgamento suspenso por pedido de vista e ainda NÃO decidido). COERÊNCIA com o resultado: se o resultado for um desfecho definitivo, a votação é "Unânime" ou "Por maioria" — nunca "Suspenso". A simples menção a um pedido de vista anterior não torna a votação "Suspenso" se o caso foi efetivamente julgado.
 """
 
 TRANSCRIPT_DETAIL_SYSTEM_PROMPT = """
@@ -506,13 +512,16 @@ TAREFA:
 """
 
 NEWS_ENRICHMENT_SYSTEM_PROMPT = """
-Você é um pesquisador jurídico-eleitoral.
+Você é um pesquisador jurídico-eleitoral especializado em localizar a COBERTURA jornalística de um julgamento específico do TSE.
 
 TAREFA:
-- Use exclusivamente o Grounding with Google Search para localizar notícias públicas relacionadas ao mesmo caso, decisão ou sessão informada.
-- Não invente URLs.
-- Só retorne links claramente relacionados ao mesmo item processual, julgamento ou sessão.
-- Se não houver notícia confiável, retorne listas vazias.
+- Use exclusivamente o Grounding with Google Search. Ancore a busca no número do processo, nas partes, no tema e na data da sessão informados.
+- Procure ativamente, no MESMO caso, em TRÊS frentes e devolva cada uma no seu campo:
+  - noticia_TSE: matéria do portal do próprio TSE (tse.jus.br/comunicacao/noticias) sobre este julgamento.
+  - noticia_TRE: matéria do Tribunal Regional Eleitoral de ORIGEM (tre-XX.jus.br, da UF do caso) sobre este caso, quando houver.
+  - noticia_geral: matérias da imprensa (G1, Folha, Estadão, O Globo, UOL, ConJur, JOTA, Migalhas, Poder360, Metrópoles, agências regionais) sobre este caso específico.
+- Não invente URLs nem retorne páginas genéricas (home, índice de notícias, busca). Só links claramente do MESMO caso/processo.
+- Se uma frente não tiver matéria confiável, devolva lista vazia para ela. É melhor vazio do que um link impertinente.
 """
 
 PROCESS_METADATA_SYSTEM_PROMPT = """
@@ -2391,6 +2400,72 @@ def enrich_preview_rows_with_youtube_chapters(
     return rows
 
 
+def enrich_preview_rows_with_cnj(
+    rows: list["PublishPreviewRow"],
+    notion_schema: Optional["NotionDataSourceSchema"] = None,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> list["PublishPreviewRow"]:
+    """Enriquece os preview rows com os dados oficiais do CNJ DataJud (fonte pública dos
+    tribunais): completa ``numero_processo`` para o CNJ de 20 dígitos quando consistente
+    com o número atual (mesmo prefixo NNNNNNN+DD) e preenche ``classe_processo`` quando
+    vazia/'PA' (sem rebaixar AgRg-*/ED-*). Não altera origem (o órgão julgador do CNJ é a
+    sede da zona eleitoral, que difere do município do caso) nem partes/advogados
+    (indisponíveis na API pública por LGPD). Integrado ao fluxo principal para que novas
+    extrações já saiam com o número/classe oficiais sem reparos posteriores."""
+    if not rows:
+        return rows
+    try:
+        import requests
+
+        from cnj_datajud import format_cnj_number, lookup_process
+    except Exception as exc:  # pragma: no cover - dependência opcional
+        if logger:
+            logger.warning("CNJ DataJud indisponível: %s", exc)
+        return rows
+    valid_classes: Optional[set[str]] = None
+    if notion_schema is not None:
+        prop = notion_schema.raw_payload.get("properties", {}).get("classe_processo", {})
+        valid_classes = {
+            str(option.get("name", "")).strip()
+            for option in prop.get("select", {}).get("options", []) or []
+            if str(option.get("name", "")).strip()
+        }
+    session = requests.Session()
+    applied_num = 0
+    applied_classe = 0
+    for row in rows:
+        try:
+            info = lookup_process(
+                row.numero_processo,
+                tribunal=row.tribunal,
+                year=str(row.data_sessao or "")[:4],
+                session=session,
+            )
+        except Exception as exc:  # pragma: no cover - rede
+            if logger:
+                logger.warning("Falha no lookup CNJ de %s: %s", row.numero_processo, exc)
+            continue
+        if not info:
+            continue
+        cur_digits = re.sub(r"\D", "", str(row.numero_processo or ""))
+        cnj_digits = re.sub(r"\D", "", info.numero_completo)
+        if len(cnj_digits) == 20 and 9 <= len(cur_digits) < 20 and cnj_digits.startswith(cur_digits[:9]):
+            formatted = format_cnj_number(cnj_digits)
+            if formatted and formatted != row.numero_processo:
+                row.numero_processo = formatted
+                applied_num += 1
+        sigla = info.classe_sigla
+        if sigla and (valid_classes is None or sigla in valid_classes):
+            current = str(row.classe_processo or "")
+            if (not current or current == "PA") and sigla != current and not classe_is_specificity_downgrade(current, sigla):
+                row.classe_processo = sigla
+                applied_classe += 1
+    if logger and (applied_num or applied_classe):
+        logger.info("CNJ DataJud: numero completado em %s, classe preenchida em %s.", applied_num, applied_classe)
+    return rows
+
+
 def format_transcript_snippet(snippet: TranscriptSnippet) -> str:
     return f"[{snippet.start_seconds}s-{snippet.end_seconds}s] {snippet.text}"
 
@@ -2619,9 +2694,13 @@ def resolve_grounding_redirect_url(url: str) -> str:
             headers={"User-Agent": "Mozilla/5.0"},
         )
         resolved = normalize_external_url(response.url)
-        return resolved or normalized
+        # Só aceita se o redirect realmente resolveu para um destino real; um redirect
+        # de grounding não resolvido (continua em vertexaisearch) é lixo, descarta.
+        if resolved and domain_from_url(resolved) != "vertexaisearch.cloud.google.com":
+            return resolved
+        return ""
     except Exception:
-        return normalized
+        return ""
 
 
 def _best_effort_response_text(response: Any) -> str:
@@ -2685,6 +2764,52 @@ def page_looks_not_found(*, status_code: int, final_url: str, text: str) -> bool
     return "/error/" in lowered_url or lowered_url.endswith("/404")
 
 
+# Subdomínios/sistemas que são base de dados, visualizador de processo (PJe), consulta
+# processual ou índice temático de jurisprudência — NUNCA são matéria de imprensa,
+# independentemente do path. Casado por FRAGMENTO no host (cobre www./qualquer prefixo).
+# Nomes distintivos: valem para qualquer TLD.
+_NON_NEWS_SYSTEM_HOST_FRAGMENTS = (
+    "temasselecionados",   # índice temático de jurisprudência (TSE)
+    "consultaunificada",   # consulta processual unificada
+    "pje",                 # Processo Judicial Eletrônico (visualizador de documento)
+    "consultapublica",     # consulta pública processual
+    "consultaprocessual",
+    "divulgacand",         # DivulgaCand (resultados/contas de campanha)
+    "sjur",                # sistema de jurisprudência
+    "jurisprudencia.",     # subdomínio de jurisprudência
+    "inteiroteor",         # visualizador de inteiro teor de acórdão
+    "sadp",                # SADP — visualizador de dados do processo (ExibirDadosProcesso)
+    "sessoespub",          # visualizador público de votos/sessões
+    "seer.",               # plataforma de revista acadêmica (SEER/OJS, ex.: seer.ufrgs.br)
+    "periodicos.",         # portal de periódicos acadêmicos
+)
+
+
+def _is_canonical_electoral_news_host(host: str) -> bool:
+    """True para os hosts canônicos que publicam imprensa eleitoral: ``tse.jus.br`` e
+    ``tre-XX.jus.br`` (com ou sem ``www.``)."""
+    bare = host[4:] if host.startswith("www.") else host
+    return bare == "tse.jus.br" or bool(re.fullmatch(r"tre-[a-z]{2}\.jus\.br", bare))
+
+
+def is_non_news_system_url(url: str) -> bool:
+    """True quando a URL é de um SISTEMA/base — visualizador de processo/PJe, consulta
+    processual, dados de resultado, portal de aplicativo, índice temático de
+    jurisprudência ou revista institucional/acadêmica — em vez de matéria de imprensa.
+    Em ``.jus.br`` apenas os hosts canônicos (``tse.jus.br``/``tre-XX.jus.br``) publicam
+    imprensa; qualquer outro subdomínio (``temasselecionados``, ``consultaunificadapje``,
+    ``sadppush``, ``apps``, ``sessoespub``, ``resultados``, ``resenhaeleitoral``...) é
+    sistema. Fora de ``.jus.br``, casa fragmentos distintivos (PJe, SEER, periódicos)."""
+    host = domain_from_url(normalize_external_url(url))
+    if not host:
+        return False
+    if any(fragment in host for fragment in _NON_NEWS_SYSTEM_HOST_FRAGMENTS):
+        return True
+    if host.endswith(".jus.br") and not _is_canonical_electoral_news_host(host):
+        return True
+    return False
+
+
 def classify_news_urls(urls: list[str]) -> tuple[list[str], list[str], list[str]]:
     tse_urls: list[str] = []
     tre_urls: list[str] = []
@@ -2693,6 +2818,8 @@ def classify_news_urls(urls: list[str]) -> tuple[list[str], list[str], list[str]
     for url in normalize_external_url_list(urls):
         domain = domain_from_url(url)
         if not domain:
+            continue
+        if is_non_news_system_url(url):
             continue
         if TSE_DOMAIN_RE.search(domain):
             tse_urls.append(url)
@@ -2893,12 +3020,46 @@ def is_general_news_url_relevant(url: str, row: "PublishPreviewRow") -> bool:
 def filter_general_news_urls(urls: list[str], row: "PublishPreviewRow") -> list[str]:
     accepted: list[str] = []
     for url in normalize_external_url_list(urls):
+        if is_non_news_system_url(url):
+            continue
         if is_general_news_url_relevant(url, row):
             accepted.append(url)
     return dedupe_preserve_order(accepted)
 
 
+# Seções (segmentos de caminho) do domínio eleitoral que NÃO são matéria sobre o
+# caso (jurisprudência, decisões em destaque/por ano/assunto, busca, agenda, normas,
+# transparência...). Casado por SEGMENTO inteiro (não substring) para não pegar
+# palavras dentro do slug de uma matéria válida (ex.: ".../tse-aprova-resolucoes").
+_GENERIC_INSTITUTIONAL_SECTIONS = {
+    "jurisprudencia",
+    "institucional",
+    "eleicoes",
+    "transparencia",
+    "servicos",
+    "biblioteca",
+    "sjur",
+    "pesquisa",
+    "busca",
+    "consulta",
+    "acordaos",
+    "sumulas",
+    "normas",
+    "legislacao",
+    "agenda",
+    "publicacoes",
+    "corregedoria",
+    "gestao",
+}
+
+
 def is_generic_institutional_news_url(url: str) -> bool:
+    """True quando a URL institucional eleitoral (TSE/TRE) é uma página de
+    seção/índice (jurisprudência, decisões por ano/assunto, busca, agenda, normas,
+    home, listagem por ano) — NÃO uma matéria específica do caso. Demais URLs ficam
+    a cargo da checagem de relevância de conteúdo."""
+    if is_non_news_system_url(url):
+        return True
     parsed = urlparse(normalize_external_url(url))
     host = (parsed.netloc or "").lower()
     path = re.sub(r"/+", "/", parsed.path or "/").rstrip("/").lower()
@@ -2907,7 +3068,16 @@ def is_generic_institutional_news_url(url: str) -> bool:
     is_electoral_domain = host in {"tse.jus.br", "www.tse.jus.br"} or host.startswith("www.tre-") or host.startswith("tre-")
     if not is_electoral_domain:
         return False
-    return path in {"", "/", "/comunicacao", "/comunicacao/noticias"}
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments:
+        return True
+    if any(segment in _GENERIC_INSTITUTIONAL_SECTIONS or segment.startswith("decisoes") for segment in segments):
+        return True
+    # Índice de notícias/imprensa, seção raiz, ou listagem por ano.
+    last_segment = segments[-1]
+    if last_segment in {"noticias", "comunicacao", "imprensa", "todas"} or last_segment.isdigit():
+        return True
+    return False
 
 
 def filter_relevant_institutional_news_urls(
@@ -3557,6 +3727,16 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
     try:
         payload = json.loads(response_text)
     except Exception:
+        # Respostas grounded (Google Search) vêm como TEXTO, não JSON. Para os modelos
+        # de busca, extrai os URLs do próprio texto (o restante vem do groundingMetadata)
+        # em vez de falhar o parsing.
+        if model_name in {"NewsEnrichmentResult", "InstitutionalRepairResult"}:
+            text_urls = re.findall(r"https?://[^\s)>\]\"'}]+", response_text or "")
+            if model_name == "NewsEnrichmentResult":
+                return response_model.model_validate({"noticia_geral": text_urls})
+            return response_model.model_validate({"urls": text_urls})
+        if model_name == "ProcessMetadataResult":
+            return response_model.model_validate({})
         return response_model.model_validate_json(response_text)
 
     if isinstance(payload, list):
@@ -4798,10 +4978,15 @@ class GeminiNewsEnricher:
                 enriched_rows.append(reused)
                 continue
 
+            uf = extract_uf_from_text(row.origem) or extract_uf_from_text(row.tribunal)
+            tre_hint = f"tre-{uf.lower()}.jus.br" if uf else "tre-XX.jus.br"
             prompt = (
-                "Busque notícias públicas sobre o mesmo item processual, julgamento ou sessão abaixo.\n"
-                "Priorize notícias institucionais do TSE, depois TREs, depois imprensa geral.\n"
-                "Retorne apenas URLs realmente relacionadas ao mesmo caso.\n\n"
+                "Pesquise no Google a cobertura jornalística DESTE caso/processo (âncora: número do processo, partes, tema e data).\n"
+                "Devolva, quando existirem e forem do MESMO caso:\n"
+                "- noticia_TSE: 1 matéria do TSE (tse.jus.br/comunicacao/noticias) sobre este julgamento.\n"
+                f"- noticia_TRE: 1 matéria do TRE de origem ({tre_hint}) sobre este caso, se houver.\n"
+                "- noticia_geral: até 4 matérias de imprensa (G1, Folha, Estadão, O Globo, UOL, ConJur, JOTA, Migalhas, Poder360, Metrópoles) sobre este caso.\n"
+                "Não invente URLs. Não retorne páginas genéricas (home, índice/busca de notícias). Só links claramente do mesmo caso; senão, deixe vazio.\n\n"
                 f"Contexto:\n{context}"
             )
             try:
