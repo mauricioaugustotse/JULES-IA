@@ -3,6 +3,7 @@ from tse_normalization import (
     build_timestamped_youtube_link,
     canonicalize_numero_processo,
     composicao_regimental_issue,
+    extract_youtube_video_id,
     is_regimentally_valid_composicao,
     normalize_advogados_list,
     normalize_classe_processo,
@@ -17,6 +18,7 @@ from tse_normalization import (
     normalize_resultado_final,
     normalize_session_date_to_iso,
     normalize_votacao,
+    normalize_youtube_link,
     remove_mpe_from_partes,
 )
 
@@ -162,6 +164,42 @@ def test_build_video_only_youtube_link_strips_timestamp():
     assert (
         build_video_only_youtube_link("https://youtu.be/abc123?t=5")
         == "https://www.youtube.com/watch?v=abc123"
+    )
+
+
+def test_extract_youtube_video_id_reconcilia_formatos():
+    # Concilia os dois formatos: /live/ (sessoes antigas do TSE) e watch?v= (recentes),
+    # alem de youtu.be, /shorts/ e /embed/. Nenhum formato pode ser inviabilizado.
+    vid = "KJbTq9hzG_s"
+    casos = [
+        f"https://www.youtube.com/watch?v={vid}",
+        f"https://www.youtube.com/watch?v={vid}&t=120",
+        f"https://youtu.be/{vid}",
+        f"https://youtu.be/{vid}?t=5",
+        f"https://www.youtube.com/live/{vid}?si=8o8rO-Aby7rvS2YY",
+        f"https://www.youtube.com/live/{vid}",
+        f"https://www.youtube.com/shorts/{vid}",
+        f"https://www.youtube.com/embed/{vid}",
+    ]
+    for url in casos:
+        assert extract_youtube_video_id(url) == vid, url
+
+
+def test_normalize_youtube_link_reconcilia_live_e_watch():
+    vid = "KJbTq9hzG_s"
+    # /live/?si=... e watch?v= convergem para a mesma forma canonica
+    assert (
+        normalize_youtube_link(f"https://www.youtube.com/live/{vid}?si=abc")
+        == f"https://www.youtube.com/watch?v={vid}"
+    )
+    assert (
+        normalize_youtube_link(f"https://www.youtube.com/watch?v={vid}")
+        == f"https://www.youtube.com/watch?v={vid}"
+    )
+    # preserva o timestamp quando presente
+    assert (
+        normalize_youtube_link(f"https://youtu.be/{vid}?t=931")
+        == f"https://www.youtube.com/watch?v={vid}&t=931"
     )
 
 

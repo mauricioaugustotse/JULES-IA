@@ -614,6 +614,40 @@ def test_validate_preview_row_keeps_specific_municipality_from_model():
     assert validate_preview_row(row, None).origem == "Belém/PA"
 
 
+def test_assess_publishability_allows_judged_case_without_number():
+    # Caso antigo/administrativo (consulta) efetivamente julgado, SEM numero de processo:
+    # numero ausente NAO bloqueia mais; publica porque passa pelas guardas de ruido.
+    row = PublishPreviewRow(
+        tema="Consulta sobre desincompatibilização de servidor público",
+        classe_processo="CTA",
+        numero_processo="",
+        data_sessao="2016-05-10",
+        resultado="Aprovada",
+        votacao="Unânime",
+        composicao=["Min. Gilmar Mendes", "Min. Luiz Fux", "Min. Rosa Weber"],
+        analise_do_conteudo_juridico="Consulta respondida sobre prazos de desincompatibilização de servidores públicos.",
+    )
+    disposition, _ = core.assess_row_publishability(row)
+    assert disposition == "publish"
+
+
+def test_assess_publishability_blocks_numberless_announcement_noise():
+    # Ruido (anuncio de pauta) SEM resultado/votacao continua BLOQUEADO mesmo sem numero:
+    # a guarda de resultado/votacao separa julgamento real de lixo.
+    row = PublishPreviewRow(
+        tema="Anúncio de julgamento de recurso especial eleitoral",
+        classe_processo="REspe",
+        numero_processo="",
+        data_sessao="2016-05-10",
+        resultado="",
+        votacao="",
+        composicao=["Min. Gilmar Mendes", "Min. Luiz Fux"],
+    )
+    disposition, reasons = core.assess_row_publishability(row)
+    assert disposition == "blocked"
+    assert any("Resultado/votação" in r for r in reasons)
+
+
 def test_compute_suspenso_star_updates_flips_prior_suspension_when_later_definitive():
     records = [
         {"page_id": "p1", "numero_processo": "0600100-10", "votacao": "Suspenso", "data_sessao": "2025-03-01"},
@@ -1618,7 +1652,12 @@ def test_collect_missing_multiselect_options_collects_new_labels_once():
 def test_create_row_preseeds_new_partes_and_advogados_in_default_schema():
     class RecordingClient(NotionSessoesClient):
         def __init__(self):
-            super().__init__(api_key="token", data_source_id="fake-ds")
+            # pre-semeio de options e OPT-IN (default da flag agora e False por seguranca);
+            # habilitamos aqui para validar o mecanismo append-only seguro.
+            super().__init__(
+                api_key="token", data_source_id="fake-ds",
+                normalize_multiselect_colors_post_write=True,
+            )
             self.created_payload = None
             self.preseeded_options = None
 

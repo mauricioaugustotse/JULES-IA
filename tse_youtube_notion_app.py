@@ -48,6 +48,10 @@ def load_notion_client_and_schema() -> tuple[Any, Any, str]:
         client = NotionSessoesClient(
             api_key=notion_key,
             data_source_id=runtime["notion_data_source_id"],
+            # Igual ao batch GUI: na publicacao NAO normalizar cores de options multi_select
+            # (PATCH em options e REPLACE+limite 100 e ja apagou etiquetas de advogados uma vez).
+            # Partes/advogados/composicao entram so por page-value, que cria options com seguranca.
+            normalize_multiselect_colors_post_write=False,
         )
         schema = client.fetch_schema()
         return client, schema, ""

@@ -5552,7 +5552,12 @@ class NotionSessoesClient:
         notion_version: str = DEFAULT_NOTION_VERSION,
         logger: Optional[logging.Logger] = None,
         session: Optional[requests.Session] = None,
-        normalize_multiselect_colors_post_write: bool = True,
+        # SEGURANCA: default False. Quando True, a publicacao (_write_row_once) roda
+        # ensure_multiselect_options_default (PATCH em options) — que ja apagou etiquetas
+        # de advogados uma vez. So scripts de MANUTENCAO que realmente queiram normalizar
+        # cores de options devem passar True explicitamente. Fecha o footgun de um
+        # entrypoint futuro esquecer de passar False.
+        normalize_multiselect_colors_post_write: bool = False,
     ) -> None:
         if not api_key:
             raise ValueError("NOTION_API_KEY/NOTION_TOKEN não encontrado.")
@@ -6290,7 +6295,14 @@ class NotionSessoesClient:
             )
             candidate_video_id = extract_youtube_video_id(candidate_youtube)
             same_video = bool(target_video_id and candidate_video_id == target_video_id)
-            exact_youtube_match = candidate_youtube == normalized_youtube
+            exact_youtube_match = bool(normalized_youtube) and candidate_youtube == normalized_youtube
+            if not normalized_numero:
+                # Linha SEM numero (caso antigo/administrativo): a identidade e a URL EXATA
+                # do julgamento (com timestamp). So casa pagina tambem SEM numero, para nao
+                # colidir com um processo numerado que compartilhe o video.
+                if exact_youtube_match and not candidate_numero:
+                    return NotionRowMatch(page_id=candidate.get("id", ""), url=candidate.get("url", ""))
+                continue
             if candidate_numero == normalized_numero and (
                 not target_video_id or exact_youtube_match or same_video
             ):
@@ -6632,8 +6644,11 @@ def assess_row_publishability(row: PublishPreviewRow) -> tuple[str, list[str]]:
 
     if row.action != "update":
         create_issues: list[str] = []
-        if not row.numero_processo:
-            create_issues.append("Número do processo ausente para criação.")
+        # Numero AUSENTE nao bloqueia mais: casos antigos/administrativos (consultas, PA)
+        # efetivamente julgados muitas vezes nao tem numero CNJ. Eles publicam SE passarem
+        # pelas guardas de ruido abaixo (resultado/votacao + relator/composicao + densidade
+        # + tema). O numero fica em branco (honesto); a identidade/upsert usa a URL do
+        # YouTube com timestamp (unica por julgamento) em find_existing_row.
         if not row.data_sessao:
             create_issues.append("Data da sessão ausente para criação.")
         if not (row.resultado or row.votacao or row.pedido_vista):
@@ -6718,12 +6733,22 @@ def build_preview_rows(
                     + row_composition_issue
                     + "); confira os 7 ministros participantes do julgamento."
                 )
-            if notion_client and notion_schema and row.numero_processo and row.youtube_link:
-                match = notion_client.find_existing_row(
-                    notion_schema,
-                    youtube_link=build_video_only_youtube_link(row.youtube_link),
-                    numero_processo=canonicalize_numero_processo(row.numero_processo),
-                )
+            if notion_client and notion_schema and row.youtube_link:
+                canon_num = canonicalize_numero_processo(row.numero_processo)
+                if canon_num:
+                    match = notion_client.find_existing_row(
+                        notion_schema,
+                        youtube_link=build_video_only_youtube_link(row.youtube_link),
+                        numero_processo=canon_num,
+                    )
+                else:
+                    # Sem numero: identidade pela URL EXATA (com timestamp) do julgamento,
+                    # para o upsert ser idempotente (re-rodar atualiza, nao duplica).
+                    match = notion_client.find_existing_row(
+                        notion_schema,
+                        youtube_link=row.youtube_link,
+                        numero_processo="",
+                    )
                 if match:
                     row.page_id = match.page_id
                     row.action = "update"

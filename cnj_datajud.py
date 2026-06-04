@@ -178,7 +178,7 @@ def _build_process(source: dict[str, Any], alias: str) -> CnjProcess:
         has_vista=has_vista,
         has_julgamento=has_julg,
         movimentos_count=len(movimentos),
-        assuntos=[str(a.get("nome", "")) for a in (source.get("assuntos", []) or []) if a.get("nome")],
+        assuntos=[str(a.get("nome", "")) for a in (source.get("assuntos", []) or []) if isinstance(a, dict) and a.get("nome")],
         source_index=alias,
     )
 

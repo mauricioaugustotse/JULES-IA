@@ -185,6 +185,7 @@ MINISTRO_ALIAS_MAP = {
     "jorge mussi": "Min. Jorge Mussi",
     "laurita vaz": "Min. Laurita Vaz",
     "luciana lossio": "Min. Luciana Lóssio",
+    "carmen lossio": "Min. Luciana Lóssio",  # transcricao errada de audio antigo (so ha 1 Lossio no TSE)
     "luis edson fachin": "Min. Edson Fachin",
     "luiz edson fachin": "Min. Edson Fachin",
     "luis felipe salomao": "Min. Luís Felipe Salomão",
@@ -195,6 +196,7 @@ MINISTRO_ALIAS_MAP = {
     "luiz fux": "Min. Luiz Fux",
     "luis roberto barroso": "Min. Luís Roberto Barroso",
     "luiz roberto barroso": "Min. Luís Roberto Barroso",
+    "roberto barroso": "Min. Luís Roberto Barroso",
     "marco aurelio": "Min. Marco Aurélio",
     "maria claudia bucchianeri pinheiro": "Min. Maria Cláudia Bucchianeri",
     "maria thereza": "Min. Maria Thereza de Assis Moura",
@@ -204,6 +206,8 @@ MINISTRO_ALIAS_MAP = {
     "napoleao maia": "Min. Napoleão Nunes Maia Filho",
     "napoleao nunes maia": "Min. Napoleão Nunes Maia Filho",
     "napoleao nunes maia filho": "Min. Napoleão Nunes Maia Filho",
+    "luciano nunes maia": "Min. Napoleão Nunes Maia Filho",  # transcricao errada de audio antigo
+    "luciano nunes maia filho": "Min. Napoleão Nunes Maia Filho",
     "nunes marques": "Min. Nunes Marques",
     "og fernandes": "Min. Og Fernandes",
     "paulo de tarso sanseverino": "Min. Paulo de Tarso Sanseverino",
@@ -456,6 +460,22 @@ FEMALE_NAME_HINTS = {
     "andreia", "adriana", "tatiana", "vanessa", "aline", "leticia", "raquel",
     "cristina", "cristiane", "gisele", "giovana", "gabriela", "isabel", "marta",
     "carmen", "estela", "juliana", "julia", "amanda", "bruna", "daniela",
+}
+# Nomes MASCULINOS terminados em 'a' (excecoes a heuristica '-a -> feminino' abaixo).
+MALE_NAME_HINTS = {
+    "juca", "jonata", "nicola", "luca", "joshua", "agripa", "noa", "elia",
+    "neemia", "ananias", "josua", "andrea", "cosma", "barnaba",
+}
+# SOBRENOMES comuns terminados em 'a' — quando aparecem como 1o token (nome incompleto/
+# sobrenome-primeiro), NAO inferir feminino por engano (ex.: "Dr. Silva" nao vira "Dra.").
+SURNAME_A_ENDING = {
+    "silva", "costa", "ferreira", "oliveira", "pereira", "lima", "rocha", "cunha",
+    "mota", "motta", "barbosa", "sousa", "souza", "moreira", "teixeira", "vieira",
+    "nogueira", "bezerra", "saraiva", "paiva", "fonseca", "franca", "serra", "almeida",
+    "miranda", "holanda", "lacerda", "arruda", "rezende", "resende", "guerra", "braga",
+    "fraga", "veiga", "aranha", "mendonca", "padilha", "uchoa", "gouveia", "batista",
+    "sena", "espindola", "fontoura", "siqueira", "caldeira", "pedrosa", "feitosa",
+    "macena", "messa", "lousada", "boanerges", "bda",
 }
 
 
@@ -1023,8 +1043,14 @@ def infer_advogado_prefix(name: str, label_hint: str = "") -> str:
         return "Dra."
     if "advogado" in hint:
         return "Dr."
-    first = name.split()[0] if name.split() else ""
-    if normalize_token(first) in FEMALE_NAME_HINTS:
+    first = normalize_token(name.split()[0]) if name.split() else ""
+    if first in FEMALE_NAME_HINTS:
+        return "Dra."
+    if first in MALE_NAME_HINTS or first in SURNAME_A_ENDING:
+        return "Dr."
+    # Heuristica do portugues: 1o nome terminado em 'a' (>=3 letras, fora das excecoes
+    # masculinas e de sobrenomes) costuma ser feminino -> Dra. Cobre Sara/Laura/Nadja/etc.
+    if len(first) >= 3 and first.endswith("a"):
         return "Dra."
     return "Dr."
 
@@ -1989,8 +2015,10 @@ def extract_youtube_video_id(url: str) -> str:
         video_id = query.get("v", [""])[0]
         if video_id:
             return video_id
-        if parsed.path.startswith("/shorts/"):
-            return parsed.path.split("/shorts/", 1)[1].split("/", 1)[0]
+        # /shorts/<id>, /live/<id> (lives das sessoes do TSE), /embed/<id>
+        for prefix in ("/shorts/", "/live/", "/embed/"):
+            if parsed.path.startswith(prefix):
+                return parsed.path.split(prefix, 1)[1].split("/", 1)[0]
     return ""
 
 
