@@ -111,7 +111,7 @@ def main() -> int:
             stats["paginas_alteradas"] += 1
             rec = {"page_id": p["id"], "numero": client._extract_property_text(p, schema, "numero_processo"), "old": cur, "new": new}
             if args.apply:
-                props = {"partes": {"multi_select": [{"name": n} for n in new]}}
+                props = {"partes": client._build_property_value(schema, "partes", new) or client._build_empty_property_value(schema, "partes")}
                 try:
                     notion_request_with_retry(client, "PATCH", f"/pages/{p['id']}", json={"properties": props})
                     rec["status"] = "updated"; stats["applied"] += 1

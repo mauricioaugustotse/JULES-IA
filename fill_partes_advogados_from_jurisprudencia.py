@@ -37,6 +37,7 @@ from typing import Any
 from audit_notion_sessoes_round2 import notion_request_with_retry
 from local_secrets import get_secret
 from tse_normalization import (
+    clean_partes_list,
     dedupe_preserve_order,
     normalize_advogado_name,
     normalize_party_entry,
@@ -313,8 +314,11 @@ def main() -> int:
         merged_adv = merge_names(cur_adv, info["advogados"])
         props: dict[str, Any] = {}
         detail: dict[str, Any] = {}
+        # going-forward redondo: limpa o merge (estirpa papeis + remove lixo + dedup fuzzy)
+        # via clean_partes_list ANTES de gravar (sem re-dividir -> preserva nomes de empresa).
+        merged_partes = clean_partes_list(merged_partes)
         if merged_partes and merged_partes != cur_partes:
-            props["partes"] = {"multi_select": [{"name": n} for n in merged_partes]}
+            props["partes"] = client._build_property_value(schema, "partes", merged_partes)  # schema-driven (rich_text)
             detail["partes"] = {"old": ", ".join(cur_partes), "new": ", ".join(merged_partes)}
             stats["muda_partes"] += 1
         if merged_adv and merged_adv != cur_adv:

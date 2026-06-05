@@ -238,20 +238,19 @@ def test_normalize_classe_processo_recognizes_adi_ado_and_force_federal():
 def test_normalize_partes_list_parses_serialized_mapping_payload():
     value = """{'embargante': 'Cláudia Aparecida dos Santos', 'embargados': ['Denilson Aparecido Martins', 'Federação Brasil da Esperança de Santa Luzia']}"""
     assert normalize_partes_list(value) == (
-        "Cláudia Aparecida dos Santos (Embargante), "
-        "Denilson Aparecido Martins (Embargado), "
-        "Federação Brasil da Esperança de Santa Luzia (Embargado)"
+        "Cláudia Aparecida dos Santos, Denilson Aparecido Martins, "
+        "Federação Brasil da Esperança de Santa Luzia"
     )
 
 
 def test_normalize_partes_list_parses_loose_label_value_payload():
     value = "'agravado': 'Jânio Natal Andrade Borges'}"
-    assert normalize_partes_list(value) == "Jânio Natal Andrade Borges (Agravado)"
+    assert normalize_partes_list(value) == "Jânio Natal Andrade Borges"
 
 
 def test_normalize_partes_list_moves_impetrado_role_to_suffix_without_degrading_acronym():
     value = "Impetrado: Tribunal Regional Eleitoral do Rio de Janeiro (TRE-RJ)"
-    assert normalize_partes_list(value) == "Tribunal Regional Eleitoral do Rio de Janeiro (TRE-RJ) (Impetrado)"
+    assert normalize_partes_list(value) == "Tribunal Regional Eleitoral do Rio de Janeiro (TRE-RJ)"
 
 
 def test_normalize_partes_list_does_not_reapply_first_role_to_following_items():
@@ -261,9 +260,9 @@ def test_normalize_partes_list_does_not_reapply_first_role_to_following_items():
         "Damiana Sidneia Oliveira e outros (Interessado)",
     ]
     assert normalize_partes_list(value) == (
-        "Diego Fernandes da Silva (Impetrante), "
-        "Tribunal Regional Eleitoral do Rio de Janeiro (TRE-RJ) (Impetrado), "
-        "Damiana Sidneia Oliveira e outros (Interessado)"
+        "Diego Fernandes da Silva, "
+        "Tribunal Regional Eleitoral do Rio de Janeiro (TRE-RJ), "
+        "Damiana Sidneia Oliveira"
     )
 
 
@@ -274,9 +273,8 @@ def test_normalize_partes_list_expands_plural_loose_mapping_to_all_names():
         "Maurícia Marciel Pessanha'}",
     ]
     assert normalize_partes_list(value) == (
-        "Caio Faria Donatelli (Agravado), "
-        "César Lima de Nascimento (Agravado), "
-        "Maurícia Marciel Pessanha (Agravado)"
+        "Caio Faria Donatelli, César Lima de Nascimento, "
+        "Maurícia Marciel Pessanha"
     )
 
 
@@ -300,8 +298,7 @@ def test_normalize_partes_list_does_not_split_organization_name_on_e():
 def test_normalize_partes_list_splits_conjoined_names_with_shared_role_suffix():
     value = "José Auricchio Júnior (Prefeito eleito) e Carlos Humberto Seraphim (Vice-prefeito eleito) (Recorrido)"
     assert normalize_partes_list(value) == (
-        "José Auricchio Júnior (Prefeito eleito) (Recorrido), "
-        "Carlos Humberto Seraphim (Vice-prefeito eleito) (Recorrido)"
+        "José Auricchio Júnior, Carlos Humberto Seraphim"
     )
 
 

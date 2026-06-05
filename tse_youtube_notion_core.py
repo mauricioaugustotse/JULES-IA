@@ -6324,7 +6324,9 @@ class NotionSessoesClient:
         if prop.type == "title":
             return {"title": chunk_rich_text(str(value))}
         if prop.type == "rich_text":
-            return {"rich_text": chunk_rich_text(str(value))}
+            # listas (ex.: partes/advogados migrados de multi_select) viram texto " , "-juntado
+            text = ", ".join(str(v).strip() for v in value if str(v).strip()) if isinstance(value, list) else str(value)
+            return {"rich_text": chunk_rich_text(text)}
         if prop.type == "url":
             return {"url": str(value)}
         if prop.type == "date":

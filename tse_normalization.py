@@ -740,7 +740,11 @@ def normalize_party_entry(value: str) -> str:
 
 
 PARTY_SPLIT_ORGANIZATION_REGEX = re.compile(
-    r"(?i)\b(coliga(?:ção|cao)?|partido|federa(?:ção|cao)?|frente|minist[eé]rio|prefeitura|c[aâ]mara|munic[ií]pio|tribunal|uni[aã]o|governo)\b"
+    r"(?i)(\b(?:coliga(?:ção|cao)?|partido|federa(?:ção|cao)?|frente|minist[eé]rio|prefeitura|"
+    r"c[aâ]mara|munic[ií]pio|tribunal|uni[aã]o|governo|comunica\w*|participa\w*|televis\w*|"
+    r"r[aá]dio|ind[uú]stria|com[eé]rcio|eventos|editora|cooperativa|associa\w*|sindicato|"
+    r"funda\w*|institut\w*|empresa|sociedade|telecom\w*|transport\w*|construtora|holding|"
+    r"seguros|ltda|eireli|epp)\b|\bs\s*/\s*a\b|\bs\.\s*a\.?\b)"
 )
 PARTY_NAME_CONNECTORS = {"e", "de", "da", "do", "das", "dos"}
 TRAILING_PAREN_GROUP_REGEX = re.compile(r"\s*\(([^()]*)\)\s*$")
@@ -1003,6 +1007,123 @@ def _parse_structured_partes_payload(value: str) -> list[str]:
     return _flatten_structured_party_payload(payload)
 
 
+import difflib as _difflib
+
+_PARTES_JUNK_WORDS = {
+    "interessados", "interessado", "assessoria", "coligacao", "coligacoes", "requerente",
+    "requerentes", "recorrente", "recorrentes", "embargante", "embargantes", "agravante",
+    "agravantes", "outros", "outro", "outras", "advogado", "advogados", "advogada",
+    "eleitor", "eleitores", "candidato", "candidatos", "partido", "diretorio", "federacao",
+}
+_PARTES_JUNK_PHRASES = {
+    "destinatario para ciencia publica", "para ciencia publica", "ciencia publica",
+    "interessado nao identificado", "nao identificado", "a quem possa interessar",
+    "terceiro interessado", "terceiros interessados",
+}
+_PARTES_CONN = {"de", "da", "do", "dos", "das", "no", "na", "em", "e", "a", "o"}
+_PARTES_INITIALS_RE = re.compile(r"^(?:[A-Za-zÀ-ÿ]\.?\s+)+[A-Za-zÀ-ÿ]\.?$")
+
+
+def _partes_fold(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s or "").lower())
+    return re.sub(r"\s+", " ", "".join(c for c in s if not unicodedata.combining(c))).strip()
+
+
+def is_partes_junk(v: str) -> bool:
+    """Valor de partes que e SO papel/ruido (Interessados, Destinatario..., iniciais soltas)."""
+    v = str(v or "").strip()
+    f = _partes_fold(re.sub(r"\([^)]*\)", "", v).strip())
+    if f in _PARTES_JUNK_WORDS or f in _PARTES_JUNK_PHRASES:
+        return True
+    core = re.sub(r"[^A-Za-zÀ-ÿ]", "", v)
+    return len(core) <= 6 and bool(_PARTES_INITIALS_RE.match(v))
+
+
+def _partes_tokens(v: str) -> list[str]:
+    base = re.sub(r"(?i)^\s*dr[a]?\.?\s+", "", str(v or ""))
+    base = re.sub(r"\([^)]*\)", " ", base)
+    return [t for t in _partes_fold(base).split() if len(t) > 1 and t not in _PARTES_CONN]
+
+
+def _partes_same_entity(a: str, b: str) -> bool:
+    """Mesma pessoa/entidade por VARIACAO DE GRAFIA (token-alinhado, cada par ratio>=0.8).
+    Guarda de genero (Fernanda!=Fernando) e rejeita 1 token totalmente diferente."""
+    ta, tb = _partes_tokens(a), _partes_tokens(b)
+    if not ta or not tb or len(ta) != len(tb) or ta == tb:
+        return False
+    if any(x[:-1] == y[:-1] and {x[-1:], y[-1:]} == {"a", "o"} for x, y in zip(ta, tb) if x != y):
+        return False
+    return all(x == y or _difflib.SequenceMatcher(None, x, y).ratio() >= 0.8 for x, y in zip(ta, tb))
+
+
+def _partes_canonical(group: list[str]) -> str:
+    return max(group, key=lambda v: (
+        sum(1 for c in unicodedata.normalize("NFKD", v) if unicodedata.combining(c)),
+        1 if re.search(r"\([A-Za-z]{2,}\)", v) else 0, len(v)))
+
+
+def _dedupe_partes_inrow(values: list[str]) -> list[str]:
+    clusters: list[list[str]] = []
+    for v in values:
+        for cl in clusters:
+            if _partes_same_entity(v, cl[0]):
+                cl.append(v)
+                break
+        else:
+            clusters.append([v])
+    out: list[str] = []
+    for cl in clusters:
+        c = _partes_canonical(cl)
+        if c not in out:
+            out.append(c)
+    return out
+
+
+_PARTES_ROLE = (
+    r"recorr\w*|reclam\w*|agrav\w*|embarg\w*|requer\w*|assistente(?:\s+simples)?|consult\w*|"
+    r"consulente|petrante|peticionante|impugn\w*|impetr\w*|litiscons\w*|paciente|investigad[oa]s?|"
+    r"interessad[oa]s?|autoridade\s+coatora|denunci\w*|querel\w*|exequente|executad[oa]s?|apelad[oa]s?|"
+    r"apelante|terceir[oa]\s+\w+|primeir[oa]\s+\w+|segund[oa]\s+\w+|prefeit[oa]?\s*\w*|vice-?prefeit\w*|"
+    r"governador\w*|vice-?governador\w*|senador\w*|deputad[oa]s?|vereador\w*|suplente|presidente|"
+    r"vice-?presidente|tesoureir[oa]|candidat[oa]s?|relator[a]?"
+)
+_PARTES_TRAIL_ROLE = re.compile(rf"(?i)\s*\((?:{_PARTES_ROLE})[^)]*\)\s*$")
+_PARTES_PREFIX_ROLE = re.compile(rf"(?i)^(?:{_PARTES_ROLE})(?:\s*\([a-zà-ÿ]+\)|\s*/\s*[a-zà-ÿ]+)*\s*:\s*")
+_PARTES_ALIAS_PREFIX = re.compile(
+    r"(?i)^(?:registrad[oa]\s+civilmente\s+como|conhecid[oa]\s+como|tamb[eé]m\s+conhecid[oa]\s+como|"
+    r"vulgo|nome\s+social)\s*:?\s+")
+
+
+_PARTES_EOUTRO = re.compile(r"(?i)\s*,?\s*\be\s+(outr[oa]s?|mais\s+\d+)\b\s*$")
+
+
+def strip_partes_roles(v: str) -> str:
+    """Estirpa anotacoes de PAPEL/posicao e ruido de uma parte: prefixo ('Recorrido:',
+    'Registrado civilmente como'), sufixos entre parenteses ('(Agravado)', '(Recorrido)',
+    '(Prefeito eleito)') e ' e outros'. PRESERVA siglas em CAIXA-ALTA ('(TRE-RJ)', '(PT)')."""
+    v = _PARTES_ALIAS_PREFIX.sub("", str(v or "")).strip()
+    v = _PARTES_PREFIX_ROLE.sub("", v).strip()
+    prev = None
+    while prev != v:
+        prev = v
+        v = _PARTES_TRAIL_ROLE.sub("", v).strip()
+        v = _PARTES_EOUTRO.sub("", v).strip()
+    return v
+
+
+def clean_partes_list(values: list[str]) -> list[str]:
+    """Limpa uma lista de partes JA SEPARADAS (1 entidade por valor) SEM re-dividir: estirpa
+    papeis/posicoes + 'e outros', remove lixo e dedup FUZZY. Para usar pos-merge (fill) e na
+    re-limpeza da base, evitando o over-split de nomes de empresa ('Globo Comunicacao e
+    Participacoes S/A') que o split_conjoined faz."""
+    out: list[str] = []
+    for v in values:
+        s = strip_partes_roles(str(v or "").strip())
+        if s and not is_partes_junk(s):
+            out.append(s)
+    return _dedupe_partes_inrow(out)
+
+
 def normalize_partes_list(value: str | list[str]) -> str:
     if isinstance(value, list):
         raw_parts = [str(item or "").strip() for item in value if str(item or "").strip()]
@@ -1024,10 +1145,15 @@ def normalize_partes_list(value: str | list[str]) -> str:
         if not entry:
             continue
         for split_entry in split_conjoined_person_party_entry(entry):
+            split_entry = strip_partes_roles(split_entry)
             if not split_entry or split_entry in seen:
                 continue
             seen.add(split_entry)
             normalized.append(split_entry)
+    # going-forward redondo: remove lixo (Interessados/Destinatario.../iniciais soltas) e
+    # dedup FUZZY in-row (Arthur/Artur, Souza/Sousa). Mantem papeis e nomes de organizacao.
+    normalized = [v for v in normalized if not is_partes_junk(v)]
+    normalized = _dedupe_partes_inrow(normalized)
     return ", ".join(normalized)
 
 
@@ -1608,6 +1734,20 @@ def normalize_ministro_name(name: str) -> str:
     return name
 
 
+def _extract_ministro_prefix(value: str) -> str:
+    """Extrai SO o ministro de uma frase com texto de acao colado (ex.: 'Min. Nunes
+    Marques suspendendo a conclusao do julgamento' -> 'Min. Nunes Marques'). Pega o MAIOR
+    prefixo de palavras que normaliza para um ministro CONHECIDO; '' se nao identificar."""
+    known = MINISTROS_STF | MINISTROS_STJ | MINISTROS_JURISTAS
+    bare = re.sub(r"(?i)^\s*min(?:istr[oa])?\.?\s+", "", str(value or "")).strip()
+    tokens = bare.split()
+    for k in range(min(len(tokens), 6), 1, -1):
+        norm = normalize_ministro_name(" ".join(tokens[:k]))
+        if norm in known:
+            return norm
+    return ""
+
+
 def normalize_pedido_vista_name(value: str) -> str:
     value = re.sub(r"(?i)^\s*(relator(?:a)?|presidente|vice-?presidente)\s+", "", value).strip()
     name = normalize_ministro_name(value)
@@ -1616,6 +1756,10 @@ def normalize_pedido_vista_name(value: str) -> str:
     name = re.sub(r"^Min\.\s+Ministra\s+", "Min. ", name)
     if name in {"Min. Presidente", "Min. Relator", "Min. Relatora", "Min. Ministra", "Min. Ministro"}:
         return ""
+    # Se sobrou texto de acao colado (nao e nome de ministro plausivel), extrai so o
+    # ministro; se nao houver ministro conhecido na frase, esvazia (ex.: 'Min. que').
+    if name and not is_plausible_ministro_name(name):
+        return _extract_ministro_prefix(value)
     return name
 
 
