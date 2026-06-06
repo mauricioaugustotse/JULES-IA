@@ -36,7 +36,7 @@ const vis=(el)=>{if(!el||!(el instanceof Element))return false;const s=getComput
 """
 
 
-def load_targets(prop: str, apply_deletes: bool) -> list[dict[str, str]]:
+def load_targets(prop: str, apply_deletes: bool, only_deletes: bool = False) -> list[dict[str, str]]:
     path = OUTPUT_DIR / f"{prop}_plano_manual.csv"
     rows = list(csv.DictReader(path.open("r", encoding="utf-8-sig")))
     out = []
@@ -48,7 +48,7 @@ def load_targets(prop: str, apply_deletes: bool) -> list[dict[str, str]]:
         nondefault = (r["cor_atual"].strip() or "default") != "default"
         if orphan and apply_deletes:
             out.append({"name": name, "action": "delete"})
-        elif nondefault and not orphan:
+        elif nondefault and not orphan and not only_deletes:  # --only-deletes: NAO recolore (ex.: composicao)
             out.append({"name": name, "action": "recolor"})
         elif orphan and not apply_deletes:
             continue
@@ -189,26 +189,25 @@ def _submenu_usage(page) -> int:
 
 
 def _open_option_submenu(page, label, delay):
-    """Abre o submenu da opção clicando no chevron/linha (mouse real)."""
+    """Abre o submenu da opção clicando NA PROPRIA opção (UI atual: clicar a linha abre
+    rename+cores+Excluir). Hover antes do clique p/ o '...' renderizar (mouse real)."""
     pts = page.evaluate(
-        "({t})=>{" + VIS + "const c=Array.from(document.querySelectorAll('[role=\\\"dialog\\\"],[role=\\\"menu\\\"]')).filter(vis);const opt=[...c].reverse().find(d=>norm(d.innerText||'').includes('Opções'))||document.body;const tt=norm(t);let chosen=null;const w=document.createTreeWalker(opt,NodeFilter.SHOW_ELEMENT);while(w.nextNode()){const el=w.currentNode;if(!vis(el))continue;if(norm(el.innerText||el.textContent||'')!==tt)continue;if(Array.from(el.children).some(ch=>vis(ch)&&norm(ch.innerText||ch.textContent||'')===tt))continue;chosen=el;break;}if(!chosen)return null;chosen.scrollIntoView({block:'center'});let row=chosen,node=chosen.parentElement;const cr=chosen.getBoundingClientRect();while(node&&node!==opt.parentElement){if(vis(node)){const r=node.getBoundingClientRect();if(r.width>=cr.width+20&&r.height>=cr.height&&r.height<=cr.height+26){row=node;}}node=node.parentElement;}const r=row.getBoundingClientRect();return {chevX:Math.min(window.innerWidth-2,r.right-14),midY:r.top+r.height/2,rowX:r.left+Math.min(24,r.width/4)};}",
+        "({t})=>{" + VIS + "const c=Array.from(document.querySelectorAll('[role=\\\"dialog\\\"],[role=\\\"menu\\\"]')).filter(vis);const opt=[...c].reverse().find(d=>norm(d.innerText||'').includes('Op'))||document.body;const tt=norm(t);let chosen=null;const w=document.createTreeWalker(opt,NodeFilter.SHOW_ELEMENT);while(w.nextNode()){const el=w.currentNode;if(!vis(el))continue;if(norm(el.innerText||el.textContent||'')!==tt)continue;if(Array.from(el.children).some(ch=>vis(ch)&&norm(ch.innerText||ch.textContent||'')===tt))continue;chosen=el;break;}if(!chosen)return null;chosen.scrollIntoView({block:'center'});const r=chosen.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,right:r.right,left:r.left};}",
         {"t": label},
     )
     if not isinstance(pts, dict):
         return False
-    for x in (pts.get("chevX"), pts.get("rowX")):
-        if not x:
-            continue
-        # hover na linha primeiro: o chevron ">" so renderiza ao passar o mouse
-        page.mouse.move(pts["rowX"], pts["midY"])
-        time.sleep(0.18)
-        page.mouse.click(x, pts["midY"], delay=40)
-        time.sleep(delay)
-        if _submenu_open(page) and _submenu_is_for(page, label):
-            return True
-        # submenu de outra opcao (chevron errado) -> fecha e tenta o proximo alvo de clique
-        if _submenu_open(page):
-            page.keyboard.press("Escape"); time.sleep(0.15)
+    # clicamos NA opcao exata (achada por texto) -> o submenu (Cores/Excluir) e dela.
+    # A UI atual nao tem campo de renomear no submenu, entao _submenu_is_for nao se aplica.
+    for cx in (pts["right"] - 12, pts["x"], pts["left"] + 20):
+        page.mouse.move(cx, pts["y"])
+        time.sleep(0.10)
+        page.mouse.click(cx, pts["y"], delay=20)
+        # POLLING: prossegue assim que o submenu abrir (em vez de esperar 'delay' fixo).
+        for _ in range(int(max(delay, 0.30) / 0.03) + 1):
+            if _submenu_open(page):
+                return True
+            time.sleep(0.03)
     return False
 
 
@@ -220,7 +219,7 @@ def _click_in_submenu(page, labels) -> bool:
             {"t": lab},
         )
         if isinstance(rect, dict):
-            page.mouse.click(rect["x"], rect["y"], delay=30)
+            page.mouse.click(rect["x"], rect["y"], delay=15)
             return True
     return False
 
@@ -278,7 +277,7 @@ def wait_for_panel(page, timeout_s, logger):
 
 def run(args):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    targets = load_targets(args.property, args.apply_deletes)
+    targets = load_targets(args.property, args.apply_deletes, getattr(args, "only_deletes", False))
     if args.limit:
         targets = targets[: args.limit]
     target_names = [t["name"] for t in targets]
@@ -291,8 +290,20 @@ def run(args):
     done = set(json.loads(ck_path.read_text(encoding="utf-8")).get("done", [])) if ck_path.exists() else set()
     shots = OUTPUT_DIR / "ui_debug"; shots.mkdir(parents=True, exist_ok=True)
 
+    cdp_url = getattr(args, "cdp_url", None) or CDP_URL
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(CDP_URL)
+        browser = None
+        for tentativa in range(1, 4):  # retry: Edge pode estar abrindo
+            try:
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                break
+            except Exception as exc:
+                LOGGER.warning("CDP %s indisponivel (tentativa %s/3): %s", cdp_url, tentativa, exc)
+                time.sleep(2.0)
+        if browser is None:
+            LOGGER.error("Edge nao encontrado em %s. Abra o Edge com --remote-debugging-port=9222 "
+                         "(ou use 'Preparar Edge'). Etiquetas NAO recoloridas.", cdp_url)
+            return 2
         page = pick_page(browser)
         LOGGER.info("Pagina: %s", page.url)
 
@@ -305,6 +316,35 @@ def run(args):
             LOGGER.error("Painel de Opcoes de %s nao foi aberto.", args.property)
             return 1
         LOGGER.info("Painel de Opcoes detectado (auto_open=%s).", args.auto_open)
+        if getattr(args, "sort_only", False):
+            # "Editar propriedade > Ordenar": clica a linha 'Ordenar [Manual] >' (painel de opcoes, a
+            # mais a direita) -> submenu Manual/Alfabetica/Alfabetica reversa -> clica 'Alfabética'.
+            ords = page.evaluate(
+                "()=>{" + VIS + "const out=[];const all=Array.from(document.querySelectorAll('*')).filter(vis);"
+                "for(const el of all){const t=norm(el.innerText||el.textContent||'');if(!/^ordenar/i.test(t)||t.length>22)continue;"
+                "if(Array.from(el.children).some(c=>vis(c)&&/^ordenar/i.test(norm(c.innerText||c.textContent||''))))continue;"
+                "const r=el.getBoundingClientRect();out.push({x:r.left+r.width/2,y:r.top+r.height/2});}return out;}")
+            if not ords:
+                LOGGER.warning("[%s] linha 'Ordenar' nao encontrada.", args.property); return 1
+            row = max(ords, key=lambda e: e["x"])  # painel de opcoes fica a direita do menu da propriedade
+            page.mouse.move(row["x"], row["y"]); time.sleep(0.12)
+            page.mouse.click(row["x"], row["y"], delay=30)
+            alfa = None
+            for _ in range(15):  # poll: submenu (Manual/Alfabetica/reversa) demora mais em painel grande
+                time.sleep(0.15)
+                alfa = page.evaluate(
+                    "(oy)=>{" + VIS + "const all=Array.from(document.querySelectorAll('*')).filter(vis);let best=null;"
+                    "for(const el of all){const t=norm(el.innerText||el.textContent||'');if(t!=='Alfabética')continue;"
+                    "if(Array.from(el.children).some(c=>vis(c)&&norm(c.innerText||c.textContent||'')==='Alfabética'))continue;"
+                    "const r=el.getBoundingClientRect();const cy=r.top+r.height/2;if(cy<=oy+4)continue;"
+                    "if(!best||cy<best.y)best={x:r.left+r.width/2,y:cy};}return best;}", row["y"])
+                if isinstance(alfa, dict):
+                    break
+            if isinstance(alfa, dict):
+                page.mouse.move(alfa["x"], alfa["y"]); time.sleep(0.12)
+                page.mouse.click(alfa["x"], alfa["y"], delay=30); time.sleep(0.5)
+                LOGGER.info("[%s] ordenado: Alfabética.", args.property); return 0
+            LOGGER.warning("[%s] opcao 'Alfabética' do submenu nao encontrada.", args.property); return 1
         if args.diag:
             diag = page.evaluate(
                 "({names})=>{" + VIS + "const c=Array.from(document.querySelectorAll('[role=\\\"dialog\\\"],[role=\\\"menu\\\"]')).filter(vis);const opt=[...c].reverse().find(d=>norm(d.innerText||'').includes('Opções'));if(!opt)return {err:'no opt'};"
@@ -365,13 +405,10 @@ def run(args):
             LOGGER.info("DEPOIS Excluir: %s", json.dumps(after, ensure_ascii=False))
             return 0
 
-        # revela a busca clicando no '+' (Adicionar uma opção) se ainda nao estiver ativa
+        # UI atual NAO usa busca via '+': as opcoes ja ficam renderizadas na lista.
+        # (best-effort; nao e fatal se nao houver caixa de busca.)
         if not _search_active(page):
             _click_plus(page, delay)
-        if not _search_active(page):
-            page.screenshot(path=str(shots / "no_search.png"))
-            LOGGER.error("Nao consegui revelar a busca (clique no '+'). Ver no_search.png.")
-            return 1
 
         def dialogs_state():
             return page.evaluate(
@@ -415,20 +452,9 @@ def run(args):
             if not (_panel_open(page) and (not args.auto_open or _panel_is_for(page, args.property))):
                 if not acquire_panel():
                     raise RuntimeError("painel nao reaberto")
-            if not _search_active(page):
-                _click_plus(page, delay)
-            if not set_search(label):
-                raise RuntimeError("busca nao revelada (clique no +)")
-            time.sleep(delay)
-            # garante que a lista FILTROU na opcao (alvo na viewport); senao, digita de
-            # verdade para forcar o filtro (o React value setter as vezes nao dispara).
-            if not _target_in_viewport(page, label):
-                focus_search()
-                page.keyboard.press("Control+A"); page.keyboard.press("Delete")
-                page.keyboard.type(label, delay=6)
-                time.sleep(delay)
-            if not _target_in_viewport(page, label):
-                raise RuntimeError("etiqueta nao filtrou na viewport apos busca")
+            # UI atual: opcoes renderizadas direto -> abre o submenu na lista (sem busca).
+            if _search_active(page):  # se houver busca, filtra (ajuda em listas enormes)
+                set_search(label); time.sleep(delay * 0.5)
             if not _open_option_submenu(page, label, delay):
                 raise RuntimeError("submenu nao abriu")
             if action == "delete":
@@ -448,17 +474,14 @@ def run(args):
                 if not confirmed:
                     raise RuntimeError("confirmacao de exclusao nao apareceu")
                 time.sleep(delay)
-                if not _search_active(page):
-                    _click_plus(page, delay)
-                set_search(label); time.sleep(delay)
                 if _exact_present(page, label):
                     raise RuntimeError("etiqueta ainda presente apos exclusao")
             else:
                 if not _click_in_submenu(page, DEFAULT_COLOR_LABELS):
                     raise RuntimeError("nao clicou Padrao")
-                time.sleep(0.15)
+                time.sleep(0.04)
                 if _submenu_open(page):
-                    page.keyboard.press("Escape"); time.sleep(delay)
+                    page.keyboard.press("Escape"); time.sleep(0.05)
 
         processed = 0
         failed = 0
@@ -502,7 +525,7 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--property", required=True, choices=["partes", "advogados", "origem"])
+    ap.add_argument("--property", required=True, choices=["partes", "advogados", "origem", "composicao"])
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--delay-ms", type=int, default=350)
     ap.add_argument("--apply-deletes", action="store_true")
@@ -513,6 +536,9 @@ def main():
     ap.add_argument("--probe-plus", action="store_true")
     ap.add_argument("--auto-open", action="store_true", help="Abre o painel da coluna via CDP (sem o usuario).")
     ap.add_argument("--probe-delete", action="store_true")
+    ap.add_argument("--cdp-url", default=CDP_URL, help="URL do CDP do Edge (default 127.0.0.1:9222).")
+    ap.add_argument("--sort-only", action="store_true", help="So clica 'Ordenar Alfabética' (sem recolorir/excluir).")
+    ap.add_argument("--only-deletes", action="store_true", help="So exclui orfas (NAO recolore) — p/ composicao.")
     return run(ap.parse_args())
 
 

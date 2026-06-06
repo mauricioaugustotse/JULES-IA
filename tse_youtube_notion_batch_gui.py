@@ -61,6 +61,13 @@ class BatchOptions:
     with_news: bool
     publish: bool
     continue_on_error: bool
+    # --- GOING-FORWARD: tratamentos pos-publicacao (defaults ligados) ---
+    post_publish_steps: tuple = ("materia", "suspenso", "classe_nomes", "sanear")
+    recolor_labels: bool = True          # Playwright recolore/exclui orfas (degrada se Edge ausente)
+    watch_dje: bool = True               # processa CSVs ja em DJE (--once)
+    dje_apply: bool = True               # grava no Notion (vs dry-run)
+    dje_dir: str = r"C:\Users\mauri\ProjetoConversor\DJE"
+    cdp_url: str = "http://127.0.0.1:9222"
 
 
 @dataclass(frozen=True)
@@ -232,6 +239,65 @@ def process_single_video(
     return summary
 
 
+def _gf_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _gf_run_label_recolor(cdp_url: str, output_queue: "queue.Queue[tuple[str, Any]]") -> dict[str, Any]:
+    """Recolore default + exclui orfas via Playwright. partes e rich_text -> NAO entra.
+    Sequencial (mesmo painel CDP). Para no 1o sinal de Edge ausente (returncode 2)."""
+    import subprocess
+    res: dict[str, Any] = {}
+    edge_ok = True
+    for prop in ("origem",):  # advogados virou rich_text (sem etiquetas); composicao: NAO recolorir
+        cmd = [sys.executable, str(_gf_dir() / "notion_labels_drive.py"), "--property", prop,
+               "--auto-open", "--apply-deletes", "--cdp-url", cdp_url, "--delay-ms", "110"]
+        try:
+            p = subprocess.run(cmd, cwd=str(_gf_dir()), capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=7200)
+            for ln in (p.stdout or "").splitlines():
+                if any(k in ln for k in ("CONCLUIDO", "FALHOU", "ABORTADO", "Edge nao", "alvos")):
+                    output_queue.put(("log", f"[labels:{prop}] {ln}\n"))
+            res[prop] = p.returncode
+            if p.returncode == 2:  # Edge ausente em :9222
+                output_queue.put(("log", "[labels] Edge ausente (:9222) — etiquetas nao recoloridas. Use 'Preparar Edge'.\n"))
+                edge_ok = False; break
+        except Exception as exc:
+            res[prop] = str(exc); output_queue.put(("log", f"[labels:{prop}] erro: {exc}\n"))
+    # ORDEM ALFABETICA (origem + composicao; advogados virou rich_text, sem etiquetas)
+    if edge_ok:
+        for prop in ("origem", "composicao"):
+            cmd = [sys.executable, str(_gf_dir() / "notion_labels_drive.py"), "--property", prop,
+                   "--auto-open", "--sort-only", "--cdp-url", cdp_url]
+            try:
+                p = subprocess.run(cmd, cwd=str(_gf_dir()), capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=900)
+                for ln in (p.stdout or "").splitlines():
+                    if any(k in ln for k in ("ordenado", "nao encontr", "Edge nao")):
+                        output_queue.put(("log", f"[sort:{prop}] {ln}\n"))
+                res[f"sort_{prop}"] = p.returncode
+            except Exception as exc:
+                res[f"sort_{prop}"] = str(exc)
+    return res
+
+
+def _gf_run_dje_once(dje_dir: str, apply: bool, output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
+    """Processa os CSVs de jurisprudencia ja presentes em DJE (modo --once) -> fill partes/advogados."""
+    import subprocess
+    cmd = [sys.executable, str(_gf_dir() / "watch_jurisprudencia_csv.py"), "--watch-dir", dje_dir, "--once"]
+    if apply:
+        cmd.append("--apply")
+    try:
+        p = subprocess.run(cmd, cwd=str(_gf_dir()), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=3600)
+        for ln in (p.stdout or "").splitlines()[-10:]:
+            if ln.strip():
+                output_queue.put(("log", f"[dje] {ln}\n"))
+        return p.returncode
+    except Exception as exc:
+        output_queue.put(("log", f"[dje] erro: {exc}\n")); return str(exc)
+
+
 def process_video_batch(
     videos: list[VideoInput],
     options: BatchOptions,
@@ -320,7 +386,32 @@ def process_video_batch(
             if not options.continue_on_error:
                 break
 
+    # ===== POS-PUBLICACAO GOING-FORWARD (so se publicou algo e nao interrompido) =====
+    post_publish: dict[str, Any] = {}
+    publicou = any(item.get("status") == "done" for item in summaries)
+    if options.publish and publicou and not stop_event.is_set():
+        dsid = runtime["notion_data_source_id"]
+        if options.post_publish_steps:
+            output_queue.put(("status", "__post__", "Pos-publicacao: tratamentos de dados...", ""))
+            try:
+                from post_publish_orchestrator import run_post_publish_treatments
+                post_publish["treatments"] = run_post_publish_treatments(
+                    data_source_id=dsid, apply=True, steps=list(options.post_publish_steps),
+                    logger=LOGGER, artifact_dir=run_root,
+                    log_line=lambda ln: output_queue.put(("log", ln + "\n")))
+            except Exception as exc:
+                LOGGER.warning("Pos-publicacao (dados) falhou: %s", exc)
+                post_publish["treatments_error"] = str(exc)
+        if options.recolor_labels:
+            output_queue.put(("status", "__post__", "Pos-publicacao: recolorir/excluir etiquetas (Edge)...", ""))
+            post_publish["labels"] = _gf_run_label_recolor(options.cdp_url, output_queue)
+        if options.watch_dje:
+            output_queue.put(("status", "__post__", "Pos-publicacao: CSVs DJE (--once)...", ""))
+            post_publish["dje"] = _gf_run_dje_once(options.dje_dir, options.dje_apply, output_queue)
+        output_queue.put(("status", "__post__", "Pos-publicacao concluida.", ""))
+
     summary_payload = {
+        "post_publish": post_publish,
         "started_at": run_root.name,
         "artifact_dir": str(run_root),
         "notion_database_url": runtime.get("notion_database_url") or DEFAULT_NOTION_DATABASE_URL,
@@ -363,6 +454,9 @@ class BatchGuiApp:
         self.with_news_var = tk.BooleanVar(value=True)
         self.publish_var = tk.BooleanVar(value=True)
         self.continue_on_error_var = tk.BooleanVar(value=True)
+        self.post_publish_var = tk.BooleanVar(value=True)
+        self.recolor_labels_var = tk.BooleanVar(value=True)
+        self.watch_dje_var = tk.BooleanVar(value=True)
         self.count_var = tk.StringVar(value=f"0/{MAX_LINKS} links")
         self.target_var = tk.StringVar(value=f"Notion: {DEFAULT_NOTION_DATABASE_URL}")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -419,6 +513,12 @@ class BatchGuiApp:
             sticky=tk.W,
             pady=(6, 0),
         )
+        ttk.Checkbutton(options, text="Pos-publicacao: tratar dados (materia/Suspenso/classe/sanear)",
+                        variable=self.post_publish_var).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ttk.Checkbutton(options, text="Recolorir etiquetas (Edge :9222)",
+                        variable=self.recolor_labels_var).grid(row=2, column=2, sticky=tk.W, pady=(6, 0))
+        ttk.Checkbutton(options, text="Processar CSVs DJE",
+                        variable=self.watch_dje_var).grid(row=2, column=3, sticky=tk.W, pady=(6, 0))
 
         actions = ttk.Frame(main)
         actions.grid(row=3, column=0, sticky="ew", pady=(0, 8))
@@ -583,6 +683,9 @@ class BatchGuiApp:
             with_news=bool(self.with_news_var.get()),
             publish=bool(self.publish_var.get()),
             continue_on_error=bool(self.continue_on_error_var.get()),
+            post_publish_steps=("materia", "suspenso", "classe_nomes", "sanear") if self.post_publish_var.get() else (),
+            recolor_labels=bool(self.recolor_labels_var.get()),
+            watch_dje=bool(self.watch_dje_var.get()),
         )
 
     def _start_batch(self) -> None:

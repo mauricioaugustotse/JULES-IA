@@ -43,6 +43,7 @@ PERM_DIR = SCRIPT_DIR / "artifacts" / "jurisprudencia_csv"   # acervo permanente
 STATE_FILE = PERM_DIR / "_watch_state.json"
 REPORTS_DIR = SCRIPT_DIR / "artifacts" / "jurisprudencia_partes_advogados"
 PIPELINE = SCRIPT_DIR / "fill_partes_advogados_from_jurisprudencia.py"
+PIPELINE_COMP = SCRIPT_DIR / "fill_composicao_from_jurisprudencia.py"  # composicao oficial do acordao
 
 TSE_SIGNATURE_COLS = ("siglaTribunalJE", "textoDecisao", "partes", "relatores", "numeroProcesso")
 CNJ20_RE = re.compile(r"\d{20}")
@@ -158,6 +159,15 @@ def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict
     if proc.returncode != 0:
         log(f"  ! pipeline retornou {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-400:]}")
         return {}
+    # tambem extrai a COMPOSICAO oficial ('Composicao: Ministros...' no textoDecisao) por CNJ
+    comp_cmd = [sys.executable, str(PIPELINE_COMP), "--input-dir", str(staging), "--log-level", "WARNING"]
+    if apply:
+        comp_cmd.append("--apply")
+    if data_source_id:
+        comp_cmd += ["--data-source-id", data_source_id]
+    cproc = subprocess.run(comp_cmd, cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True)
+    if cproc.returncode != 0:
+        log(f"  ! composicao retornou {cproc.returncode}: {(cproc.stderr or cproc.stdout or '').strip()[-300:]}")
     return newest_report_summary()
 
 
@@ -227,8 +237,8 @@ def scan_once(watch_dir: Path, sizes: dict, state: dict, args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--watch-dir", default=str(PERM_DIR),
-                    help="Pasta a vigiar. Default: a pasta do projeto (artifacts/jurisprudencia_csv).")
+    ap.add_argument("--watch-dir", default=os.environ.get("DJE_WATCH_DIR", r"C:\Users\mauri\ProjetoConversor\DJE"),
+                    help=r"Pasta a vigiar. Default: C:\Users\mauri\ProjetoConversor\DJE (env DJE_WATCH_DIR).")
     ap.add_argument("--apply", action="store_true",
                     help="Grava no Notion. Sem ela: dry-run (so relatorios, nao escreve).")
     ap.add_argument("--once", action="store_true",
