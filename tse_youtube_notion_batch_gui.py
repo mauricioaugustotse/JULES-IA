@@ -32,6 +32,7 @@ from tse_youtube_notion_core import (
     enrich_preview_rows_with_theme_punchline,
     enrich_preview_rows_with_cnj,
     enrich_preview_rows_with_youtube_chapters,
+    enrich_preview_rows_with_session_date_from_title,
     extract_youtube_video_id,
     normalize_youtube_link,
     publish_preview_rows,
@@ -161,6 +162,13 @@ def process_single_video(
         rows,
         youtube_url=video.url,
         notion_schema=notion_schema,
+        logger=LOGGER,
+    )
+
+    progress("corrigindo data da sessão pelo título do vídeo")
+    rows = enrich_preview_rows_with_session_date_from_title(
+        rows,
+        youtube_url=video.url,
         logger=LOGGER,
     )
 

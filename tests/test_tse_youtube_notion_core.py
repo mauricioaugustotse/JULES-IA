@@ -4212,3 +4212,24 @@ def test_infer_full_numero_processo_from_row_text_matches_existing_short_number(
     )
 
     assert infer_full_numero_processo_from_row_text(row) == "0600249-07.2024.6.02.0001"
+
+
+def test_enrich_session_date_from_title_overrides_hallucinated_date():
+    rows = [
+        PublishPreviewRow(numero_processo="0600266-10", data_sessao="2024-05-21"),
+        PublishPreviewRow(numero_processo="0607928-52", data_sessao="2024-05-21"),
+    ]
+    out = core.enrich_preview_rows_with_session_date_from_title(
+        rows,
+        "https://www.youtube.com/watch?v=Yqr06a5zXlA",
+        title="Sessão Plenária - 29 de Fevereiro  de 2024",
+    )
+    assert all(row.data_sessao == "2024-02-29" for row in out)
+
+
+def test_enrich_session_date_from_title_keeps_date_when_title_has_no_date():
+    rows = [PublishPreviewRow(numero_processo="0600266-10", data_sessao="2024-03-10")]
+    out = core.enrich_preview_rows_with_session_date_from_title(
+        rows, "https://www.youtube.com/watch?v=VID", title="Posse de Ministro do TSE"
+    )
+    assert out[0].data_sessao == "2024-03-10"

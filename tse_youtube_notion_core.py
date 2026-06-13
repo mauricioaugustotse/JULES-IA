@@ -32,6 +32,7 @@ from tse_normalization import (
     extract_uf_from_text,
     extract_youtube_video_id,
     identity_overlay_class_key,
+    infer_session_date_from_video_title,
     composicao_regimental_issue,
     normalize_advogados_list,
     normalize_class_text,
@@ -2319,6 +2320,95 @@ def fetch_youtube_description(video_id: str, session: Optional["requests.Session
                 return ""
             time.sleep(1.0 * attempt)
     return ""
+
+
+_YOUTUBE_TITLE_RE_META = re.compile(r'<meta name="title" content="([^"]+)"')
+_YOUTUBE_TITLE_RE_PLAYER = re.compile(r'"videoDetails":\{[^}]*?"title":"(.*?)","')
+_YOUTUBE_TITLE_RE_TAG = re.compile(r"<title>([^<]+)</title>")
+
+
+def fetch_youtube_title(video_id: str, session: Optional["requests.Session"] = None) -> str:
+    """Busca o TÍTULO de um vídeo do YouTube via HTML público. Retorna "" em caso de
+    falha. O título publicado pelo TSE traz a data da sessão e é a fonte autoritativa
+    dessa data (ver ``infer_session_date_from_video_title``)."""
+    if not video_id:
+        return ""
+    getter = session.get if session is not None else requests.get
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    for attempt in range(1, 4):
+        try:
+            response = getter(
+                url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "pt-BR,pt;q=0.9"},
+                timeout=30,
+            )
+            text = getattr(response, "text", "") or ""
+            # O <meta>/<title> trazem o texto já em UTF-8 com entidades HTML; o bloco
+            # "videoDetails" do player traz o título com escapes JSON (\uXXXX, \"). Cada
+            # fonte exige um decode diferente — aplicar unicode_escape no UTF-8 do meta
+            # corromperia acentos (ex.: 'Sessão' -> 'SessÃ£o').
+            html_match = _YOUTUBE_TITLE_RE_META.search(text) or _YOUTUBE_TITLE_RE_TAG.search(text)
+            if html_match:
+                title = unescape(html_match.group(1))
+            else:
+                player_match = _YOUTUBE_TITLE_RE_PLAYER.search(text)
+                if not player_match:
+                    return ""
+                try:
+                    title = json.loads('"' + player_match.group(1) + '"')
+                except Exception:
+                    title = player_match.group(1)
+            return re.sub(r"\s*-\s*YouTube\s*$", "", str(title)).strip()
+        except Exception:
+            if attempt == 3:
+                return ""
+            time.sleep(1.0 * attempt)
+    return ""
+
+
+def enrich_preview_rows_with_session_date_from_title(
+    rows: list["PublishPreviewRow"],
+    youtube_url: str,
+    *,
+    title: Optional[str] = None,
+    logger: Optional[logging.Logger] = None,
+) -> list["PublishPreviewRow"]:
+    """Corrige a ``data_sessao`` dos preview rows usando o TÍTULO do vídeo do TSE como
+    fonte AUTORITATIVA da data da sessão. O modelo ocasionalmente alucina uma data
+    default (ex.: '2024-05-21') que não corresponde à sessão; o título publicado pelo
+    próprio tribunal ('Sessão Plenária - 29 de Fevereiro de 2024') é confiável. Só
+    sobrescreve quando consegue inferir uma data válida do título e ela difere da atual.
+    Faz parte do fluxo principal para que novas extrações já saiam com a data correta."""
+    if not rows:
+        return rows
+    if title is None:
+        video_id = extract_youtube_video_id(youtube_url)
+        if not video_id:
+            return rows
+        try:
+            title = fetch_youtube_title(video_id)
+        except Exception as exc:  # pragma: no cover - rede
+            if logger:
+                logger.warning("Falha ao buscar título do YouTube: %s", exc)
+            return rows
+    inferred = infer_session_date_from_video_title(title or "")
+    if not inferred:
+        return rows
+    applied = 0
+    for row in rows:
+        if normalize_session_date_to_iso(row.data_sessao) != inferred:
+            row.data_sessao = inferred
+            applied += 1
+        else:
+            row.data_sessao = inferred
+    if logger and applied:
+        logger.info(
+            "Título do YouTube: data da sessão corrigida para %s em %s linha(s) (título: %r).",
+            inferred,
+            applied,
+            title,
+        )
+    return rows
 
 
 def _youtube_link_has_timestamp(url: str) -> bool:

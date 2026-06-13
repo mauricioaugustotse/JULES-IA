@@ -2136,6 +2136,24 @@ def normalize_session_date_to_iso(value: str) -> str:
     return f"{year:04d}-{month:02d}-{day:02d}"
 
 
+def infer_session_date_from_video_title(title: str) -> str:
+    """Extrai a data da sessão (ISO ``YYYY-MM-DD``) a partir do título do vídeo do TSE,
+    que segue o padrão ``... - DD de <Mês> de AAAA`` (ex.: 'Sessão Plenária - 29 de
+    Fevereiro de 2024'). Tolera o ordinal '1º' e a ausência do 'de' antes do ano
+    ('13 de Fevereiro 2025'). Retorna "" quando o título não permite inferir a data.
+
+    O título publicado pelo próprio TSE é a fonte AUTORITATIVA da data da sessão e deve
+    prevalecer sobre a data extraída pelo modelo, que ocasionalmente alucina um valor
+    default (ex.: '2024-05-21')."""
+    cleaned = re.sub(r"(\d{1,2})[ºª]\b", r"\1", str(title or "").strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"(?i)(\d{1,2}\s+de\s+[a-zà-ÿç]+)\s+(\d{4})\b",
+        r"\1 de \2",
+        cleaned,
+    )
+    return normalize_session_date_to_iso(cleaned)
+
+
 def split_csv_like_text(value: str) -> list[str]:
     if not value:
         return []

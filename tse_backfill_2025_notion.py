@@ -31,6 +31,7 @@ from tse_normalization import (
     extract_uf_from_text,
     extract_youtube_video_id,
     identity_overlay_class_key,
+    infer_session_date_from_video_title,
     normalize_class_text,
     normalize_classe_processo,
     normalize_eleicao_value,
@@ -192,16 +193,6 @@ class RepairArtifactContext:
     trusted_item_by_special_process: dict[str, JudgmentItemExtraction] = field(default_factory=dict)
     best_valid_item_composicao: list[str] = field(default_factory=list)
     valid_item_composition_by_date: dict[str, list[str]] = field(default_factory=dict)
-
-
-def infer_session_date_from_video_title(title: str) -> str:
-    cleaned = re.sub(r"(\d{1,2})[ºª]\b", r"\1", str(title or "").strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(
-        r"(?i)(\d{1,2}\s+de\s+[a-zà-ÿç]+)\s+(\d{4})\b",
-        r"\1 de \2",
-        cleaned,
-    )
-    return normalize_session_date_to_iso(cleaned)
 
 
 def _now_iso() -> str:
