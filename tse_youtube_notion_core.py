@@ -3979,6 +3979,7 @@ class GeminiSessionExtractor:
         enable_start_refinement: bool = ENABLE_START_REFINEMENT,
         enable_transition_refinement: bool = ENABLE_TRANSITION_REFINEMENT,
         conditional_start_refinement: bool = CONDITIONAL_START_REFINEMENT,
+        allow_transcript_fallback: bool = True,
     ) -> None:
         if not api_key:
             raise ValueError("GEMINI_API_KEY/GOOGLE_API_KEY não encontrado.")
@@ -3994,6 +3995,12 @@ class GeminiSessionExtractor:
         self.enable_start_refinement = enable_start_refinement
         self.enable_transition_refinement = enable_transition_refinement
         self.conditional_start_refinement = conditional_start_refinement
+        # Salvaguarda de qualidade: quando False, a extração EXIGE o vídeo. Se o Gemini
+        # não consegue processar o vídeo (ex.: vídeo recém-saído de transmissão ao vivo,
+        # ainda não disponibilizado como VOD), NÃO cai no fallback de transcrição (que
+        # produz registros rasos — sem número/resultado, composição inflada). Em vez disso
+        # falha, marcando o vídeo como erro para ser reprocessado quando o VOD estabilizar.
+        self.allow_transcript_fallback = allow_transcript_fallback
         self._transcript_snippets_cache: list[TranscriptSnippet] | None = None
 
     def analyze_session(self, youtube_url: str) -> AnalysisResult:
@@ -4339,6 +4346,19 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                 continue
             if extracted_chunks:
                 return self._merge_session_chunks(extracted_chunks)
+        if not getattr(self, "allow_transcript_fallback", True):
+            # Salvaguarda: não rebaixa para transcrição (registros rasos). Falha para que
+            # o vídeo seja reprocessado por vídeo quando o Gemini conseguir baixá-lo.
+            message = (
+                "Extração por VÍDEO falhou em todos os planos e o fallback de transcrição "
+                "está desativado (allow_transcript_fallback=False). Provável vídeo recém-saído "
+                "de transmissão ao vivo, ainda não processável pelo Gemini — reprocessar por "
+                "vídeo quando o VOD estabilizar."
+            )
+            self.logger.warning("%s", message)
+            if last_error is not None:
+                raise RuntimeError(message) from last_error
+            raise RuntimeError(message)
         try:
             transcript_chunks = self._extract_session_windows_from_transcript(youtube_url)
         except Exception as exc:
@@ -4628,6 +4648,15 @@ Contexto global:
                 artifact_name=f"raw_detail_{index:02d}.txt",
             )
         except Exception as exc:
+            if not getattr(self, "allow_transcript_fallback", True):
+                # Salvaguarda: não rebaixa o bloco para transcrição. Propaga o erro para que
+                # vire placeholder bloqueável (não publica registro raso para este processo).
+                self.logger.warning(
+                    "Falha na extração em vídeo do bloco %s; fallback de transcrição desativado: %s",
+                    index,
+                    exc,
+                )
+                raise
             self.logger.warning(
                 "Falha na extração detalhada em vídeo do bloco %s; tentando fallback por transcrição: %s",
                 index,

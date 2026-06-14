@@ -88,6 +88,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="Limita nº de registros (piloto). 0 = todos.")
     parser.add_argument("--all", action="store_true", help="Inclui registros que já têm alguma notícia.")
     parser.add_argument("--resume", action="store_true", help="Pula registros já processados em execuções anteriores (artifacts/notion_news_backfill/_done_ids.txt).")
+    parser.add_argument("--video-ids", default="", help="Restringe aos vídeos informados (ids separados por vírgula): só enriquece páginas cujo youtube_link contém um desses ids.")
     parser.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -103,6 +104,13 @@ def main() -> int:
 
     candidates = [p for p in pages if args.all or not _has_any_news(p)]
     candidates = [p for p in candidates if client._extract_property_text(p, schema, "tema").strip() or client._extract_property_text(p, schema, "numero_processo").strip()]
+    if args.video_ids:
+        wanted = {v.strip() for v in args.video_ids.split(",") if v.strip()}
+        candidates = [
+            p for p in candidates
+            if any(v in (client._extract_property_text(p, schema, "youtube_link") or "") for v in wanted)
+        ]
+        LOGGER.info("Filtro --video-ids: %s vídeos -> %s páginas candidatas.", len(wanted), len(candidates))
     if args.resume and DONE_FILE.exists():
         done_ids = {line.strip() for line in DONE_FILE.read_text(encoding="utf-8").splitlines() if line.strip()}
         before = len(candidates)

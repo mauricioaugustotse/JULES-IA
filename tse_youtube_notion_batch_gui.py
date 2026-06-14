@@ -62,6 +62,11 @@ class BatchOptions:
     with_news: bool
     publish: bool
     continue_on_error: bool
+    # Salvaguarda de qualidade: por padrao EXIGE extracao por video. Se o Gemini nao
+    # processar o video (ex.: sessao recem-transmitida ao vivo, ainda nao disponivel como
+    # VOD), o video falha e e reprocessado depois — em vez de publicar registros rasos
+    # vindos da transcricao (sem numero/resultado, composicao inflada).
+    allow_transcript_fallback: bool = False
     # --- GOING-FORWARD: tratamentos pos-publicacao (defaults ligados) ---
     post_publish_steps: tuple = ("materia", "suspenso", "classe_nomes", "sanear")
     recolor_labels: bool = True          # Playwright recolore/exclui orfas (degrada se Edge ausente)
@@ -138,15 +143,23 @@ def process_single_video(
     gemini_api_key: str,
     options: BatchOptions,
     progress: Callable[[str], None],
+    analysis: Any | None = None,
 ) -> dict[str, Any]:
-    progress("analisando video")
-    extractor = GeminiSessionExtractor(
-        api_key=gemini_api_key,
-        model=options.model,
-        artifact_store=artifact_store,
-        logger=LOGGER,
-    )
-    analysis = extractor.analyze_session(video.url)
+    # ``analysis`` pre-extraido (IA bruta vinda dos artefatos) pula a extracao pelo
+    # Gemini e segue por TODAS as demais etapas de padronizacao iguais ao fluxo normal
+    # (capitulos, data pelo titulo, CNJ, metadados, tema/punchline, noticias, publish).
+    if analysis is None:
+        progress("analisando video")
+        extractor = GeminiSessionExtractor(
+            api_key=gemini_api_key,
+            model=options.model,
+            artifact_store=artifact_store,
+            logger=LOGGER,
+            allow_transcript_fallback=options.allow_transcript_fallback,
+        )
+        analysis = extractor.analyze_session(video.url)
+    else:
+        progress("usando analise pre-extraida dos artefatos (IA bruta)")
     artifact_store.write_json("03_analysis.json", analysis.model_dump(mode="json"))
 
     progress("montando previa")
@@ -312,6 +325,7 @@ def process_video_batch(
     output_queue: "queue.Queue[tuple[str, Any]]",
     stop_event: threading.Event,
     resume_root: Path | None = None,
+    analysis_provider: Callable[[VideoInput], Any] | None = None,
 ) -> dict[str, Any]:
     runtime = build_runtime_context()
     gemini_key = runtime["gemini_api_key"]
@@ -357,6 +371,7 @@ def process_video_batch(
             LOGGER.info("[%s] %s", video.video_id, message)
 
         try:
+            injected_analysis = analysis_provider(video) if analysis_provider else None
             summary = process_single_video(
                 video,
                 artifact_store=artifact_store,
@@ -365,6 +380,7 @@ def process_video_batch(
                 gemini_api_key=gemini_key,
                 options=options,
                 progress=_progress,
+                analysis=injected_analysis,
             )
             summaries.append({"status": "done", **summary})
             final_status = (

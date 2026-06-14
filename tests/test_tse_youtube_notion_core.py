@@ -1,6 +1,8 @@
 import json
 import logging
 
+import pytest
+
 import tse_youtube_notion_core as core
 from tse_youtube_notion_core import (
     AnalysisResult,
@@ -4233,3 +4235,40 @@ def test_enrich_session_date_from_title_keeps_date_when_title_has_no_date():
         rows, "https://www.youtube.com/watch?v=VID", title="Posse de Ministro do TSE"
     )
     assert out[0].data_sessao == "2024-03-10"
+
+
+def _extractor_with_video_failing(tmp_path, monkeypatch):
+    """Monta um GeminiSessionExtractor cujas chamadas de VÍDEO sempre falham (400),
+    com a transcrição disponível como fallback — para exercitar a salvaguarda."""
+    ext = object.__new__(core.GeminiSessionExtractor)
+    ext.logger = logging.getLogger("test_extractor")
+    ext._transcript_snippets_cache = None
+    ext.artifact_store = core.RunArtifacts(tmp_path)
+    monkeypatch.setattr(core, "fetch_youtube_duration_seconds", lambda url: 600)
+
+    def boom(**kwargs):
+        raise RuntimeError("Gemini REST error 400: INVALID_ARGUMENT")
+
+    ext._extract_session_windows_for_plan = boom
+    ext._extract_session_windows_from_transcript = lambda url: [
+        core.SessionExtraction(data_sessao="2026-06-11", composicao=[], judgments=[])
+    ]
+    ext._merge_session_chunks = lambda chunks: chunks[0]
+    return ext
+
+
+def test_session_windows_aborts_when_video_fails_and_transcript_disabled(tmp_path, monkeypatch):
+    # Salvaguarda: vídeo não processável + fallback de transcrição DESLIGADO -> aborta
+    # (não publica registro raso vindo da transcrição).
+    ext = _extractor_with_video_failing(tmp_path, monkeypatch)
+    ext.allow_transcript_fallback = False
+    with pytest.raises(RuntimeError, match="transcrição está desativado"):
+        ext._extract_session_windows("https://www.youtube.com/watch?v=X")
+
+
+def test_session_windows_uses_transcript_when_fallback_enabled(tmp_path, monkeypatch):
+    # Com a transcrição permitida (--allow-transcript), mantém o comportamento antigo.
+    ext = _extractor_with_video_failing(tmp_path, monkeypatch)
+    ext.allow_transcript_fallback = True
+    result = ext._extract_session_windows("https://www.youtube.com/watch?v=X")
+    assert result.data_sessao == "2026-06-11"
