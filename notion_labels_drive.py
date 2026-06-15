@@ -63,6 +63,25 @@ def pick_page(browser):
     return browser.contexts[0].pages[0]
 
 
+def _looks_logged_out(page) -> bool:
+    """Detecta a tela de login do Notion (perfil sem sessao valida). Sem isto, com
+    o Edge oculto a etapa falharia em silencio (nenhuma etiqueta recolorida)."""
+    try:
+        url = (page.url or "").lower()
+        if any(s in url for s in ("accounts.google.com", "/login", "/signin",
+                                  "login.live.com", "appleid.apple.com")):
+            return True
+        txt = (page.inner_text("body") or "")[:2500].lower()
+    except Exception:
+        return False
+    # Tela de login: pouco texto + provedores Google/Apple/Microsoft simultaneos.
+    if len(txt) < 1500 and ("google" in txt and "apple" in txt and "microsoft" in txt):
+        return True
+    markers = ("continue with google", "continuar com o google", "log in to notion",
+               "faça login no notion", "fazer login no notion")
+    return any(m in txt for m in markers)
+
+
 def _topmost_rect(page, text):
     return page.evaluate(
         "({t})=>{" + VIS + "const tt=norm(t);let best=null,top=1e9;const w=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT);while(w.nextNode()){const el=w.currentNode;if(!vis(el))continue;if(norm(el.innerText||el.textContent||'')!==tt)continue;if(Array.from(el.children).some(c=>vis(c)&&norm(c.innerText||c.textContent||'')===tt))continue;const r=el.getBoundingClientRect();if(r.top<top){top=r.top;best={x:r.left+r.width/2,y:r.top+r.height/2};}}return best;}",
@@ -306,6 +325,13 @@ def run(args):
             return 2
         page = pick_page(browser)
         LOGGER.info("Pagina: %s", page.url)
+        if _looks_logged_out(page):
+            # reconfirma apos dar tempo de a SPA terminar de carregar (evita falso-positivo durante o load)
+            time.sleep(3.0)
+            if _looks_logged_out(page):
+                LOGGER.error("Notion DESLOGADO no perfil (%s). Abra 'Preparar Edge' e faca login; "
+                             "etiquetas NAO recoloridas.", page.url)
+                return 2
 
         def acquire_panel() -> bool:
             if args.auto_open:

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -264,42 +267,182 @@ def _gf_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _gf_run_label_recolor(cdp_url: str, output_queue: "queue.Queue[tuple[str, Any]]") -> dict[str, Any]:
+# --- Edge OCULTO para a etapa Playwright do pos-publish -----------------------
+# A etapa de etiquetas dirige o Notion via CDP. Para nao "abrir telas", quando o
+# CDP nao estiver de pe abrimos um Edge HEADLESS (sem janela) reusando o perfil
+# dedicado que ja esta logado no Notion. Os cliques sao injetados via CDP, logo
+# nao dependem de foco/janela visivel: a execucao no Notion ocorre plenamente.
+# Modo "offscreen" (janela renderizada fora da tela) fica como alternativa caso
+# algum dia o headless quebre a automacao por coordenadas.
+EDGE_HIDDEN_MODE = "headless"  # "headless" (sem janela) | "offscreen" (fora da tela)
+_EDGE_EXE_CANDIDATES = (
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+)
+_EDGE_PROFILE_DIR = str(Path(tempfile.gettempdir()) / "notion-cdp-profile")
+_EDGE_WARMUP_S = 6.0  # folga pos-CDP para o Notion renderizar a base
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _cdp_is_up(cdp_url: str, timeout: float = 1.0) -> bool:
+    try:
+        with urllib.request.urlopen((cdp_url or "").rstrip("/") + "/json/version", timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _find_edge_exe() -> str | None:
+    for p in _EDGE_EXE_CANDIDATES:
+        if Path(p).exists():
+            return p
+    return None
+
+
+def _gf_ensure_hidden_edge(
+    cdp_url: str, notion_url: str, output_queue: "queue.Queue[tuple[str, Any]]"
+) -> tuple["subprocess.Popen[Any] | None", bool]:
+    """Garante um Edge OCULTO escutando no CDP, reusando o perfil ja logado.
+    Retorna (proc, launched_by_us). Se o CDP ja estiver de pe (ex.: 'Preparar
+    Edge' aberto manualmente), NAO lanca e NAO assume a posse do processo."""
+    if _cdp_is_up(cdp_url):
+        return None, False
+    if os.name != "nt":
+        return None, False
+    exe = _find_edge_exe()
+    if not exe:
+        output_queue.put(("log", "[labels] Edge nao localizado para abrir oculto; "
+                                 "etiquetas dependem de um Edge :9222 manual.\n"))
+        return None, False
+    m = re.search(r":(\d+)", cdp_url or "")
+    port = m.group(1) if m else "9222"
+    start_url = notion_url or "https://www.notion.so"
+    args = [exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={_EDGE_PROFILE_DIR}",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-features=Translate,msEdgeWelcomePage"]
+    if EDGE_HIDDEN_MODE == "offscreen":
+        args += ["--window-position=-32000,-32000", "--window-size=1920,1080", "--new-window", start_url]
+    else:
+        args += ["--headless=new", "--window-size=1920,1080", start_url]
+    try:
+        proc = subprocess.Popen(args, close_fds=True, creationflags=_CREATE_NO_WINDOW)
+    except Exception as exc:
+        output_queue.put(("log", f"[labels] falha ao abrir Edge oculto: {exc}\n"))
+        return None, False
+    try:
+        for _ in range(40):  # ~20s para o listener do CDP subir
+            if _cdp_is_up(cdp_url):
+                output_queue.put(("log", f"[labels] Edge oculto pronto ({EDGE_HIDDEN_MODE}) em {cdp_url}.\n"))
+                time.sleep(_EDGE_WARMUP_S)
+                return proc, True
+            time.sleep(0.5)
+    except BaseException:
+        # nunca deixa o Edge orfao se a espera for interrompida (ex.: KeyboardInterrupt)
+        _gf_close_hidden_edge(proc, True, output_queue)
+        raise
+    output_queue.put(("log", "[labels] Edge oculto nao respondeu no CDP a tempo "
+                             "(perfil pode estar travado por outra instancia do Edge); seguindo.\n"))
+    return proc, True
+
+
+def _gf_close_hidden_edge(
+    proc: "subprocess.Popen[Any] | None", launched: bool,
+    output_queue: "queue.Queue[tuple[str, Any]]"
+) -> None:
+    """Encerra o Edge oculto SOMENTE se fomos nos que o lancamos (nunca derruba um
+    Edge aberto manualmente pelo usuario)."""
+    if not (launched and proc is not None):
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, creationflags=_CREATE_NO_WINDOW)
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except Exception:
+            proc.kill()
+        output_queue.put(("log", "[labels] Edge oculto encerrado.\n"))
+    except Exception as exc:
+        output_queue.put(("log", f"[labels] falha ao encerrar Edge oculto: {exc}\n"))
+
+
+def _gf_python_with_playwright() -> str:
+    """Interpretador que tenha o pacote `playwright` (exigido por notion_labels_drive.py).
+    Prefere o python atual; cai para o venv dedicado de UI (.venv-windows-notion-ui).
+    Sem isto, a etapa rodaria no .venv-win (sem playwright) e falharia no import."""
+    cands = [sys.executable,
+             str(_gf_dir() / ".venv-windows-notion-ui" / "Scripts" / "python.exe"),
+             str(_gf_dir() / ".venv-win" / "Scripts" / "python.exe"),
+             str(_gf_dir() / ".venv" / "Scripts" / "python.exe")]
+    seen: set[str] = set()
+    for c in cands:
+        if not c or c in seen or not Path(c).exists():
+            continue
+        seen.add(c)
+        try:
+            r = subprocess.run(
+                [c, "-c", "import importlib.util,sys;"
+                          "sys.exit(0 if importlib.util.find_spec('playwright') else 3)"],
+                capture_output=True, timeout=20)
+            if r.returncode == 0:
+                return c
+        except Exception:
+            continue
+    # ultimo recurso: prefere o venv de UI (unico sabidamente com playwright) se existir
+    ui = str(_gf_dir() / ".venv-windows-notion-ui" / "Scripts" / "python.exe")
+    return ui if Path(ui).exists() else sys.executable
+
+
+def _gf_run_label_recolor(cdp_url: str, notion_url: str, output_queue: "queue.Queue[tuple[str, Any]]") -> dict[str, Any]:
     """Recolore default + exclui orfas via Playwright. partes e rich_text -> NAO entra.
-    Sequencial (mesmo painel CDP). Para no 1o sinal de Edge ausente (returncode 2)."""
+    Sequencial (mesmo painel CDP). Para no 1o sinal de Edge ausente (returncode 2).
+
+    A etapa roda SEMPRE oculta: se nao houver Edge no CDP, abre um Edge headless
+    (sem janela) com o perfil ja logado e o encerra ao final. A execucao no Notion
+    e feita plenamente via CDP (cliques nao dependem de foco/janela visivel)."""
     import subprocess
     res: dict[str, Any] = {}
     edge_ok = True
-    for prop in ("origem",):  # advogados virou rich_text (sem etiquetas); composicao: NAO recolorir
-        cmd = [sys.executable, str(_gf_dir() / "notion_labels_drive.py"), "--property", prop,
-               "--auto-open", "--apply-deletes", "--cdp-url", cdp_url, "--delay-ms", "110"]
-        try:
-            p = subprocess.run(cmd, cwd=str(_gf_dir()), capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=7200)
-            for ln in (p.stdout or "").splitlines():
-                if any(k in ln for k in ("CONCLUIDO", "FALHOU", "ABORTADO", "Edge nao", "alvos")):
-                    output_queue.put(("log", f"[labels:{prop}] {ln}\n"))
-            res[prop] = p.returncode
-            if p.returncode == 2:  # Edge ausente em :9222
-                output_queue.put(("log", "[labels] Edge ausente (:9222) — etiquetas nao recoloridas. Use 'Preparar Edge'.\n"))
-                edge_ok = False; break
-        except Exception as exc:
-            res[prop] = str(exc); output_queue.put(("log", f"[labels:{prop}] erro: {exc}\n"))
-    # ORDEM ALFABETICA (origem + composicao; advogados virou rich_text, sem etiquetas)
-    if edge_ok:
-        for prop in ("origem", "composicao"):
-            cmd = [sys.executable, str(_gf_dir() / "notion_labels_drive.py"), "--property", prop,
-                   "--auto-open", "--sort-only", "--cdp-url", cdp_url]
+    pyexe = _gf_python_with_playwright()
+    edge_proc, edge_launched = _gf_ensure_hidden_edge(cdp_url, notion_url, output_queue)
+    try:
+        for prop in ("origem",):  # advogados virou rich_text (sem etiquetas); composicao: NAO recolorir
+            cmd = [pyexe, str(_gf_dir() / "notion_labels_drive.py"), "--property", prop,
+                   "--auto-open", "--apply-deletes", "--cdp-url", cdp_url, "--delay-ms", "110"]
             try:
                 p = subprocess.run(cmd, cwd=str(_gf_dir()), capture_output=True, text=True,
-                                   encoding="utf-8", errors="replace", timeout=900)
+                                   encoding="utf-8", errors="replace", timeout=7200)
                 for ln in (p.stdout or "").splitlines():
-                    if any(k in ln for k in ("ordenado", "nao encontr", "Edge nao")):
-                        output_queue.put(("log", f"[sort:{prop}] {ln}\n"))
-                res[f"sort_{prop}"] = p.returncode
+                    if any(k in ln for k in ("CONCLUIDO", "FALHOU", "ABORTADO", "Edge nao", "alvos")):
+                        output_queue.put(("log", f"[labels:{prop}] {ln}\n"))
+                res[prop] = p.returncode
+                if p.returncode == 2:  # Edge ausente OU Notion deslogado em :9222
+                    output_queue.put(("log", "[labels] Edge ausente ou Notion deslogado (:9222) — "
+                                             "etiquetas nao recoloridas. Abra 'Preparar Edge' e faca login.\n"))
+                    edge_ok = False; break
             except Exception as exc:
-                res[f"sort_{prop}"] = str(exc)
-    return res
+                res[prop] = str(exc); output_queue.put(("log", f"[labels:{prop}] erro: {exc}\n"))
+        # ORDEM ALFABETICA (origem + composicao; advogados virou rich_text, sem etiquetas)
+        if edge_ok:
+            for prop in ("origem", "composicao"):
+                cmd = [pyexe, str(_gf_dir() / "notion_labels_drive.py"), "--property", prop,
+                       "--auto-open", "--sort-only", "--cdp-url", cdp_url]
+                try:
+                    p = subprocess.run(cmd, cwd=str(_gf_dir()), capture_output=True, text=True,
+                                       encoding="utf-8", errors="replace", timeout=900)
+                    for ln in (p.stdout or "").splitlines():
+                        if any(k in ln for k in ("ordenado", "nao encontr", "Edge nao")):
+                            output_queue.put(("log", f"[sort:{prop}] {ln}\n"))
+                    res[f"sort_{prop}"] = p.returncode
+                except Exception as exc:
+                    res[f"sort_{prop}"] = str(exc)
+        return res
+    finally:
+        _gf_close_hidden_edge(edge_proc, edge_launched, output_queue)
 
 
 def _gf_run_dje_once(dje_dir: str, apply: bool, output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
@@ -427,8 +570,11 @@ def process_video_batch(
                 LOGGER.warning("Pos-publicacao (dados) falhou: %s", exc)
                 post_publish["treatments_error"] = str(exc)
         if options.recolor_labels:
-            output_queue.put(("status", "__post__", "Pos-publicacao: recolorir/excluir etiquetas (Edge)...", ""))
-            post_publish["labels"] = _gf_run_label_recolor(options.cdp_url, output_queue)
+            output_queue.put(("status", "__post__", "Pos-publicacao: recolorir/excluir etiquetas (Edge oculto)...", ""))
+            post_publish["labels"] = _gf_run_label_recolor(
+                options.cdp_url,
+                runtime.get("notion_database_url") or DEFAULT_NOTION_DATABASE_URL,
+                output_queue)
         if options.watch_dje:
             output_queue.put(("status", "__post__", "Pos-publicacao: CSVs DJE (--once)...", ""))
             post_publish["dje"] = _gf_run_dje_once(options.dje_dir, options.dje_apply, output_queue)
