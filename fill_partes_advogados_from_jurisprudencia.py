@@ -49,7 +49,7 @@ LOGGER = logging.getLogger("fill_partes_advogados_jurisprudencia")
 ARTIFACT_ROOT = Path("artifacts") / "jurisprudencia_partes_advogados"
 DEFAULT_INPUT_DIRS = [
     str(Path("artifacts") / "jurisprudencia_csv"),
-    r"C:\Users\mauri\ProjetoConversor\DJE",
+    r"C:\Users\mauri\ProjetoConversor\dje",
 ]
 APPLY_SLEEP_SECONDS = 0.2
 

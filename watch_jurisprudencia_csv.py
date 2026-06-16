@@ -237,8 +237,8 @@ def scan_once(watch_dir: Path, sizes: dict, state: dict, args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--watch-dir", default=os.environ.get("DJE_WATCH_DIR", r"C:\Users\mauri\ProjetoConversor\DJE"),
-                    help=r"Pasta a vigiar. Default: C:\Users\mauri\ProjetoConversor\DJE (env DJE_WATCH_DIR).")
+    ap.add_argument("--watch-dir", default=os.environ.get("DJE_WATCH_DIR", r"C:\Users\mauri\ProjetoConversor\dje"),
+                    help=r"Pasta a vigiar. Default: C:\Users\mauri\ProjetoConversor\dje (env DJE_WATCH_DIR).")
     ap.add_argument("--apply", action="store_true",
                     help="Grava no Notion. Sem ela: dry-run (so relatorios, nao escreve).")
     ap.add_argument("--once", action="store_true",

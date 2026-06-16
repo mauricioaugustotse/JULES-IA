@@ -185,6 +185,81 @@ def fetch_detail(session: requests.Session, nprot: str, tribunal: str = "tse") -
     return parse_detail(r.text) if r.status_code == 200 else {}
 
 
+# ---------------------------------------------------------------------------
+# Publicacoes no DJe (Diario da Justica Eletronico) extraidas do ANDAMENTO.
+# A aba "Andamento/Decisao" do SADP (POST em ExibirPartesProcessoJudDocRec.do,
+# processo fixado antes por um GET em ExibirDadosProcesso.do) traz linhas como:
+#   "Publicacao em 27/10/2017 Diario de justica eletronico N. 209 Pag. 74/75. Acordao de 01/08/2017"
+#   "Disponibilizacao no Diario da Justica Eletronico em 26/10/2017 ..."
+# Dai extraimos data de publicacao, numero da edicao, pagina(s), ato e data do ato.
+DJE_CONSULTA_URL = "https://dje-consulta.tse.jus.br/"  # sistema oficial de consulta do DJe do TSE (SPA)
+
+_PUB_RE = re.compile(
+    r"Publica[çc][aã]o em (\d{2}/\d{2}/\d{4})\s+Di[aá]rio de justi[çc]a eletr[oô]nico"
+    r"(?:\s*N\.?\s*0*(\d+))?"            # numero da edicao (sem zeros a esquerda)
+    r"(?:\s*Pag\.?\s*([\d/\-]+))?"        # pagina(s)
+    r"\s*\.?\s*"
+    # ato (Acordao, Decisao Monocratica, Intimacao...): 1 palavra + ate 3 seguintes. Os lookaheads
+    # (?!Publica)(?!Disponibiliza) impedem que o ato comece OU atravesse o inicio do PROXIMO evento
+    # (senao o quantificador engole "Publicacao em..." da entrada seguinte e a perde/funde).
+    r"((?!Publica)(?!Disponibiliza)[A-Za-zÀ-ÿ./()]+"
+    r"(?:\s+(?!de\s+\d{2}/\d{2}/\d{4})(?!d[oa]\b)(?!no\b)(?!Publica)(?!Disponibiliza)[A-Za-zÀ-ÿ./()]+){0,3})?"
+    r"(?:\s+de\s+(\d{2}/\d{2}/\d{4}))?", re.I)
+_DISP_RE = re.compile(
+    r"Disponibiliza[çc][aã]o no Di[aá]rio da Justi[çc]a Eletr[oô]nico em (\d{2}/\d{2}/\d{4})", re.I)
+
+
+def _data_key(ddmmaaaa: str) -> tuple:
+    d = (ddmmaaaa or "").split("/")
+    return (d[2], d[1], d[0]) if len(d) == 3 else ("", "", "")
+
+
+def parse_publicacoes_dje(html: str) -> list[dict]:
+    """Lista as publicacoes/disponibilizacoes no DJe achadas no andamento, mais recentes primeiro.
+    Cada item: {evento, data, edicao, pagina, ato, data_ato}."""
+    import html as _h
+    txt = re.sub(r"\s+", " ", _h.unescape(re.sub(r"<[^>]+>", " ", html or "")))
+    out: list[dict] = []
+    for m in _PUB_RE.finditer(txt):
+        ato = re.sub(r"\s+", " ", (m.group(4) or "")).strip(" .-")
+        ato = re.split(r"\s+(?:Publica|Disponibiliza)", ato)[0].strip(" .-")  # defesa: nunca colar o proximo evento
+        out.append({"evento": "publicacao", "data": m.group(1), "edicao": m.group(2) or "",
+                    "pagina": m.group(3) or "", "ato": ato, "data_ato": m.group(5) or ""})
+    for m in _DISP_RE.finditer(txt):
+        out.append({"evento": "disponibilizacao", "data": m.group(1), "edicao": "",
+                    "pagina": "", "ato": "", "data_ato": ""})
+    seen, uniq = set(), []
+    for p in sorted(out, key=lambda p: _data_key(p["data"]), reverse=True):
+        k = (p["evento"], p["data"], p["edicao"], p["pagina"], p["ato"], p["data_ato"])
+        if k not in seen:
+            seen.add(k); uniq.append(p)
+    return uniq
+
+
+def fetch_detail_e_publicacoes(session: requests.Session, nprot: str, tribunal: str = "tse") -> dict:
+    """Detalhe (partes/advogados/relator) + publicacoes no DJe, numa unica passada na mesma sessao.
+    O GET fixa o processo na sessao e da as partes; o POST traz o andamento (de onde saem as publicacoes)."""
+    if not nprot:
+        return {}
+    try:
+        rget = session.get(SADP_BASE + "ExibirDadosProcesso.do",
+                           params={"nprot": nprot, "comboTribunal": tribunal}, timeout=45)
+        if rget.status_code != 200:
+            return {}  # sem o GET ok o processo nao fica fixado na sessao -> o POST seria nao-confiavel
+        rget.encoding = "iso-8859-1"
+        det = parse_detail(rget.text)
+        # Apenas "Andamento" + "Decisão": incluir "Despachos"/"Documentos Juntados" faz o SADP
+        # devolver uma pagina vazia (sem andamento) em parte dos processos.
+        rpost = session.post(SADP_BASE + "ExibirPartesProcessoJudDocRec.do",
+                            data=[("partesSelecionadas", "Andamento"), ("partesSelecionadas", "Decisão")], timeout=45)
+        rpost.encoding = "iso-8859-1"
+        det["publicacoes_dje"] = parse_publicacoes_dje(rpost.text) if rpost.status_code == 200 else []
+        det["ok"] = True  # GET 200: detalhe válido (mesmo sem CNJ-20, caso de processos antigos)
+        return det
+    except Exception:
+        return {}  # falha de rede -> falsy, para a GUI sinalizar "detalhe indisponivel" e permitir retry
+
+
 def _pilot(n: int) -> None:
     import re as _re
     from local_secrets import get_secret

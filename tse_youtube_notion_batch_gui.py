@@ -75,7 +75,7 @@ class BatchOptions:
     recolor_labels: bool = True          # Playwright recolore/exclui orfas (degrada se Edge ausente)
     watch_dje: bool = True               # processa CSVs ja em DJE (--once)
     dje_apply: bool = True               # grava no Notion (vs dry-run)
-    dje_dir: str = r"C:\Users\mauri\ProjetoConversor\DJE"
+    dje_dir: str = r"C:\Users\mauri\ProjetoConversor\dje"
     cdp_url: str = "http://127.0.0.1:9222"
 
 
