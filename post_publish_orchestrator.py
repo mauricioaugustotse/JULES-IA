@@ -3,9 +3,11 @@ Encadeia, por SUBPROCESS (isolado + idempotente — cada script re-consulta o es
 no-downgrade), os tratamentos que deixam a base limpa/padronizada/validada/relacionada DEPOIS
 que a GUI publica um lote. Chamado por run_post_publish_treatments(...) (da GUI/app) ou via CLI.
 
-PASSOS BARATOS (Notion-only / pouca rede) — DEFAULT a cada lote:
+PASSOS DEFAULT a cada lote (Notion-only / pouca rede, exceto pedido_vista/composicao que usam IA p/ poucos casos):
   materia       -> materia_semelhante_update.py   (relations: mesmo CNJ liga registros)
   suspenso      -> recheck_suspenso_via_datajud.py (so os ~Suspenso, rapido)
+  pedido_vista  -> fill_pedido_vista_via_grounding.py (QUEM pediu vista, via noticia TSE; so "Suspenso por vista" vazios)
+  composicao    -> fix_composicao_from_transcript.py + fix_composicao_via_gemini_opening.py (fallback p/ sessao recente)
   classe_nomes  -> fix_classe_nomes.py            (nome-por-extenso -> sigla)
   sanear        -> sanear_coluna.py (advogados+composicao) (gemeos acento/junk/multi)
 
@@ -35,7 +37,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STEPS: dict[str, list[tuple[str, list[str], bool, bool]]] = {
     "materia": [("materia_semelhante_update.py", [], True, True)],
     "suspenso": [("recheck_suspenso_via_datajud.py", [], True, True)],
-    "composicao": [("fix_composicao_from_transcript.py", [], True, True)],
+    "pedido_vista": [("fill_pedido_vista_via_grounding.py", [], True, True)],
+    # composicao: transcript (gratis, sessao antiga) + opening como FALLBACK p/ sessao RECENTE
+    # (transcript indisponivel por dias); opening prioriza os videos mais recentes e limita custo.
+    "composicao": [("fix_composicao_from_transcript.py", [], True, True),
+                   ("fix_composicao_via_gemini_opening.py", ["--max-videos", "8", "--since-days", "25"], True, True)],
     "classe_nomes": [("fix_classe_nomes.py", [], True, True)],
     "sanear": [("sanear_advogados.py", [], True, True),
                ("sanear_coluna.py", ["--column", "composicao"], True, True)],
@@ -47,7 +53,7 @@ STEPS: dict[str, list[tuple[str, list[str], bool, bool]]] = {
                   ("fix_origem_via_datajud.py", [], True, False)],
     "classe_valida": [("classe_validate_datajud.py", [], True, True)],
 }
-DEFAULT_STEPS = ["materia", "suspenso", "composicao", "classe_nomes", "sanear"]
+DEFAULT_STEPS = ["materia", "suspenso", "pedido_vista", "composicao", "classe_nomes", "sanear"]
 EXPENSIVE_STEPS = ["backfill_cnj", "sadp_cnj", "sadp_origem", "origem_uf", "classe_valida"]
 ALL_STEPS = DEFAULT_STEPS + EXPENSIVE_STEPS
 

@@ -95,6 +95,7 @@ def main() -> int:
     ap.add_argument("--retries", type=int, default=2, help="Gemini-video e nao-deterministico: re-tenta no vazio")
     ap.add_argument("--model", default=DEFAULT_GEMINI_MODEL, help="flash-lite acerta a saudacao (validado jun/2026, 6/6); p/ maxima limpeza em caso dificil use gemini-2.5-pro (NAO existe gemini-3.1-flash)")
     ap.add_argument("--max-videos", type=int, default=0)
+    ap.add_argument("--since-days", type=int, default=0, help="so sessoes dos ultimos N dias (0=todas); evita re-processar backlog antigo a cada lote no fluxo going-forward")
     ap.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
@@ -144,6 +145,13 @@ def main() -> int:
             by_vid[vid].append(p)
     pend = [(vid, pgs) for vid, pgs in by_vid.items()
             if any(t(p, "relator") and not relator_in(t(p, "relator"), parse_multi_value_text(t(p, "composicao"))) for p in pgs)]
+    # prioriza as sessoes MAIS RECENTES (data_sessao desc) — assim --max-videos no fluxo
+    # going-forward pega os videos do lote novo (fallback p/ sessao sem transcript) primeiro.
+    pend.sort(key=lambda vp: max(((t(p, "data_sessao") or "")[:10]) for p in vp[1]), reverse=True)
+    if args.since_days:  # so a JANELA recente (fallback p/ transcript indisponivel); nao re-processa backlog
+        from datetime import datetime, timedelta
+        limite = (datetime.now() - timedelta(days=args.since_days)).strftime("%Y-%m-%d")
+        pend = [vp for vp in pend if max(((t(p, "data_sessao") or "")[:10]) for p in vp[1]) >= limite]
     if args.max_videos:
         pend = pend[:args.max_videos]
     LOGGER.info("videos pendentes a processar: %d (end=%ss fps=%s modelo=%s)", len(pend), args.end_seconds, args.fps, DEFAULT_GEMINI_MODEL)

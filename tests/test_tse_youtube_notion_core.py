@@ -4336,3 +4336,20 @@ def test_session_windows_uses_transcript_when_fallback_enabled(tmp_path, monkeyp
     ext.allow_transcript_fallback = True
     result = ext._extract_session_windows("https://www.youtube.com/watch?v=X")
     assert result.data_sessao == "2026-06-11"
+
+
+def test_coerce_nongrounded_invalid_json_raises_not_masked():
+    # REGRESSAO (guard): na via NAO-grounded (responseMimeType=json), um JSON vazio/truncado/prosa
+    # para SessionExtraction/JudgmentBundleExtraction DEVE levantar (aciona retries + a salvaguarda
+    # allow_transcript_fallback). Nunca pode virar objeto vazio silenciosamente.
+    for bad in ("", '{"data_sessao": "2026', "isto e prosa, nao json"):
+        raised = False
+        try:
+            core._coerce_gemini_response_model(SessionExtraction, bad)
+        except Exception:
+            raised = True
+        assert raised, f"coerce mascarou JSON invalido p/ SessionExtraction: {bad!r}"
+    # mas a remocao do code fence ```json ... ``` (comum no grounding) continua funcionando:
+    parsed = core._coerce_gemini_response_model(
+        core.ProcessMetadataResult, '```json\n{"origem": "Macapá/AP"}\n```')
+    assert parsed.origem == "Macapá/AP"

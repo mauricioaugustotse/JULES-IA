@@ -3877,7 +3877,12 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
         }:
             return response_model.model_validate({})
     try:
-        payload = json.loads(response_text)
+        # modelos às vezes embrulham o JSON em ```json ... ``` (comum no grounding); remove a cerca
+        _cleaned = (response_text or "").strip()
+        if _cleaned.startswith("```"):
+            _cleaned = re.sub(r"^```(?:json)?\s*", "", _cleaned)
+            _cleaned = re.sub(r"\s*```$", "", _cleaned).strip()
+        payload = json.loads(_cleaned)
     except Exception:
         # Respostas grounded (Google Search) vêm como TEXTO, não JSON. Para os modelos
         # de busca, extrai os URLs do próprio texto (o restante vem do groundingMetadata)
@@ -3889,6 +3894,10 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
             return response_model.model_validate({"urls": text_urls})
         if model_name == "ProcessMetadataResult":
             return response_model.model_validate({})
+        # IMPORTANTE: para os demais modelos (SessionExtraction/JudgmentBundleExtraction/etc, via
+        # NAO-grounded com responseMimeType=json) um JSON vazio/truncado/malformado DEVE levantar:
+        # e o que aciona os retries + fallback de modelo e a salvaguarda allow_transcript_fallback
+        # (evita publicar registro raso). NUNCA trocar por model_validate({}) — mascara a falha.
         return response_model.model_validate_json(response_text)
 
     if isinstance(payload, list):
