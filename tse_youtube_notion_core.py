@@ -533,7 +533,8 @@ TAREFA:
 - Complete prioritariamente o número CNJ integral do processo.
 - Só informe a cidade/UF de origem quando ela vier de forma clara junto da mesma evidência relevante para o processo. Não faça busca isolada apenas para preencher origem.
 - Se os resultados indicarem que o número consultado aparece apenas como precedente citado, e não como processo efetivamente julgado na sessão, marque is_judged_process=false.
-- Não invente número completo, origem ou classificação do item.
+- Quando o item for uma LISTA TRÍPLICE (formação de lista para vaga de membro/juiz de TRE pela classe de advogado/jurista), pesquise e devolva em indicados_lista_triplice os nomes COMPLETOS das pessoas indicadas na lista (em regra três advogados/advogadas), exatamente como publicados em fonte oficial (DJe, sites do TSE/TRE/TJ) ou imprensa jurídica confiável. Esses nomes são informação pública. Inclua apenas os nomes que você localizar com segurança para o processo específico; se não encontrar, devolva lista vazia (melhor vazio do que nome errado).
+- Não invente número completo, origem, indicados ou classificação do item.
 """
 
 THEME_REPAIR_SYSTEM_PROMPT = """
@@ -3247,6 +3248,57 @@ def build_process_metadata_context(row: "PublishPreviewRow") -> str:
     return "\n".join(lines)
 
 
+def _row_is_lista_triplice(row: "PublishPreviewRow") -> bool:
+    return "lista triplice" in normalize_class_text(getattr(row, "classe_processo", "") or "")
+
+
+_TRIPLICE_HONORIFIC_RE = re.compile(r"^\s*(?:dr|dra|sr|sra|adv|advogad[oa])\.?\s+", re.IGNORECASE)
+
+
+def _clean_triplice_indicados(values: list[str]) -> list[str]:
+    """Normaliza/dedup nomes de indicados em lista tríplice (page-values seguros). Remove
+    honoríficos (Dr./Dra.), que senão fariam o nome ser descartado como advogado."""
+    stripped: list[str] = []
+    for raw in values or []:
+        name = re.sub(r"\s+", " ", str(raw or "")).strip()
+        name = _TRIPLICE_HONORIFIC_RE.sub("", name).strip()
+        if name:
+            stripped.append(name)
+    return normalize_party_list(stripped)[:5]
+
+
+def _metadata_confidence_blocks_write(confidence: str) -> bool:
+    """Bloqueia gravação só quando o grounding declara confiança explicitamente baixa."""
+    return normalize_class_text(confidence) in {"low", "baixa", "baixo", "none", "nenhuma"}
+
+
+def _process_metadata_result_is_empty(result: "BaseModel") -> bool:
+    """ProcessMetadataResult sem nenhum campo útil (típico de resposta grounded em prosa)."""
+    return (
+        isinstance(result, ProcessMetadataResult)
+        and not result.full_numero_processo
+        and not result.origem
+        and result.is_judged_process is None
+        and not result.indicados_lista_triplice
+    )
+
+
+# O Grounding (Google Search) devolve PROSA, não JSON; esta 2ª passada SEM busca converte o
+# texto já pesquisado no schema, com as chaves EXPLÍCITAS (o REST grounded não envia
+# responseSchema, então sem isto o modelo devolve JSON com chaves próprias e o parse falha).
+PROCESS_METADATA_EXTRACTION_PROMPT = (
+    "Converta o texto pesquisado abaixo em JSON com EXATAMENTE estas chaves:\n"
+    "- full_numero_processo: número CNJ completo do processo (string; vazio se não houver)\n"
+    "- origem: cidade/UF de origem (string; vazio se não houver)\n"
+    "- is_judged_process: true se trata de processo efetivamente julgado, false se aparece só como precedente citado, null se indefinido\n"
+    "- indicados_lista_triplice: lista com os nomes completos das pessoas indicadas na lista tríplice (vazia se não for lista tríplice ou não houver nomes)\n"
+    "- confidence: alta, media ou baixa\n"
+    "- rationale: justificativa curta\n"
+    "Use EXCLUSIVAMENTE o que está no texto; não invente nomes, números ou origem.\n\n"
+    "TEXTO PESQUISADO:\n"
+)
+
+
 def _normalize_local_judgment_probe(value: str) -> str:
     normalized = normalize_class_text(unescape(str(value or "")))
     if not normalized:
@@ -3473,6 +3525,7 @@ class ProcessMetadataResult(BaseModel):
     full_numero_processo: str = ""
     origem: str = ""
     is_judged_process: bool | None = None
+    indicados_lista_triplice: list[str] = Field(default_factory=list)
     confidence: str = ""
     rationale: str = ""
 
@@ -5522,12 +5575,17 @@ class GeminiProcessMetadataEnricher:
                     continue
             has_full_cnj = bool(extract_full_cnj(row.numero_processo))
             has_origem = bool(normalize_model_text(row.origem))
-            if has_full_cnj and has_origem:
-                enriched_rows.append(row)
-                continue
-            if has_full_cnj:
-                enriched_rows.append(row)
-                continue
+            # Lista tríplice: os indicados (advogados/juristas) são públicos mas não vêm no
+            # vídeo nem na API do CNJ; buscar via grounding quando 'partes' está vazio, mesmo
+            # que o número CNJ já esteja completo (o gate normal pularia o item).
+            needs_triplice_partes = _row_is_lista_triplice(row) and not row.partes
+            if not needs_triplice_partes:
+                if has_full_cnj and has_origem:
+                    enriched_rows.append(row)
+                    continue
+                if has_full_cnj:
+                    enriched_rows.append(row)
+                    continue
 
             context = build_process_metadata_context(row)
             if not context:
@@ -5538,9 +5596,16 @@ class GeminiProcessMetadataEnricher:
                 "Analise o item processual abaixo.\n"
                 "Complete prioritariamente o número CNJ integral.\n"
                 "Só informe a cidade/UF de origem quando ela vier com clareza na mesma evidência relevante do processo.\n"
-                "Se o número pesquisado aparecer apenas como precedente citado, marque is_judged_process=false.\n\n"
-                f"Contexto:\n{context}"
+                "Se o número pesquisado aparecer apenas como precedente citado, marque is_judged_process=false.\n"
             )
+            if needs_triplice_partes:
+                prompt += (
+                    "Este item é uma LISTA TRÍPLICE: pesquise e devolva em indicados_lista_triplice "
+                    "os nomes completos das pessoas que compõem a lista (em regra três advogados/"
+                    "advogadas), conforme fonte oficial (DJe, TSE/TRE/TJ) ou imprensa jurídica; se "
+                    "não localizar com segurança, devolva lista vazia.\n"
+                )
+            prompt += f"\nContexto:\n{context}"
             candidate = row.model_copy(deep=True)
             try:
                 response = self._call_grounded_json(
@@ -5562,11 +5627,18 @@ class GeminiProcessMetadataEnricher:
                 )
                 enriched_rows.append(candidate)
                 continue
-            if response.full_numero_processo:
+            if response.full_numero_processo and not has_full_cnj:
                 candidate.numero_processo = response.full_numero_processo
             if response.origem:
                 candidate.origem = response.origem
-            if response.is_judged_process is False:
+            if needs_triplice_partes:
+                indicados = _clean_triplice_indicados(response.indicados_lista_triplice)
+                if indicados and not _metadata_confidence_blocks_write(response.confidence):
+                    candidate.partes = indicados
+                    candidate.add_warning(
+                        "partes (indicados da lista tríplice) preenchidas via busca Google; confira os nomes."
+                    )
+            elif response.is_judged_process is False:
                 if _row_has_strong_local_judgment_evidence(candidate, self.artifact_store):
                     candidate.add_warning(
                         "Grounding indicou precedente citado, mas o próprio vídeo traz prova local forte do julgamento; mantendo item."
@@ -5607,6 +5679,17 @@ class GeminiProcessMetadataEnricher:
                     timeout_seconds=DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
                 )
                 self.artifact_store.write_text(artifact_name, response_text)
+                # Grounding responde em prosa: se o schema saiu vazio mas há texto, faz uma
+                # 2ª passada SEM busca para estruturar o conteúdo já pesquisado.
+                if (
+                    response_model is ProcessMetadataResult
+                    and _process_metadata_result_is_empty(parsed)
+                    and normalize_model_text(response_text)
+                ):
+                    try:
+                        parsed = self._structure_grounded_text(response_text, response_model)
+                    except Exception as exc:  # estruturação é best-effort; mantém o vazio
+                        self.logger.warning("Falha ao estruturar texto grounded: %s", exc)
                 return parsed
             except Exception as exc:
                 last_error = exc
@@ -5622,6 +5705,20 @@ class GeminiProcessMetadataEnricher:
                     retry_delay = extract_retry_delay_seconds(exc)
                     time.sleep(max(GEMINI_RETRY_BASE_DELAY ** attempt, retry_delay))
         raise RuntimeError(f"Falha definitiva no enriquecimento de metadados processuais: {last_error}") from last_error
+
+    def _structure_grounded_text(self, text: str, response_model: type[BaseModel]) -> BaseModel:
+        """2ª passada SEM grounding: estrutura o texto já pesquisado no schema (chaves explícitas)."""
+        parsed, _, _ = call_gemini_generate_content_rest(
+            api_key=self.api_key,
+            model_name=self.model,
+            contents=[{"parts": [_build_gemini_rest_part(text=PROCESS_METADATA_EXTRACTION_PROMPT + text)]}],
+            system_instruction="Você converte um texto factual já pesquisado em JSON estruturado, sem acrescentar dados ausentes.",
+            response_model=response_model,
+            temperature=0.0,
+            use_google_search=False,
+            timeout_seconds=DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
+        )
+        return parsed
 
 
 class NotionDataSourceSchema:

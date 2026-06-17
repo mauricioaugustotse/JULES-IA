@@ -93,7 +93,7 @@ def main() -> int:
     ap.add_argument("--end-seconds", type=int, default=480, help="cobre saudacao apos as vinhetas")
     ap.add_argument("--fps", type=float, default=0.25, help="capta as placas com os nomes (visual)")
     ap.add_argument("--retries", type=int, default=2, help="Gemini-video e nao-deterministico: re-tenta no vazio")
-    ap.add_argument("--model", default=DEFAULT_GEMINI_MODEL, help="flash-lite e fraco em video; tente gemini-3.1-flash")
+    ap.add_argument("--model", default=DEFAULT_GEMINI_MODEL, help="flash-lite acerta a saudacao (validado jun/2026, 6/6); p/ maxima limpeza em caso dificil use gemini-2.5-pro (NAO existe gemini-3.1-flash)")
     ap.add_argument("--max-videos", type=int, default=0)
     ap.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     ap.add_argument("--log-level", default="INFO")

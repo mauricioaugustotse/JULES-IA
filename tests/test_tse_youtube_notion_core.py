@@ -2658,6 +2658,70 @@ def test_process_metadata_enricher_still_grounds_when_cnj_is_incomplete(tmp_path
     assert enriched[0].origem == "Brasília/DF"
 
 
+def test_process_metadata_enricher_fills_partes_for_lista_triplice(tmp_path):
+    row = PublishPreviewRow(
+        tema="Idoneidade moral em lista tríplice para TRE",
+        classe_processo="Lista Tríplice",
+        tipo_registro="Julgamento 1",
+        tribunal="TSE",
+        numero_processo="0601130-93.2026.6.00.0000",  # CNJ completo: o gate normal pularia
+        origem="Rio de Janeiro/RJ",
+        youtube_link="https://www.youtube.com/watch?v=abc123&t=10",
+        relator="Min. Ricardo Villas Bôas Cueva",
+        resultado="Provido",
+        votacao="Unânime",
+        data_sessao="2026-06-16",
+        partes=[],
+    )
+    enricher = object.__new__(GeminiProcessMetadataEnricher)
+    enricher.artifact_store = RunArtifacts(tmp_path)
+    captured = {}
+
+    def fake_call_grounded_json(*, prompt, response_model, artifact_name):
+        captured["prompt"] = prompt
+        return core.ProcessMetadataResult(
+            indicados_lista_triplice=["Dra. Fulana de Tal", "Beltrana de Souza", "Sicrana Lima"],
+            is_judged_process=True,
+            confidence="high",
+        )
+
+    enricher._call_grounded_json = fake_call_grounded_json
+
+    enriched = enricher.enrich_rows([row])
+
+    assert "LISTA TRÍPLICE" in captured["prompt"]
+    assert enriched[0].partes == core.normalize_party_list(
+        ["Fulana de Tal", "Beltrana de Souza", "Sicrana Lima"]
+    )
+    assert len(enriched[0].partes) == 3
+    # número CNJ já estava completo: não pode ser sobrescrito pelo grounding
+    assert enriched[0].numero_processo == "0601130-93.2026.6.00.0000"
+    assert any("indicados da lista tríplice" in warning for warning in enriched[0].warnings)
+
+
+def test_process_metadata_enricher_skips_lista_triplice_when_partes_present(tmp_path):
+    row = PublishPreviewRow(
+        classe_processo="Lista Tríplice",
+        tribunal="TSE",
+        numero_processo="0601130-93.2026.6.00.0000",
+        origem="Rio de Janeiro/RJ",
+        youtube_link="https://www.youtube.com/watch?v=abc123&t=10",
+        data_sessao="2026-06-16",
+        partes=["Indicada Já Existente"],
+    )
+    enricher = object.__new__(GeminiProcessMetadataEnricher)
+    enricher.artifact_store = RunArtifacts(tmp_path)
+
+    def fail_if_called(*, prompt, response_model, artifact_name):
+        raise AssertionError("grounding não deveria ser chamado quando 'partes' já existe")
+
+    enricher._call_grounded_json = fail_if_called
+
+    enriched = enricher.enrich_rows([row])
+
+    assert enriched[0].partes == ["Indicada Já Existente"]
+
+
 def test_process_metadata_enricher_keeps_item_when_grounding_marks_precedent_but_local_video_proves_overlay_judgment(tmp_path):
     row = PublishPreviewRow(
         tema="ED na PC - 060122740",
