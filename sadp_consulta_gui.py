@@ -168,7 +168,7 @@ class SadpConsultaApp:
         self.txt.tag_bind("link", "<Enter>", lambda _e: self.txt.configure(cursor="hand2"))
         self.txt.tag_bind("link", "<Leave>", lambda _e: self.txt.configure(cursor=""))
         self.txt.tag_configure("djelink", foreground="#0a58ca", underline=True)
-        self.txt.tag_bind("djelink", "<Button-1>", lambda _e: webbrowser.open(sadp.DJE_CONSULTA_URL))
+        self.txt.tag_bind("djelink", "<Button-1>", lambda _e: webbrowser.open(sadp.DJE_CONSULTA_URL + "?trib=tse"))
         self.txt.tag_bind("djelink", "<Enter>", lambda _e: self.txt.configure(cursor="hand2"))
         self.txt.tag_bind("djelink", "<Leave>", lambda _e: self.txt.configure(cursor=""))
         self._link_atual = ""
@@ -183,7 +183,7 @@ class SadpConsultaApp:
         ttk.Button(barra, text="Copiar link", command=self.copiar_link).pack(side="left", padx=(6, 0))
         ttk.Separator(barra, orient="vertical").pack(side="left", fill="y", padx=8)
         ttk.Button(barra, text="Abrir consulta DJe", command=self.abrir_consulta_dje).pack(side="left")
-        ttk.Button(barra, text="Copiar ref. DJe", command=self.copiar_ref_dje).pack(side="left", padx=(6, 0))
+        ttk.Button(barra, text="Localizar no DJe…", command=self.localizar_no_dje).pack(side="left", padx=(6, 0))
         self.var_status = tk.StringVar(value="Pronto.")
         ttk.Label(barra, textvariable=self.var_status, foreground="#444").pack(side="right")
 
@@ -194,7 +194,7 @@ class SadpConsultaApp:
         self.menu.add_command(label="Copiar link", command=self.copiar_link)
         self.menu.add_separator()
         self.menu.add_command(label="Abrir consulta DJe", command=self.abrir_consulta_dje)
-        self.menu.add_command(label="Copiar ref. DJe", command=self.copiar_ref_dje)
+        self.menu.add_command(label="Localizar no DJe…", command=self.localizar_no_dje)
 
     # ------------------------------------------------------------- busca
     def buscar(self) -> None:
@@ -511,10 +511,31 @@ class SadpConsultaApp:
         self.var_status.set("Linha copiada para a área de transferência.")
 
     def abrir_consulta_dje(self) -> None:
-        webbrowser.open(sadp.DJE_CONSULTA_URL)
-        self.var_status.set("Abrindo a consulta oficial do DJe — informe a data/edição mostrada na coluna DJe.")
+        webbrowser.open(sadp.DJE_CONSULTA_URL + "?trib=tse")
+        self.var_status.set("Abrindo a consulta oficial do DJe (TSE já selecionado) — informe a edição/ano da coluna DJe e resolva o captcha.")
 
-    def copiar_ref_dje(self) -> None:
+    @staticmethod
+    def _ano_de(data_ddmmaaaa: str) -> str:
+        """Ano (AAAA) de uma data dd/mm/aaaa — vai para o campo 'Ano' do DJe."""
+        partes = (data_ddmmaaaa or "").split("/")
+        return partes[2] if len(partes) == 3 else ""
+
+    def _copiar_valor(self, valor: str, status_var: tk.StringVar, rotulo: str) -> None:
+        if not valor:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(valor)
+        status_var.set("✓ Copiado — " + rotulo + ": " + valor[:48] + ("…" if len(valor) > 48 else ""))
+
+    def localizar_no_dje(self) -> None:
+        """Diálogo com os campos prontos para a consulta oficial do DJe (TSE).
+
+        Por que não basta um "termo de busca": o campo 'Termo de busca' do DJe faz busca
+        textual no CONTEÚDO do documento — colar ali a referência descritiva inteira não casa
+        nada. O caminho determinístico é Nº de edição + Ano (que o SADP já fornece). Pesquisar
+        e baixar o PDF exigem resolver o hCaptcha no site (só desativado na rede interna do
+        TSE), então não há como abrir o arquivo automaticamente.
+        """
         f = self._linha_selecionada()
         if not f:
             return
@@ -523,11 +544,75 @@ class SadpConsultaApp:
             messagebox.showinfo("Consulta SADP", "Esta linha não tem publicação no DJe registrada no SADP.")
             return
         cnj = f["cnj"] or f["num_unico"]
+        edicao = pref.get("edicao", "") or ""
+        ano = self._ano_de(pref.get("data", ""))
+        pagina = pref.get("pagina", "") or ""
         cauda = " ".join(x for x in (f["ident"], cnj) if x)  # evita espaço duplo quando não há identificação
-        ref = f"DJe — {self._fmt_pub_longo(pref)}" + (f" — {cauda}" if cauda else "")
-        self.root.clipboard_clear()
-        self.root.clipboard_append(ref)
-        self.var_status.set("Referência do DJe copiada: " + ref[:55] + ("…" if len(ref) > 55 else ""))
+        ref_anotacao = f"DJe — {self._fmt_pub_longo(pref)}" + (f" — {cauda}" if cauda else "")
+
+        win = tk.Toplevel(self.root)
+        win.title("Localizar no DJe — " + (f["ident"] or cnj or "processo"))
+        win.transient(self.root)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(1, weight=1)
+        status = tk.StringVar(value="")
+        st = {"row": 0}
+
+        intro = ("Preencha estes campos na consulta oficial do DJe (TSE), resolva o captcha e clique\n"
+                 "Pesquisar. Nº de edição + Ano localizam a edição com certeza; o termo de busca\n"
+                 "(número do processo) é alternativa que pode não casar no texto. Abrir o PDF exige\n"
+                 "resolver o captcha de novo — não é possível automatizar.")
+        ttk.Label(frm, text=intro, foreground="#444", justify="left").grid(
+            row=st["row"], column=0, columnspan=3, sticky="w", pady=(0, 10))
+        st["row"] += 1
+
+        def campo(rotulo: str, valor: str, dica: str = "", copiavel: bool = True) -> None:
+            row = st["row"]
+            ttk.Label(frm, text=rotulo + ":", font=("Segoe UI", 9, "bold")).grid(
+                row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
+            if copiavel:
+                # Inserir o texto direto no Entry (e só então readonly). Um tk.StringVar local
+                # seria coletado pelo GC ao fim desta função e o campo apareceria vazio — o Entry
+                # guarda só o NOME da variável Tcl, não uma referência Python que a mantenha viva.
+                ent = ttk.Entry(frm, width=46)
+                ent.insert(0, valor or "—")
+                ent.configure(state="readonly")
+                ent.grid(row=row, column=1, sticky="ew", pady=3)
+                btn = ttk.Button(frm, text="Copiar", width=8,
+                                 command=lambda: self._copiar_valor(valor, status, rotulo))
+                btn.grid(row=row, column=2, padx=(6, 0), pady=3)
+                if not valor:
+                    btn.configure(state="disabled")
+            else:
+                ttk.Label(frm, text=valor).grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
+            st["row"] += 1
+            if dica:
+                ttk.Label(frm, text=dica, foreground="#888").grid(
+                    row=st["row"], column=1, columnspan=2, sticky="w")
+                st["row"] += 1
+
+        campo("Tribunal", "Tribunal Superior Eleitoral", copiavel=False)
+        campo("Nº de edição", edicao)
+        campo("Ano", ano)
+        campo("Termo de busca", cnj, dica="alternativa à edição — pode não casar no texto")
+        dica_ref = ("para anotação; a publicação está na página " + pagina + " da edição") if pagina else "para anotação"
+        campo("Referência", ref_anotacao, dica=dica_ref)
+
+        barra = ttk.Frame(frm)
+        barra.grid(row=st["row"], column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        ttk.Button(barra, text="Abrir consulta DJe (TSE)",
+                   command=lambda: webbrowser.open(sadp.DJE_CONSULTA_URL + "?trib=tse")).pack(side="left")
+        ttk.Button(barra, text="Fechar", command=win.destroy).pack(side="right")
+        st["row"] += 1
+        ttk.Label(frm, textvariable=status, foreground="#1a7a1a").grid(
+            row=st["row"], column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        win.update_idletasks()
+        win.geometry("+%d+%d" % (self.root.winfo_rootx() + 60, self.root.winfo_rooty() + 80))
+        win.grab_set()
+        self.var_status.set("Localizar no DJe: cole os campos no site, resolva o captcha e pesquise.")
 
     def copiar_link(self) -> None:
         f = self._linha_selecionada()
