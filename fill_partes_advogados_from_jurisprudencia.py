@@ -55,14 +55,10 @@ APPLY_SLEEP_SECONDS = 0.2
 
 _LOWER_CONNECTORS = {"de", "da", "do", "das", "dos", "e", "di", "del", "la", "das"}
 _OAB_RE = re.compile(r"\(\s*OAB[^)]*\)|\bOAB[\s/:.\-].*?(?=(?:,|;|\bE\b|$))", re.IGNORECASE)
+# Registro OAB "pelado" (sem a palavra OAB) que vem colado ao nome no textoDecisao:
+# ' - BA 30276-A', ' - Df2030', ' - Rr0001917', ' - Sp447778'.
+_OAB_BARE_RE = re.compile(r"\s*[-–—]\s*[A-Za-z]{2}\s*\d{3,8}\s*[-–—/]?\s*[A-Za-z]?")
 _E_OUTROS_RE = re.compile(r"\b[Ee]\s+outr[oa]s?\b")
-# blocos de advogados no cabeçalho do textoDecisao, até o próximo rótulo em maiúsculas
-_ADV_BLOCK_RE = re.compile(
-    r"ADVOGAD[OA]S?\s*:\s*(.+?)(?=\s+(?:AGRAVANTE|AGRAVAD|RECORR|REQUER|REQUERID|IMPETR|"
-    r"EMBARG|APEL|ADVOGAD|RELATOR|RELATORA|DECIS[ÃA]O|EMENTA|INTERESSAD|PACIENTE|"
-    r"ASSISTENTE|AUTOR|R[ÉE]U|REPRESENT|LITISCONS|TERCEIRO|MINIST[ÉE]RIO\s+P[ÚU]BLICO)\b|$)",
-    re.IGNORECASE | re.DOTALL,
-)
 
 
 def _digits(value: Any) -> str:
@@ -153,17 +149,28 @@ def merge_names(current: list[str], official: list[str]) -> list[str]:
 
 
 def parse_advogados_from_texto(texto: str) -> list[str]:
-    """Extrai advogados do cabeçalho do textoDecisao: blocos 'ADVOGADO(S):', remove OAB
-    e 'e outros', proper-case e aplica normalize_advogado_name (Dr./Dra.)."""
+    """Extrai advogados dos blocos rotulados ADVOGADO(S)/representante do textoDecisao,
+    delimitados pelo próximo rótulo (via _attorney_label_blocks) e cortados no início do
+    corpo; remove OAB/'e outros', VALIDA cada candidato (anti-lixo) e normaliza (Dr./Dra.)."""
     out: list[str] = []
-    for match in _ADV_BLOCK_RE.finditer(texto or ""):
-        block = match.group(1)
+    for block in _attorney_label_blocks(texto or ""):
+        m = _BODY_START_RE.search(block)
+        if m:
+            block = block[: m.start()]
         block = _OAB_RE.sub("", block)
+        block = _OAB_BARE_RE.sub("", block)
         block = _E_OUTROS_RE.sub("", block)
+        misses = 0
         for piece in re.split(r"[;,]|\bE\b(?=\s+[A-ZÀ-Ý])", block):
             raw = piece.strip(" .,;- ")
-            if not raw or len(raw.split()) < 2 or "OAB" in raw.upper():
+            raw = re.sub(r"^[Ee]\s+", "", raw)  # remove conector 'E' inicial (artefato do split)
+            raw = re.sub(r"\s*\([^)]*$", "", raw).strip()  # parentese aberto sem fechar (ex.: '(pelo PT')
+            if not _is_plausible_advogado(raw):
+                misses += 1
+                if misses >= 2:  # 2 invalidos seguidos: o roster acabou e o corpo vazou; encerra
+                    break
                 continue
+            misses = 0
             normalized = normalize_advogado_name(proper_case(raw))
             if normalized:
                 out.append(normalized)
@@ -209,6 +216,65 @@ def _attorney_label_blocks(text: str):
             start = m.end()
             end = labels[i + 1].start() if i + 1 < len(labels) else len(text)
             yield text[start:end]
+
+
+# Início do corpo da decisão/acórdão: encerra o cabeçalho de autuação. Em CAPS para não
+# cortar nomes próprios mixed-case (salvaguarda ao delimitar o último bloco de advogados).
+_BODY_START_RE = re.compile(r"\b(?:DECIS[ÃA]O|EMENTA|AC[ÓO]RD[ÃA]O|RELAT[ÓO]RIO|VOTO|ACORDAM|VISTOS|SENTEN[ÇC]A)\b")
+# Palavra de papel processual (Recorrida, Executado, ...): REJEITA candidato a advogado que,
+# por delimitação imperfeita, tenha engolido rótulo + nome de parte.
+_ROLE_WORD_RE = re.compile(rf"\b{_PARTY_ROLE_PATTERN}\b", re.IGNORECASE)
+# Entidade/cargo (NÃO é advogado pessoa física): partido/coligação/órgão público que entra no
+# roster como representante. Termos escolhidos para não casar sobrenomes reais (ex.: 'Câmara'
+# só com qualificador; nada de termos ambíguos isolados).
+_ENTITY_RE = re.compile(
+    r"(?i)\b(?:partido|coliga\w+|diret[oó]rio|advocacia-geral|procuradoria|defensoria|"
+    r"minist[eé]rio\s+p[uú]blico|tribunal|prefeitura|vice-?prefeit\w*|governador\w*|"
+    r"assembleia\s+legislativa|c[aâ]mara\s+(?:municipal|dos|de\s+vereadores)|"
+    r"munic[ií]pio\s+de|federa[cç][aã]o|confedera[cç][aã]o|sindicato|"
+    r"uni[aã]o\s+federal|fazenda\s+(?:p[uú]blica|nacional)|governo\s+d)\b"
+)
+
+
+# Tokens que iniciam FRASE DE CORPO (texto da decisão vazado), nunca um nome de pessoa:
+# preposições, artigos, advérbios, conjunções, pronomes, verbos comuns e cargos.
+_NONNAME_FIRST = {
+    "a", "o", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das", "em",
+    "no", "na", "nos", "nas", "ao", "aos", "por", "pelo", "pela", "pelos", "pelas", "com",
+    "sem", "sob", "sobre", "ou", "e", "ha", "que", "se", "ja", "nao", "como", "quando",
+    "onde", "assim", "logo", "pois", "mas", "porem", "contudo", "entretanto", "isto", "isso",
+    "esta", "este", "esse", "essa", "tambem", "inclusive", "ainda", "data", "rel", "min",
+    "ministro", "ministra", "art", "artigo", "inciso", "lei", "codigo", "caput", "paragrafo",
+    "sumula", "fl", "fls", "resp", "respe", "havendo", "ficou", "conforme", "ademais",
+    "outrossim", "destarte", "portanto", "vistos", "trata", "cuida", "nesse", "neste", "desse",
+    "deste", "dessa", "desta", "aquele", "aquela", "outro", "outra", "outros", "outras", "seu",
+    "sua", "seus", "suas", "sendo", "tendo", "face", "ante", "apos", "perante", "mediante",
+}
+# Marca de citação processual em qualquer posição (corpo, não nome).
+_CITATION_RE = re.compile(r"(?i)\b(?:rel|min|art|inc|c[óo]digo|s[úu]mula|caput|respe?|fls?)\b\.?|§")
+
+
+def _is_plausible_advogado(raw: str) -> bool:
+    """Salvaguarda anti-lixo: descarta candidato com rótulo embutido (':'), dígito, palavra de
+    papel processual, entidade/cargo, frase de corpo (1º token funcional ou citação), 'OAB',
+    ou contagem de tokens implausível para nome de pessoa."""
+    if not raw or ":" in raw or "OAB" in raw.upper():
+        return False
+    if any(ch.isdigit() for ch in raw):  # nome de pessoa não tem dígito; OAB já foi removido antes
+        return False
+    if _ROLE_WORD_RE.search(raw) or _ENTITY_RE.search(raw) or _CITATION_RE.search(raw):
+        return False
+    toks = raw.split()
+    if not (2 <= len(toks) <= 7):
+        return False
+    first = _strip_accents(toks[0]).lower().strip(".,;()")
+    return first not in _NONNAME_FIRST
+
+
+def _clean_advogado_form(name: str) -> str:
+    """Limpa resíduos de um nome já mesclado (inclui formas pré-existentes vindas do Notion):
+    parêntese aberto sem fechar e pontuação nas bordas. Mantém siglas entre parênteses fechados."""
+    return re.sub(r"\s*\([^)]*$", "", str(name or "")).strip(" ,;-")
 
 
 def parse_advogados_from_header(*texts: str) -> list[str]:
@@ -321,8 +387,9 @@ def main() -> int:
             props["partes"] = client._build_property_value(schema, "partes", merged_partes)  # schema-driven (rich_text)
             detail["partes"] = {"old": ", ".join(cur_partes), "new": ", ".join(merged_partes)}
             stats["muda_partes"] += 1
+        merged_adv = dedupe_preserve_order([a for a in map(_clean_advogado_form, merged_adv) if a])
         if merged_adv and merged_adv != cur_adv:
-            props["advogados"] = {"multi_select": [{"name": n} for n in merged_adv]}
+            props["advogados"] = client._build_property_value(schema, "advogados", merged_adv)  # schema-driven (rich_text)
             detail["advogados"] = {"old": ", ".join(cur_adv), "new": ", ".join(merged_adv)}
             stats["muda_advogados"] += 1
         if props:
