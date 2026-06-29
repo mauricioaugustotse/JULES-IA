@@ -44,6 +44,9 @@ STATE_FILE = PERM_DIR / "_watch_state.json"
 REPORTS_DIR = SCRIPT_DIR / "artifacts" / "jurisprudencia_partes_advogados"
 PIPELINE = SCRIPT_DIR / "fill_partes_advogados_from_jurisprudencia.py"
 PIPELINE_COMP = SCRIPT_DIR / "fill_composicao_from_jurisprudencia.py"  # composicao oficial do acordao
+PIPELINE_CNJ = SCRIPT_DIR / "complete_cnj_from_jurisprudencia.py"      # completa CNJ-20 das paginas incompletas
+PIPELINE_CLASSE = SCRIPT_DIR / "classe_from_jurisprudencia.py"         # classe canonica (anti-downgrade)
+PIPELINE_META = SCRIPT_DIR / "fill_metadata_from_jurisprudencia.py"    # eleicao + origem oficiais
 
 TSE_SIGNATURE_COLS = ("siglaTribunalJE", "textoDecisao", "partes", "relatores", "numeroProcesso")
 CNJ20_RE = re.compile(r"\d{20}")
@@ -148,26 +151,29 @@ def newest_report_summary() -> dict:
         return {}
 
 
-def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict:
-    cmd = [sys.executable, str(PIPELINE), "--input-dir", str(staging), "--log-level", "WARNING"]
+def _run_one(path: Path, label: str, staging: Path, apply: bool, data_source_id: str | None, env: dict) -> None:
+    """Roda um pipeline (fill_*/classe/complete_cnj) sobre o staging; loga se retornar erro."""
+    cmd = [sys.executable, str(path), "--input-dir", str(staging), "--log-level", "WARNING"]
     if apply:
         cmd.append("--apply")
     if data_source_id:
         cmd += ["--data-source-id", data_source_id]
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     proc = subprocess.run(cmd, cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True)
     if proc.returncode != 0:
-        log(f"  ! pipeline retornou {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-400:]}")
-        return {}
-    # tambem extrai a COMPOSICAO oficial ('Composicao: Ministros...' no textoDecisao) por CNJ
-    comp_cmd = [sys.executable, str(PIPELINE_COMP), "--input-dir", str(staging), "--log-level", "WARNING"]
-    if apply:
-        comp_cmd.append("--apply")
-    if data_source_id:
-        comp_cmd += ["--data-source-id", data_source_id]
-    cproc = subprocess.run(comp_cmd, cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True)
-    if cproc.returncode != 0:
-        log(f"  ! composicao retornou {cproc.returncode}: {(cproc.stderr or cproc.stdout or '').strip()[-300:]}")
+        log(f"  ! {label} retornou {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-400:]}")
+
+
+def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict:
+    """Confronta o(s) CSV(s) do lote com a base de sessoes, na ordem:
+    1) completa o CNJ-20 das paginas incompletas (amplia o match dos demais);
+    2) partes+advogados; 3) composicao oficial; 4) classe canonica (anti-downgrade);
+    5) eleicao+origem oficiais. Cada um e seguro/idempotente (page-values)."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+    _run_one(PIPELINE_CNJ, "cnj", staging, apply, data_source_id, env)
+    _run_one(PIPELINE, "partes/advogados", staging, apply, data_source_id, env)
+    _run_one(PIPELINE_COMP, "composicao", staging, apply, data_source_id, env)
+    _run_one(PIPELINE_CLASSE, "classe", staging, apply, data_source_id, env)
+    _run_one(PIPELINE_META, "metadata", staging, apply, data_source_id, env)
     return newest_report_summary()
 
 

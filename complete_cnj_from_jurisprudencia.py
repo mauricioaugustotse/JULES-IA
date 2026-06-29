@@ -22,6 +22,7 @@ from local_secrets import get_secret
 from tse_normalization import parse_multi_value_text
 from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, NotionSessoesClient
 
+csv.field_size_limit(50 * 1024 * 1024)  # textoDecisao pode passar do default (128 KB) e abortar o DictReader
 LOGGER = logging.getLogger("complete_cnj_from_jurisprudencia")
 ARTIFACT_ROOT = Path("artifacts") / "notion_cnj_complete"
 
@@ -47,16 +48,17 @@ def format_cnj(d):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--input-dir", action="append", default=["C:\\Users\\mauri\\Downloads"])
+    ap.add_argument("--input-dir", action="append", default=None)
     ap.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
 
+    input_dirs = args.input_dir or ["C:\\Users\\mauri\\Downloads"]
     by_proc_date: dict[tuple, set] = defaultdict(set)
     by_date: dict[str, list] = defaultdict(list)
     files = []
-    for d in args.input_dir:
+    for d in input_dirs:
         files.extend(glob.glob(str(Path(d) / "*.csv")))
     for path in files:
         with open(path, encoding="utf-8-sig", newline="") as fh:

@@ -27,12 +27,18 @@ ARTIFACT_ROOT = Path("artifacts") / "notion_tipo_registro_renumber"
 def vid_t(link: str) -> tuple[str, int]:
     vid = extract_youtube_video_id(link or "")
     m = re.search(r"[?&]t=(\d+)", link or "")
-    return (vid, int(m.group(1)) if m else 0)
+    return (vid, int(m.group(1)) if m else 10**9)  # sem timestamp -> fim da sub-ordem do video
+
+
+def cur_num(tr: str) -> int:
+    m = re.match(r"Julgamento\s+(\d+)", (tr or "").strip())
+    return int(m.group(1)) if m else 10**6
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--all", action="store_true", help="Renumera TODAS as sessoes por ordem cronologica do video (nao so as com duplicata).")
     ap.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
@@ -57,10 +63,12 @@ def main() -> int:
     stats = {"sessoes_dup": 0, "paginas_renumeradas": 0, "applied": 0, "failed": 0}
     for ds, ps in by_sess.items():
         trs = [(t(p, "tipo_registro") or "").strip() for p in ps]
-        if len(set(trs)) == len(trs):
-            continue  # sem duplicata
+        if not args.all and len(set(trs)) == len(trs):
+            continue  # sem duplicata (no modo --all, processa todas)
         stats["sessoes_dup"] += 1
-        ordered = sorted(ps, key=lambda p: vid_t(t(p, "youtube_link")))
+        # ordena por (video, timestamp) e DESEMPATA pela numeracao atual (preserva a ordem ja
+        # existente quando o timestamp nao distingue -> evita reordenacao arbitraria)
+        ordered = sorted(ps, key=lambda p: (vid_t(t(p, "youtube_link")), cur_num(t(p, "tipo_registro"))))
         for i, p in enumerate(ordered, 1):
             new = f"Julgamento {i}"
             old = (t(p, "tipo_registro") or "").strip()

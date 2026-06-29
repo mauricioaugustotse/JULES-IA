@@ -24,8 +24,11 @@ from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, NotionSessoes
 
 LOGGER = logging.getLogger("fill_composicao_from_jurisprudencia")
 ARTIFACT_ROOT = Path("artifacts") / "notion_composicao_csv"
-# "Composicao: Ministros (as) <lista>" ate o fim da frase
-COMP = re.compile(r"composi[çc][aã]o:\s*ministr[oa]s?\s*(?:\(as\)|\(os\))?\s*(.+?)(?:\.\s|\bsala\b|\bbras[ií]lia\b|$)", re.I)
+# "Composicao [do julgamento]: Ministros (as) <lista>" ate o fim da frase. Captura tanto o formato
+# antigo ("Composicao: Ministros...") quanto o moderno do TSE ("Composicao do julgamento: Ministros
+# (as) ..."). NAO casa o trecho "Acompanharam o Relator os Ministros ..." (esse nao tem "composicao"),
+# que lista so quem votou com o relator -> usar a COMPOSICAO OFICIAL evita a hiperinflacao do video.
+COMP = re.compile(r"composi[çc][aã]o\s*(?:d[oa]\s+julgamento)?\s*:?\s*ministr[oa]s?\s*(?:\(as\)|\(os\))?\s*(.+?)(?:\.\s|\bsala\b|\bbras[ií]lia\b|$)", re.I)
 csv.field_size_limit(10 * 1024 * 1024)
 
 

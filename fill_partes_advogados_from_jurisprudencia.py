@@ -45,6 +45,7 @@ from tse_normalization import (
 )
 from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, NotionSessoesClient
 
+csv.field_size_limit(50 * 1024 * 1024)  # textoDecisao pode passar do default (128 KB) e abortar o DictReader
 LOGGER = logging.getLogger("fill_partes_advogados_jurisprudencia")
 ARTIFACT_ROOT = Path("artifacts") / "jurisprudencia_partes_advogados"
 DEFAULT_INPUT_DIRS = [

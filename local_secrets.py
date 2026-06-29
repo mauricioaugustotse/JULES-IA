@@ -6,7 +6,7 @@ from typing import Dict, Iterable, Optional
 
 
 SECRET_FILE_CANDIDATES = {
-    "OPENAI_API_KEY": ("CHAVE_SECRETA_API_Mauricio_local.txt", "Chave_OpenAI.txt"),
+    "OPENAI_API_KEY": ("Chave_secreta_OpenAI.txt", "CHAVE_SECRETA_API_Mauricio_local.txt", "Chave_OpenAI.txt"),
     "NOTION_API_KEY": ("Chave_Notion.txt",),
     "PERPLEXITY_API_KEY": ("Chave_secreta_Perplexity.txt",),
     "GEMINI_API_KEY": ("Chave_Gemini.txt", "Chave_Google_API.txt"),

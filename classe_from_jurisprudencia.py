@@ -18,8 +18,9 @@ from typing import Any
 from audit_notion_sessoes_round2 import notion_request_with_retry
 from local_secrets import get_secret
 from tse_normalization import normalize_classe_processo
-from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, NotionSessoesClient
+from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, SAFE_DYNAMIC_SELECT_OPTIONS, NotionSessoesClient
 
+csv.field_size_limit(50 * 1024 * 1024)  # textoDecisao pode passar do default (128 KB) e abortar o DictReader
 LOGGER = logging.getLogger("classe_from_jurisprudencia")
 ARTIFACT_ROOT = Path("artifacts") / "notion_classe_juris"
 
@@ -33,10 +34,13 @@ def iso(d):
     return f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}" if m else ""
 
 
-def csv_classe(row):
-    for field in ("descricaoClasse", "siglaClasse"):
+def csv_classe(row, known):
+    # sigla PRIMEIRO (AI/HC/AIJE/AC mapeiam melhor pela sigla que pela descricao por extenso);
+    # so aceita se o resultado for uma classe CANONICA ja conhecida da base (evita gravar por
+    # extenso, ex.: "Agravo de Instrumento", ou siglas-variantes do CSV como "REspEl"/"AREspEl").
+    for field in ("siglaClasse", "descricaoClasse"):
         c = normalize_classe_processo(row.get(field, ""))
-        if c:
+        if c and c in known:
             return c
     return ""
 
@@ -44,15 +48,27 @@ def csv_classe(row):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--input-dir", action="append", default=["C:\\Users\\mauri\\Downloads"])
+    ap.add_argument("--input-dir", action="append", default=None)
     ap.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
 
+    client = NotionSessoesClient(api_key=get_secret("NOTION_API_KEY", "NOTION_TOKEN"), data_source_id=args.data_source_id)
+    schema = client.fetch_schema()
+    pages = client.query_data_source()
+
+    def t(p, f):
+        return client._extract_property_text(p, schema, f)
+
+    # vocabulario canonico = classes que a base JA usa + as opcoes seguras conhecidas.
+    known = {c for c in (normalize_classe_processo(t(p, "classe_processo")) for p in pages) if c}
+    known |= set(SAFE_DYNAMIC_SELECT_OPTIONS.get("classe_processo", set()))
+
+    input_dirs = args.input_dir or ["C:\\Users\\mauri\\Downloads"]
     juris: dict[tuple, str] = {}
     files = []
-    for d in args.input_dir:
+    for d in input_dirs:
         files.extend(glob.glob(str(Path(d) / "*.csv")))
     for path in files:
         with open(path, encoding="utf-8-sig", newline="") as fh:
@@ -61,17 +77,10 @@ def main() -> int:
                 dt = iso(row.get("dataDecisao"))
                 if len(uni) < 20 or not dt:
                     continue
-                c = csv_classe(row)
+                c = csv_classe(row, known)
                 if c:
                     juris[(uni, dt)] = c
-    LOGGER.info("CSVs: %s | (cnj,data) com classe: %s", len(files), len(juris))
-
-    client = NotionSessoesClient(api_key=get_secret("NOTION_API_KEY", "NOTION_TOKEN"), data_source_id=args.data_source_id)
-    schema = client.fetch_schema()
-    pages = client.query_data_source()
-
-    def t(p, f):
-        return client._extract_property_text(p, schema, f)
+    LOGGER.info("CSVs: %s | (cnj,data) com classe canonica: %s | vocab: %s", len(files), len(juris), len(known))
 
     changes: list[dict[str, Any]] = []
     stats = {"match": 0, "iguais": 0, "upgrade": 0, "vazio_preenchido": 0, "downgrade_evitado": 0, "diferente_mantido": 0, "applied": 0, "failed": 0}
