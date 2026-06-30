@@ -73,9 +73,12 @@ class BatchOptions:
     # --- GOING-FORWARD: tratamentos pos-publicacao (defaults ligados) ---
     post_publish_steps: tuple = ("materia", "suspenso", "classe_nomes", "sanear")
     recolor_labels: bool = True          # Playwright recolore/exclui orfas (degrada se Edge ausente)
-    watch_dje: bool = True               # processa CSVs ja em DJE (--once)
+    # Desligado por default: o monitor independente da pasta DJe (Tarefa Agendada
+    # WatchDJe_Notion, via CRIAR_TAREFA_WATCH_DJE.ps1) cuida disso continuamente.
+    # A caixa segue na GUI para uma rodada --once manual, se desejado.
+    watch_dje: bool = False              # processa CSVs ja em DJE (--once)
     dje_apply: bool = True               # grava no Notion (vs dry-run)
-    dje_dir: str = r"C:\Users\mauri\ProjetoConversor\dje"
+    dje_dir: str = r"C:\Users\mauri\OneDrive\Documentos\12 - Consultoria Legislativa\DJe"
     cdp_url: str = "http://127.0.0.1:9222"
 
 
@@ -626,7 +629,7 @@ class BatchGuiApp:
         self.continue_on_error_var = tk.BooleanVar(value=True)
         self.post_publish_var = tk.BooleanVar(value=True)
         self.recolor_labels_var = tk.BooleanVar(value=True)
-        self.watch_dje_var = tk.BooleanVar(value=True)
+        self.watch_dje_var = tk.BooleanVar(value=False)  # monitor independente (Tarefa WatchDJe_Notion) assume; marque p/ rodada --once manual
         self.count_var = tk.StringVar(value=f"0/{MAX_LINKS} links")
         self.target_var = tk.StringVar(value=f"Notion: {DEFAULT_NOTION_DATABASE_URL}")
         self.progress_var = tk.DoubleVar(value=0.0)

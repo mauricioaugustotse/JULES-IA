@@ -41,6 +41,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 PERM_DIR = SCRIPT_DIR / "artifacts" / "jurisprudencia_csv"   # acervo permanente dos CSVs
 STATE_FILE = PERM_DIR / "_watch_state.json"
+LOCK_FILE = PERM_DIR / "_watch.lock"   # guarda de instancia unica (so no modo continuo)
+DEFAULT_WATCH_DIR = r"C:\Users\mauri\OneDrive\Documentos\12 - Consultoria Legislativa\DJe"
 REPORTS_DIR = SCRIPT_DIR / "artifacts" / "jurisprudencia_partes_advogados"
 PIPELINE = SCRIPT_DIR / "fill_partes_advogados_from_jurisprudencia.py"
 PIPELINE_COMP = SCRIPT_DIR / "fill_composicao_from_jurisprudencia.py"  # composicao oficial do acordao
@@ -54,6 +56,25 @@ CNJ20_RE = re.compile(r"\d{20}")
 
 def log(msg: str) -> None:
     print(f"{datetime.now().strftime('%H:%M:%S')} | {msg}", flush=True)
+
+
+def _setup_logging(log_file: str) -> None:
+    """Redireciona stdout/stderr para um arquivo quando rodando sem console.
+    Necessario sob pythonw.exe (Tarefa Agendada oculta): la sys.stdout pode ser None
+    e os print() do watcher quebrariam. Se --log-file vier vazio mas nao houver console,
+    cai num log default ao lado do estado."""
+    target = log_file
+    if not target and (sys.stdout is None or sys.stderr is None):
+        target = str(PERM_DIR / "watch_dje.log")
+    if not target:
+        return
+    try:
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        f = open(target, "a", encoding="utf-8", errors="replace", buffering=1)
+        sys.stdout = f
+        sys.stderr = f
+    except Exception:
+        pass
 
 
 def sha256_of(path: Path) -> str:
@@ -82,6 +103,75 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     PERM_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _pid_alive(pid: int) -> bool:
+    """True se o processo `pid` ainda existe (Windows e POSIX).
+
+    Atencao: no Windows, os.kill(pid, 0) NAO e uma checagem inocua de vida -- o sinal 0
+    e interpretado como CTRL_C_EVENT, falha para um PID arbitrario e daria 'morto' para
+    processo vivo. Por isso usamos a API Win32 (OpenProcess + WaitForSingleObject)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint
+            kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            SYNCHRONIZE = 0x00100000
+            WAIT_TIMEOUT = 0x00000102
+            ERROR_ACCESS_DENIED = 5
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not handle:
+                # sem handle: ACCESS_DENIED => existe (outro contexto); demais => nao existe
+                return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+            try:
+                return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return True  # erro inesperado: assume vivo (conservador, evita 2 watchers)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    except Exception:
+        return True
+    return True
+
+
+def acquire_lock() -> bool:
+    """Guarda de instancia unica para o modo continuo. Retorna False se ja ha um watcher
+    vivo (e o chamador deve sair). Lock orfao (PID morto) e sobrescrito."""
+    PERM_DIR.mkdir(parents=True, exist_ok=True)
+    if LOCK_FILE.exists():
+        try:
+            other = int((LOCK_FILE.read_text(encoding="utf-8").strip() or "0"))
+        except Exception:
+            other = 0
+        if other and other != os.getpid() and _pid_alive(other):
+            log(f"Ja existe um watcher rodando (PID {other}). Saindo.")
+            return False
+        # lock orfao (processo morto ou ilegivel): sobrescreve
+    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    return True
+
+
+def release_lock() -> None:
+    try:
+        if LOCK_FILE.exists():
+            try:
+                owner = int((LOCK_FILE.read_text(encoding="utf-8").strip() or "0"))
+            except Exception:
+                owner = os.getpid()
+            if owner == os.getpid():
+                LOCK_FILE.unlink()
+    except Exception:
+        pass
 
 
 def sniff_is_tse_csv(path: Path) -> tuple[bool, str]:
@@ -243,30 +333,40 @@ def scan_once(watch_dir: Path, sizes: dict, state: dict, args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--watch-dir", default=os.environ.get("DJE_WATCH_DIR", r"C:\Users\mauri\ProjetoConversor\dje"),
-                    help=r"Pasta a vigiar. Default: C:\Users\mauri\ProjetoConversor\dje (env DJE_WATCH_DIR).")
+    ap.add_argument("--watch-dir", default=os.environ.get("DJE_WATCH_DIR", DEFAULT_WATCH_DIR),
+                    help=rf"Pasta a vigiar. Default: {DEFAULT_WATCH_DIR} (env DJE_WATCH_DIR).")
     ap.add_argument("--apply", action="store_true",
                     help="Grava no Notion. Sem ela: dry-run (so relatorios, nao escreve).")
     ap.add_argument("--once", action="store_true",
                     help="Processa os CSVs ja presentes e sai (nao fica vigiando).")
     ap.add_argument("--poll-secs", type=float, default=3.0)
     ap.add_argument("--data-source-id", default=None)
+    ap.add_argument("--log-file", default="",
+                    help="Redireciona a saida para este arquivo (uso da Tarefa Agendada oculta com pythonw).")
     args = ap.parse_args()
+    _setup_logging(args.log_file)
 
     watch_dir = Path(args.watch_dir).resolve()
-    if not watch_dir.exists():
-        log(f"ERRO: pasta nao existe: {watch_dir}")
-        return 1
     PERM_DIR.mkdir(parents=True, exist_ok=True)
     if not PIPELINE.exists():
         log(f"ERRO: pipeline nao encontrado: {PIPELINE}")
         return 1
 
+    if not watch_dir.exists():
+        if args.once:
+            log(f"ERRO: pasta nao existe: {watch_dir}")
+            return 1
+        # Modo continuo: a pasta pode ainda nao ter sincronizado (OneDrive no logon).
+        # Espera ela aparecer em vez de abortar. NAO cria a pasta.
+        log(f"Pasta ainda nao existe: {watch_dir} -- aguardando aparecer (poll={args.poll_secs}s)...")
+        while not watch_dir.exists():
+            time.sleep(max(args.poll_secs, 1.0))
+        log(f"Pasta encontrada: {watch_dir}")
+
     state = load_state()
     log(f"Vigiando: {watch_dir}")
     log(f"Acervo permanente: {PERM_DIR}")
     log(f"Modo: {'APLICAR no Notion' if args.apply else 'DRY-RUN (nada escrito)'} | poll={args.poll_secs}s")
-    log("Baixe os CSVs no navegador normal; cada arquivo novo sera processado. Ctrl+C para parar.")
 
     # No modo --once, considera tudo 'estavel' de imediato (sem esperar 2 polls).
     sizes: dict = {}
@@ -280,6 +380,10 @@ def main() -> int:
         log(f"--once: {n} arquivo(s) processado(s). Saindo.")
         return 0
 
+    # Modo continuo: guarda de instancia unica (evita 2 watchers na mesma pasta/estado).
+    if not acquire_lock():
+        return 0
+    log("Baixe os CSVs no navegador normal; cada arquivo novo sera processado. Ctrl+C para parar.")
     try:
         while True:
             try:
@@ -290,6 +394,8 @@ def main() -> int:
     except KeyboardInterrupt:
         log("Encerrado pelo usuario.")
         save_state(state)
+    finally:
+        release_lock()
     return 0
 
 
