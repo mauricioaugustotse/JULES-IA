@@ -2218,3 +2218,106 @@ def build_timestamped_youtube_link(value: str, start_seconds: int | None) -> str
     if start_seconds is not None and start_seconds >= 0:
         params["t"] = str(int(start_seconds))
     return f"https://www.youtube.com/watch?{urlencode(params)}"
+
+
+# ---------------------------------------------------------------------------
+# Coerência RAG: TR do CNJ eleitoral e vocabulário de resultado por classe.
+# ---------------------------------------------------------------------------
+CNJ_ELECTORAL_UF_BY_CODE = {
+    "01": "AC",
+    "02": "AL",
+    "03": "AP",
+    "04": "AM",
+    "05": "BA",
+    "06": "CE",
+    "07": "DF",
+    "08": "ES",
+    "09": "GO",
+    "10": "MA",
+    "11": "MT",
+    "12": "MS",
+    "13": "MG",
+    "14": "PA",
+    "15": "PB",
+    "16": "PR",
+    "17": "PE",
+    "18": "PI",
+    "19": "RJ",
+    "20": "RN",
+    "21": "RS",
+    "22": "RO",
+    "23": "RR",
+    "24": "SC",
+    "25": "SE",
+    "26": "SP",
+    "27": "TO",
+}
+
+_RESULTADO_SUSPENSIVOS = {"Suspenso por vista", "Suspenso mas julgado depois", "Sobrestado", "Prejudicado"}
+_RESULTADO_RECURSAL = {
+    "Provido",
+    "Provido em parte",
+    "Desprovido",
+    "Desprovida",
+    "Não conhecido",
+    "Não conhecida",
+    "Rejeitados",
+    "Rejeitada",
+    "Acolhidos",
+    "Acolhido em parte",
+    "Deferido",
+    "Indeferido",
+    "Indeferida",
+    "Parcialmente deferido",
+    "Denegado",
+    "Concedido",
+} | _RESULTADO_SUSPENSIVOS
+_RESULTADO_PC = {
+    "Aprovada",
+    "Aprovada com ressalvas",
+    "Desaprovada",
+    "Não conhecida",
+    "Não prestadas",
+} | _RESULTADO_SUSPENSIVOS
+_RESULTADO_PA = {
+    "Aprovada",
+    "Aprovada com ressalvas",
+    "Referendada",
+    "Referendado",
+    "Não referendada",
+} | _RESULTADO_SUSPENSIVOS
+_RESULTADO_LISTA_TRIPLICE = {"Aprovada", "Devolvida"} | _RESULTADO_SUSPENSIVOS
+_CLASSE_RECURSAL_TOKENS = {
+    "agr",
+    "agrg",
+    "ai",
+    "arespe",
+    "ed",
+    "edcl",
+    "rced",
+    "respe",
+    "rhc",
+    "rms",
+    "ro",
+}
+
+
+def resultado_allowed_for_classe(classe_processo: str) -> set[str] | None:
+    """Vocabulário de resultados plausíveis por classe; None = sem checagem.
+
+    Mantido deliberadamente permissivo: só classes com vocabulário bem
+    conhecido participam (recursais, PC, PA, Lista Tríplice).
+    """
+    key = normalize_class_text(classe_processo)
+    if not key:
+        return None
+    if key in {"pc", "prestacao de contas"}:
+        return _RESULTADO_PC
+    if key in {"pa", "processo administrativo"}:
+        return _RESULTADO_PA
+    if "lista" in key and ("triplice" in key or "tripse" in key):
+        return _RESULTADO_LISTA_TRIPLICE
+    tokens = set(key.split())
+    if tokens & _CLASSE_RECURSAL_TOKENS:
+        return _RESULTADO_RECURSAL
+    return None

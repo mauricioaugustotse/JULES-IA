@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from local_secrets import get_secret, load_local_secrets
 from tse_normalization import (
+    CNJ_ELECTORAL_UF_BY_CODE,
     STATE_NAME_KEYS,
     STATE_UF,
     UF_CAPITALS,
@@ -25,6 +26,7 @@ from tse_normalization import (
     build_timestamped_youtube_link,
     canonicalize_party_option_label,
     canonicalize_numero_processo,
+    resultado_allowed_for_classe,
     dedupe_preserve_order,
     extract_chunk_judgment_process_values,
     extract_full_cnj,
@@ -360,10 +362,13 @@ GENERAL_DOMAINS_RE = re.compile(
 RECOMPUTED_ERROR_PATTERNS = (
     re.compile(r"^Valor inválido para ", re.IGNORECASE),
     re.compile(r"^Tema/título vazio\.$", re.IGNORECASE),
+    re.compile(r"^resultado 'Suspenso por vista' sem pedido_vista", re.IGNORECASE),
 )
 RECOMPUTED_WARNING_PATTERNS = (
     re.compile(r"^(?:classe_processo|tipo_registro|eleicao|origem|relator|pedido_vista|resultado|votacao) fora das opções do Notion;", re.IGNORECASE),
     re.compile(r"^(?:classe_processo|tipo_registro|eleicao|origem|tribunal|relator|pedido_vista|resultado|votacao|partes|advogados|composicao) com opções novas no Notion:", re.IGNORECASE),
+    re.compile(r"^CNJ indica UF ", re.IGNORECASE),
+    re.compile(r"^resultado '", re.IGNORECASE),
     re.compile(r"^Tema/título vazio\.$", re.IGNORECASE),
     re.compile(r"^Número do processo não identificado;", re.IGNORECASE),
     re.compile(r"^Data da sessão não identificada em formato ISO\.$", re.IGNORECASE),
@@ -3306,6 +3311,19 @@ def _normalize_local_judgment_probe(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", normalized)
 
 
+GROUNDING_INCONCLUSIVE_RATIONALE_RE = re.compile(
+    r"data[^.;]{0,60}futur|n[ãa]o (foi |fora )?localizad|n[ãa]o (foi )?encontrad|"
+    r"n[úu]mero[^.;]{0,40}incomplet|sem resultado",
+    re.IGNORECASE,
+)
+
+
+def _grounding_rationale_is_inconclusive(rationale: str) -> bool:
+    """True quando o grounding só diz que NÃO ACHOU o processo (número incompleto,
+    nada indexado, data tida como futura) — o que não é evidência de precedente."""
+    return bool(GROUNDING_INCONCLUSIVE_RATIONALE_RE.search(normalize_model_text(rationale or "")))
+
+
 def _row_has_strong_local_judgment_evidence(row: "PublishPreviewRow", artifact_store: "RunArtifacts") -> bool:
     probes = {
         _normalize_local_judgment_probe(row.numero_processo),
@@ -3448,6 +3466,341 @@ class TranscriptChunk:
     end_seconds: int
     text: str
     snippet_count: int
+
+
+# ---------------------------------------------------------------------------
+# Rito processual das sessões — camada determinística sobre a transcrição.
+#
+# O presidente estrutura a pauta com marcadores falados: cada julgamento
+# individual começa num apregoamento ("chamo a julgamento...") e termina na
+# proclamação ("proclamo o resultado") ou num pedido de vista. Esses eventos
+# corrigem o plano de janelas do scan por vídeo (fundem fatias de voto longo,
+# resgatam a sessão administrativa marcada como "cerimonial" e desligam os
+# julgamentos "em lista", ignorados por decisão de projeto). Nenhuma chamada
+# de IA: apenas regex sobre o texto normalizado (sem acentos/pontuação) de
+# pares de snippets consecutivos, porque os marcadores quebram entre legendas.
+# ---------------------------------------------------------------------------
+RITO_EVENT_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    (
+        "lista",
+        re.compile(
+            r"listas? dest[ae] pauta"
+            r"|apreg\w+ para (?:o )?julgamento (?:as|das) listas"
+            r"|cham[oa]\w*(?: \w+){0,3}? (?:as )?(?:duas |tres )?listas"
+            r"|julgamentos? em lista"
+        ),
+    ),
+    (
+        "apregoamento",
+        re.compile(
+            r"cham[oa](?: \w+){0,2}? (?:(?:a|para(?: o)?|em mesa(?: para(?: o)?)?) )?julgamento"
+            r"|apreg[ou]\w* (?:para (?:o )?julgamento )?[oa] "
+        ),
+    ),
+    ("proclamacao", re.compile(r"proclam(?:o|amos)(?: \w+){0,2}? (?:o )?resultado")),
+    (
+        "vista",
+        re.compile(r"ped(?:e|iu|ido) (?:de )?vistas?\b|antecip\w+ o pedido de vistas?"),
+    ),
+    (
+        "admin_open",
+        re.compile(r"(?:dou |)inicio a sessao administrativa|declaro aberta a sessao administrativa"),
+    ),
+    ("admin_close", re.compile(r"declaro encerrada a sessao administrativa")),
+    ("sessao_open", re.compile(r"declaro aberta a sessao")),
+)
+RITO_EVENT_DEDUPE_SECONDS = 20
+
+
+class RitoEvent(BaseModel):
+    kind: str
+    start_seconds: int
+    end_seconds: int
+    text: str = ""
+
+
+def detect_rito_events(snippets: list[TranscriptSnippet]) -> list[RitoEvent]:
+    """Varre a transcrição e devolve os eventos do rito em ordem cronológica.
+
+    O matching roda sobre o texto normalizado de cada par de snippets
+    consecutivos; eventos do mesmo tipo a menos de RITO_EVENT_DEDUPE_SECONDS
+    são deduplicados (efeito do overlap dos pares).
+    """
+    events: list[RitoEvent] = []
+    last_by_kind: dict[str, int] = {}
+    for index, snippet in enumerate(snippets):
+        nxt = snippets[index + 1] if index + 1 < len(snippets) else None
+        raw_text = snippet.text if nxt is None else f"{snippet.text} {nxt.text}"
+        normalized = normalize_class_text(raw_text)
+        if not normalized:
+            continue
+        matched: dict[str, str] = {}
+        for kind, pattern in RITO_EVENT_PATTERNS:
+            found = pattern.search(normalized)
+            if found:
+                matched[kind] = found.group(0).strip()
+        if not matched:
+            continue
+        # Chamada das listas não é apregoamento individual; abertura da sessão
+        # administrativa não é a abertura genérica da sessão.
+        if "lista" in matched:
+            matched.pop("apregoamento", None)
+        if "admin_open" in matched or "admin_close" in matched:
+            matched.pop("sessao_open", None)
+        start_seconds = int(snippet.start_seconds)
+        end_seconds = int((nxt or snippet).end_seconds)
+        for kind, text in matched.items():
+            last = last_by_kind.get(kind)
+            if last is not None and start_seconds - last < RITO_EVENT_DEDUPE_SECONDS:
+                continue
+            last_by_kind[kind] = start_seconds
+            events.append(
+                RitoEvent(kind=kind, start_seconds=start_seconds, end_seconds=end_seconds, text=text)
+            )
+    events.sort(key=lambda event: (event.start_seconds, event.kind))
+    return events
+
+
+def count_individual_apregoamentos(events: list[RitoEvent]) -> int:
+    """Apregoamentos individuais da pauta (julgamentos "em lista" ficam fora)."""
+    lista_starts = [event.start_seconds for event in events if event.kind == "lista"]
+    first_lista = min(lista_starts) if lista_starts else None
+    count = 0
+    for event in events:
+        if event.kind != "apregoamento":
+            continue
+        if first_lista is not None and event.start_seconds >= first_lista:
+            continue
+        count += 1
+    return count
+
+
+def _rito_segments(events: list[RitoEvent], tolerance: int) -> list[tuple[int, int]]:
+    """Segmentos [apregoamento, fechamento) — cada um é UM item de pauta.
+
+    O fechamento é a última proclamação/vista antes do apregoamento seguinte;
+    sem fechamento detectado, o próprio apregoamento seguinte delimita.
+    """
+    apregoamentos = [e for e in events if e.kind == "apregoamento"]
+    closers = sorted(e.start_seconds for e in events if e.kind in {"proclamacao", "vista"})
+    segments: list[tuple[int, int]] = []
+    for idx, apreg in enumerate(apregoamentos):
+        next_start = apregoamentos[idx + 1].start_seconds if idx + 1 < len(apregoamentos) else None
+        candidates = [t for t in closers if t > apreg.start_seconds]
+        if next_start is not None:
+            candidates = [t for t in candidates if t <= next_start + tolerance]
+        if candidates:
+            end = max(candidates)
+        elif next_start is not None:
+            end = next_start
+        else:
+            end = 10**9
+        segments.append((apreg.start_seconds, end))
+    return segments
+
+
+def refine_session_windows_with_rito(
+    session: SessionExtraction,
+    events: list[RitoEvent],
+    logger: Optional[logging.Logger] = None,
+) -> tuple[SessionExtraction, dict[str, Any]]:
+    """Corrige o plano de janelas com os eventos do rito (100% determinístico).
+
+    1) Reativa janelas da sessão administrativa ignoradas como "cerimoniais"
+       quando contêm um apregoamento real (PAs e listas tríplices são
+       julgamentos válidos).
+    2) Desliga janelas do bloco de julgamentos "em lista" (fora do escopo da
+       base, por decisão de projeto).
+    3) Funde janelas ativas que caem no MESMO segmento apregoamento→fechamento
+       (fatias de voto longo); janelas de segmentos diferentes nunca se fundem.
+    Não cria janelas novas e não altera nada quando não há eventos.
+    """
+    log = logger or logging.getLogger(__name__)
+    report: dict[str, Any] = {
+        "events": [event.model_dump() for event in events],
+        "adjustments": [],
+        "windows_before": len(session.judgments),
+        "apregoamentos_individuais": count_individual_apregoamentos(events),
+    }
+    if not events or not session.judgments:
+        report["windows_after"] = len(session.judgments)
+        return session, report
+
+    tolerance = GLOBAL_SCAN_OVERLAP_SECONDS
+    updated = session.model_copy(deep=True)
+    windows = updated.judgments
+
+    def window_end(window: SessionWindow) -> int:
+        if window.end_seconds is not None:
+            return int(window.end_seconds)
+        return int(window.start_seconds) + GLOBAL_SCAN_WINDOW_SECONDS
+
+    apregoamentos = [e for e in events if e.kind == "apregoamento"]
+    listas = [e for e in events if e.kind == "lista"]
+    admin_opens = [e for e in events if e.kind == "admin_open"]
+    admin_closes = [e for e in events if e.kind == "admin_close"]
+    proclamacoes = sorted(e.start_seconds for e in events if e.kind == "proclamacao")
+
+    # 0) Conteúdo pré-abertura: janelas que terminam antes do "declaro aberta a
+    # sessão" são vinhetas institucionais/citações do telão — nunca julgamento
+    # (origem dos "Julgamento 1" falsos de 23/06 a 01/07/2026).
+    opening_starts = [
+        e.start_seconds for e in events if e.kind in {"sessao_open", "admin_open"}
+    ]
+    if opening_starts:
+        session_opening = min(opening_starts)
+        for window in windows:
+            if window.should_ignore:
+                continue
+            if window_end(window) < session_opening - tolerance:
+                window.should_ignore = True
+                window.ignore_reason = "Conteúdo pré-abertura da sessão (rito na transcrição)."
+                report["adjustments"].append(
+                    {
+                        "type": "ignore_pre_session",
+                        "title_hint": window.title_hint,
+                        "start_seconds": int(window.start_seconds),
+                        "reason": window.ignore_reason,
+                    }
+                )
+
+    # 1) Resgate da sessão administrativa.
+    if admin_opens:
+        admin_start = min(e.start_seconds for e in admin_opens)
+        admin_end = min(
+            (e.start_seconds for e in admin_closes if e.start_seconds > admin_start),
+            default=None,
+        )
+        for window in windows:
+            if not window.should_ignore:
+                continue
+            w_start, w_end = int(window.start_seconds), window_end(window)
+            if w_end < admin_start - tolerance:
+                continue
+            if admin_end is not None and w_start > admin_end + tolerance:
+                continue
+            if any(w_start - tolerance <= e.start_seconds <= w_end + tolerance for e in apregoamentos):
+                window.should_ignore = False
+                window.ignore_reason = ""
+                report["adjustments"].append(
+                    {
+                        "type": "unignore_admin",
+                        "title_hint": window.title_hint,
+                        "start_seconds": w_start,
+                        "reason": "Apregoamento dentro da sessão administrativa (rito na transcrição).",
+                    }
+                )
+
+    # 2) Julgamentos em lista: ignorados por decisão de projeto.
+    for lista_event in listas:
+        next_apregoamento = min(
+            (
+                e.start_seconds
+                for e in apregoamentos
+                if e.start_seconds > lista_event.start_seconds + tolerance
+            ),
+            default=None,
+        )
+        block_end = next_apregoamento if next_apregoamento is not None else 10**9
+        for window in windows:
+            if window.should_ignore:
+                continue
+            w_start = int(window.start_seconds)
+            if lista_event.start_seconds - tolerance <= w_start < block_end:
+                window.should_ignore = True
+                window.ignore_reason = "Julgamento em lista (rito na transcrição)."
+                report["adjustments"].append(
+                    {
+                        "type": "mark_lista",
+                        "title_hint": window.title_hint,
+                        "start_seconds": w_start,
+                        "reason": window.ignore_reason,
+                    }
+                )
+
+    # 3) Fusão de fatias de voto longo por segmento do rito.
+    segments = _rito_segments(events, tolerance)
+
+    def segment_index(window: SessionWindow) -> Optional[int]:
+        midpoint = (int(window.start_seconds) + window_end(window)) / 2
+        for idx, (seg_start, seg_end) in enumerate(segments):
+            if seg_start - tolerance <= midpoint < seg_end:
+                return idx
+        return None
+
+    result_windows: list[SessionWindow] = []
+    current_group: list[SessionWindow] = []
+    current_segment: Optional[int] = None
+
+    def flush_group() -> None:
+        nonlocal current_group
+        if not current_group:
+            return
+        if len(current_group) == 1:
+            result_windows.append(current_group[0])
+        else:
+            merged = current_group[0]
+            merged.end_seconds = max(window_end(w) for w in current_group)
+            merged.title_hint = next((w.title_hint for w in current_group if w.title_hint.strip()), "")
+            merged.mentioned_process_numbers = dedupe_preserve_order(
+                number for w in current_group for number in w.mentioned_process_numbers
+            )
+            result_windows.append(merged)
+            report["adjustments"].append(
+                {
+                    "type": "merge",
+                    "title_hint": merged.title_hint,
+                    "start_seconds": int(merged.start_seconds),
+                    "end_seconds": int(merged.end_seconds or 0),
+                    "merged_windows": len(current_group),
+                    "reason": "Fatias do mesmo segmento apregoamento-fechamento (rito na transcrição).",
+                }
+            )
+            log.info(
+                "Rito: %s janelas fundidas em '%s' (t=%s)",
+                len(current_group),
+                merged.title_hint or "sem título",
+                merged.start_seconds,
+            )
+        current_group = []
+
+    def has_proclamacao_between(start: int, end: int) -> bool:
+        return any(start < t <= end for t in proclamacoes)
+
+    for window in windows:
+        if window.should_ignore:
+            flush_group()
+            current_segment = None
+            result_windows.append(window)
+            continue
+        seg = segment_index(window)
+        if seg is not None and seg == current_segment and current_group:
+            # Guarda contra apregoamento perdido na legenda: proclamação entre as
+            # janelas + números de processo disjuntos = julgamentos distintos,
+            # mesmo que o rito detectado sugira um segmento só.
+            group_numbers = {n for w in current_group for n in w.mentioned_process_numbers if n}
+            new_numbers = {n for n in window.mentioned_process_numbers if n}
+            if (
+                group_numbers
+                and new_numbers
+                and group_numbers.isdisjoint(new_numbers)
+                and has_proclamacao_between(
+                    int(current_group[-1].start_seconds), int(window.start_seconds)
+                )
+            ):
+                flush_group()
+                current_group = [window]
+                continue
+            current_group.append(window)
+            continue
+        flush_group()
+        current_segment = seg
+        current_group = [window]
+    flush_group()
+
+    updated.judgments = result_windows
+    report["windows_after"] = len(result_windows)
+    return updated, report
 
 
 class JudgmentItemExtraction(BaseModel):
@@ -3639,6 +3992,41 @@ class PublishPreviewRow(BaseModel):
             "errors": "\n".join(self.errors),
             "blocked": self.blocked,
         }
+
+    @classmethod
+    def from_editor_record(cls, record: dict[str, Any]) -> "PublishPreviewRow":
+        return cls(
+            tema=str(record.get("tema", "") or ""),
+            classe_processo=str(record.get("classe_processo", "") or ""),
+            tipo_registro=str(record.get("tipo_registro", "") or ""),
+            eleicao=str(record.get("eleicao", "") or ""),
+            origem=str(record.get("origem", "") or ""),
+            tribunal=str(record.get("tribunal", "") or ""),
+            numero_processo=str(record.get("numero_processo", "") or ""),
+            youtube_link=str(record.get("youtube_link", "") or ""),
+            relator=str(record.get("relator", "") or ""),
+            pedido_vista=str(record.get("pedido_vista", "") or ""),
+            resultado=str(record.get("resultado", "") or ""),
+            votacao=str(record.get("votacao", "") or ""),
+            data_sessao=str(record.get("data_sessao", "") or ""),
+            partes=parse_multi_value_text(record.get("partes", "")),
+            advogados=parse_multi_value_text(record.get("advogados", "")),
+            composicao=parse_multi_value_text(record.get("composicao", "")),
+            punchline=str(record.get("punchline", "") or ""),
+            analise_do_conteudo_juridico=coerce_record_text(record.get("analise_do_conteudo_juridico")),
+            fundamentacao_normativa=coerce_record_text(record.get("fundamentacao_normativa")),
+            precedentes_citados=coerce_record_text(record.get("precedentes_citados")),
+            raciocinio_juridico=coerce_record_text(record.get("raciocinio_juridico")),
+            resolucoes_citadas=coerce_record_text(record.get("resolucoes_citadas")),
+            materia_semelhante=parse_multi_value_text(record.get("materia_semelhante", "")),
+            noticia_TSE=str(record.get("noticia_TSE", "") or ""),
+            noticia_TRE=str(record.get("noticia_TRE", "") or ""),
+            noticias_gerais=parse_multi_value_text(record.get("noticias_gerais", "")),
+            page_id=str(record.get("page_id", "") or ""),
+            action=str(record.get("action", "") or "create"),
+            warnings=split_csv_like_text(str(record.get("warnings", "") or "").replace("\n", ", ")),
+            errors=split_csv_like_text(str(record.get("errors", "") or "").replace("\n", ", ")),
+        )
 
 
 def _rename_payload_keys(payload: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
@@ -3954,41 +4342,6 @@ def _coerce_gemini_response_model(response_model: type[BaseModel], response_text
 
     return response_model.model_validate(payload)
 
-    @classmethod
-    def from_editor_record(cls, record: dict[str, Any]) -> "PublishPreviewRow":
-        return cls(
-            tema=str(record.get("tema", "") or ""),
-            classe_processo=str(record.get("classe_processo", "") or ""),
-            tipo_registro=str(record.get("tipo_registro", "") or ""),
-            eleicao=str(record.get("eleicao", "") or ""),
-            origem=str(record.get("origem", "") or ""),
-            tribunal=str(record.get("tribunal", "") or ""),
-            numero_processo=str(record.get("numero_processo", "") or ""),
-            youtube_link=str(record.get("youtube_link", "") or ""),
-            relator=str(record.get("relator", "") or ""),
-            pedido_vista=str(record.get("pedido_vista", "") or ""),
-            resultado=str(record.get("resultado", "") or ""),
-            votacao=str(record.get("votacao", "") or ""),
-            data_sessao=str(record.get("data_sessao", "") or ""),
-            partes=parse_multi_value_text(record.get("partes", "")),
-            advogados=parse_multi_value_text(record.get("advogados", "")),
-            composicao=parse_multi_value_text(record.get("composicao", "")),
-            punchline=str(record.get("punchline", "") or ""),
-            analise_do_conteudo_juridico=coerce_record_text(record.get("analise_do_conteudo_juridico")),
-            fundamentacao_normativa=coerce_record_text(record.get("fundamentacao_normativa")),
-            precedentes_citados=coerce_record_text(record.get("precedentes_citados")),
-            raciocinio_juridico=coerce_record_text(record.get("raciocinio_juridico")),
-            resolucoes_citadas=coerce_record_text(record.get("resolucoes_citadas")),
-            materia_semelhante=parse_multi_value_text(record.get("materia_semelhante", "")),
-            noticia_TSE=str(record.get("noticia_TSE", "") or ""),
-            noticia_TRE=str(record.get("noticia_TRE", "") or ""),
-            noticias_gerais=parse_multi_value_text(record.get("noticias_gerais", "")),
-            page_id=str(record.get("page_id", "") or ""),
-            action=str(record.get("action", "") or "create"),
-            warnings=split_csv_like_text(str(record.get("warnings", "") or "").replace("\n", ", ")),
-            errors=split_csv_like_text(str(record.get("errors", "") or "").replace("\n", ", ")),
-        )
-
 
 @dataclass
 class NotionPropertySchema:
@@ -4065,6 +4418,16 @@ class GeminiSessionExtractor:
         self.allow_transcript_fallback = allow_transcript_fallback
         self._transcript_snippets_cache: list[TranscriptSnippet] | None = None
 
+    def _fetch_transcript_snippets_best_effort(self, youtube_url: str) -> list[TranscriptSnippet] | None:
+        """Transcrição para a camada do rito: ausência NÃO é erro (vídeo sem legenda
+        segue o fluxo atual intacto)."""
+        try:
+            snippets = self._get_transcript_snippets(youtube_url)
+        except Exception as exc:
+            self.logger.info("Sem transcrição disponível para o refinamento pelo rito: %s", exc)
+            return None
+        return snippets or None
+
     def analyze_session(self, youtube_url: str) -> AnalysisResult:
         normalized_url = normalize_youtube_link(youtube_url)
         if self.artifact_store.exists("01_session_windows.json"):
@@ -4073,6 +4436,18 @@ class GeminiSessionExtractor:
             )
         else:
             session = self._extract_session_windows(normalized_url)
+            # Camada determinística do rito: corrige o plano de janelas ANTES de
+            # persistir 01_session_windows.json (retomadas via cache e os índices
+            # dos 02_judgment_NN não deslocam). Zero chamadas de IA.
+            snippets = self._fetch_transcript_snippets_best_effort(normalized_url)
+            rito_report: dict[str, Any] = {"transcript_available": bool(snippets)}
+            if snippets:
+                events = detect_rito_events(snippets)
+                session, refinement_report = refine_session_windows_with_rito(
+                    session, events, logger=self.logger
+                )
+                rito_report.update(refinement_report)
+            self.artifact_store.write_json("01b_rito_refinement.json", rito_report)
             self.artifact_store.write_json("01_session_windows.json", session.model_dump(mode="json"))
 
         bundles: list[JudgmentBundleExtraction] = []
@@ -5652,6 +6027,15 @@ class GeminiProcessMetadataEnricher:
                     candidate.add_warning(
                         "Grounding indicou precedente citado, mas o próprio vídeo traz prova local forte do julgamento; mantendo item."
                     )
+                elif _grounding_rationale_is_inconclusive(response.rationale):
+                    # A busca não achar o processo NÃO prova que ele não foi julgado:
+                    # PAs administrativos quase não têm cobertura e o buscador chegou a
+                    # tratar a data da sessão como "futura" (caso do PA 0600904-54 em
+                    # 23/06/2026, descartado por engano). Só descartamos quando o
+                    # grounding aponta positivamente o número como precedente citado.
+                    candidate.add_warning(
+                        "Grounding não localizou o processo (número incompleto/data tida como futura); item mantido para vistoria."
+                    )
                 else:
                     candidate.add_error(
                         "Busca Google indicou que o número consultado aparece como precedente citado, não como processo julgado."
@@ -5926,6 +6310,12 @@ class NotionSessoesClient:
             "parent": {"type": "data_source_id", "data_source_id": self.data_source_id},
             "properties": self.build_properties_payload(prepared_schema, row),
         }
+        # Registros novos nascem aptos ao RAG (tratamento de 02/07/2026: a flag
+        # incluir_no_rag passou a filtrar a base 'sessões' no conle_gerador).
+        # Só na criação: updates não tocam a flag para não sobrescrever curadoria manual.
+        flag_prop = prepared_schema.properties.get("incluir_no_rag")
+        if flag_prop is not None and getattr(flag_prop, "type", "") == "checkbox":
+            payload["properties"]["incluir_no_rag"] = {"checkbox": True}
         return self._request("POST", "/pages", json=payload)
 
     def _write_row_with_schema_recovery(
@@ -6639,6 +7029,45 @@ class NotionSessoesClient:
         return self._write_row_with_schema_recovery(schema, row, page_id=page_id)
 
 
+def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
+    """Checagens determinísticas de coerência para a base servir de RAG.
+
+    Rodam a cada validate_preview_row; as mensagens estão registradas nos
+    padrões RECOMPUTED_*, então revalidações não acumulam duplicatas.
+    """
+    digits = re.sub(r"\D", "", str(row.numero_processo or ""))
+    if len(digits) == 20 and digits[13] == "6":
+        tr_code = digits[14:16]
+        tribunal = str(row.tribunal or "").strip().upper()
+        origem_uf = extract_uf_from_text(row.origem)
+        if tr_code == "00":
+            if tribunal and tribunal != "TSE":
+                row.add_warning(
+                    f"CNJ indica UF do TSE (TR 00); tribunal aponta {tribunal} — conferir na vistoria."
+                )
+        else:
+            uf = CNJ_ELECTORAL_UF_BY_CODE.get(tr_code, "")
+            divergencias: list[str] = []
+            if uf and tribunal.startswith("TRE-") and tribunal != f"TRE-{uf}":
+                divergencias.append(f"tribunal {tribunal}")
+            if uf and origem_uf and origem_uf != uf:
+                divergencias.append(f"origem {row.origem}")
+            if divergencias:
+                row.add_warning(
+                    f"CNJ indica UF {uf}; " + " e ".join(divergencias) + " divergem — conferir na vistoria."
+                )
+    if row.resultado == "Suspenso por vista" and not row.pedido_vista:
+        if any(warning.startswith("Aprovado em vistoria") for warning in row.warnings):
+            row.add_warning("resultado 'Suspenso por vista' sem pedido_vista (aceito em vistoria).")
+        else:
+            row.add_error("resultado 'Suspenso por vista' sem pedido_vista identificado.")
+    allowed = resultado_allowed_for_classe(row.classe_processo)
+    if allowed is not None and row.resultado and row.resultado not in allowed:
+        row.add_warning(
+            f"resultado '{row.resultado}' incompatível com a classe {row.classe_processo} — conferir na vistoria."
+        )
+
+
 def validate_preview_row(
     row: PublishPreviewRow,
     notion_schema: Optional[NotionDataSourceSchema],
@@ -6739,6 +7168,7 @@ def validate_preview_row(
     row.tema = build_fallback_tema(row)
     if not row.pedido_vista:
         row.pedido_vista = infer_pedido_vista_from_row_text(row)
+    apply_rag_consistency_checks(row)
     row.warnings = dedupe_preserve_order(row.warnings)
     row.errors = dedupe_preserve_order(row.errors)
 
@@ -6890,6 +7320,88 @@ def assess_row_publishability(row: PublishPreviewRow) -> tuple[str, list[str]]:
     return "publish", []
 
 
+def _is_placeholder_numero_processo(numero: str) -> bool:
+    digits = re.sub(r"\D", "", str(numero or ""))
+    return bool(digits) and set(digits) == {"0"}
+
+
+INSTITUTIONAL_CONTENT_RE = re.compile(
+    r"n[ãa]o apresenta o julgamento|pe[çc]as? (publicit[áa]rias? |)instituciona|"
+    r"v[íi]deos? institucionais?|campanhas? de conscientiza[çc][ãa]o",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_non_judgment_item(row: PublishPreviewRow) -> bool:
+    """Item que não é julgamento e não deve consumir número na sequência do dia.
+
+    Cobre as vinhetas institucionais pré-sessão (biometria, desinformação etc.) que
+    a extração devolve com número placeholder (todos os dígitos zero) e os trechos
+    cuja própria análise afirma que não há julgamento — casos reais das sessões de
+    23/06 a 01/07/2026, em que esses itens viraram "Julgamento 1" e deslocaram a
+    numeração de toda a sessão.
+    """
+    if _is_placeholder_numero_processo(row.numero_processo):
+        return True
+    if not row.relator and not row.resultado and not row.votacao:
+        text = f"{row.tema} {row.analise_do_conteudo_juridico}"
+        if INSTITUTIONAL_CONTENT_RE.search(normalize_model_text(text)):
+            return True
+    return False
+
+
+def consolidate_rows_composicao(
+    rows: list[PublishPreviewRow],
+    notion_schema: Optional[NotionDataSourceSchema] = None,
+) -> None:
+    """Sanitiza a composicao extraída: normaliza, deduplica, restringe ao elenco
+    conhecido e, quando a lista exceder o plenário (7), substitui pelo conjunto de
+    participantes efetivamente identificados no vídeo (relatores e pedidos de vista).
+
+    A extração global tende a listar TODO ministro citado na sessão — inclusive os
+    de precedentes históricos e corruptelas de transcrição ("Min. Diestéfali") — o
+    que produzia listas de 13+ nomes. Nomes fora das opções já existentes no Notion
+    não são gravados (não criam opção nova); a ata oficial (fluxo DJE) refina depois.
+    """
+    participantes: list[str] = []
+    for row in rows:
+        for name in (row.relator, row.pedido_vista):
+            canonical = normalize_ministro_name(name) if name else ""
+            if canonical and canonical not in participantes:
+                participantes.append(canonical)
+
+    allowed: Optional[set[str]] = None
+    if notion_schema is not None:
+        prop = notion_schema.properties.get("composicao")
+        if prop is not None and prop.options:
+            allowed = set(prop.options)
+
+    for row in rows:
+        comp: list[str] = []
+        for name in row.composicao:
+            canonical = normalize_ministro_name(name)
+            if canonical and canonical not in comp:
+                comp.append(canonical)
+        # Lista plausível (<=7) fica intacta: um nome legítimo ainda sem opção no
+        # Notion não pode ser descartado (o aviso de "opções novas" já denuncia).
+        # O saneamento agressivo é só para as listas-salada (>7), que misturam
+        # ministros de precedentes históricos e corruptelas de transcrição.
+        if len(comp) > 7:
+            if allowed is not None:
+                dropped = [name for name in comp if name not in allowed]
+                if dropped:
+                    row.add_warning(
+                        "composicao com nomes fora do elenco conhecido (descartados): " + ", ".join(dropped)
+                    )
+                    comp = [name for name in comp if name in allowed]
+            if len(comp) > 7 and participantes:
+                comp = list(participantes)
+                row.add_warning(
+                    "composicao excedia o plenário (7); substituída pelos participantes identificados no vídeo (relatores/vistas). Confirme pela ata."
+                )
+        row.composicao = comp
+
+
 def build_preview_rows(
     analysis: AnalysisResult,
     youtube_url: str,
@@ -6953,6 +7465,10 @@ def build_preview_rows(
                 source_item_index=item_index,
             )
             row = validate_preview_row(row, notion_schema)
+            if _looks_like_non_judgment_item(row):
+                # Vinheta institucional/placeholder: não é julgamento e não deve
+                # consumir posição na numeração da sessão.
+                continue
             row_composition_issue = composicao_regimental_issue(row.composicao)
             if row.composicao and row_composition_issue:
                 row.add_warning(
@@ -6981,6 +7497,7 @@ def build_preview_rows(
                     row.action = "update"
             rows.append(row)
 
+    consolidate_rows_composicao(rows, notion_schema)
     deduped_rows = _dedupe_preview_rows(rows, youtube_url)
     for index, row in enumerate(deduped_rows, start=1):
         row.tipo_registro = f"Julgamento {index}"
@@ -7422,6 +7939,48 @@ def rows_from_editor_records(
     return rows
 
 
+def _renumber_judgments_after_skips(
+    assessed: list[tuple[PublishPreviewRow, str]],
+) -> None:
+    """Fecha os buracos de numeração deixados por itens descartados (skipped).
+
+    Um item skipped não é julgamento da sessão (ex.: número identificado como
+    precedente citado): os "Julgamento N" seguintes do mesmo vídeo/dia descem
+    uma posição para a sequência publicada sair contínua. Itens blocked
+    preservam o número (o julgamento existiu; pode ser publicado depois na
+    posição que reservou) e lotes sem skip não são renumerados — publicações
+    avulsas/parciais (scripts de manutenção) ficam intactas.
+    """
+
+    def group_key(row: PublishPreviewRow) -> tuple[str, str]:
+        return (build_video_only_youtube_link(row.youtube_link), row.data_sessao)
+
+    def judgment_number(row: PublishPreviewRow) -> Optional[int]:
+        value = str(row.tipo_registro or "").strip()
+        if not TIPO_REGISTRO_DYNAMIC_RE.match(value):
+            return None
+        digits = re.search(r"\d+", value)
+        return int(digits.group(0)) if digits else None
+
+    skipped_by_group: dict[tuple[str, str], list[int]] = {}
+    for row, disposition in assessed:
+        number = judgment_number(row)
+        if disposition == "skipped" and number is not None:
+            skipped_by_group.setdefault(group_key(row), []).append(number)
+    if not skipped_by_group:
+        return
+
+    for row, disposition in assessed:
+        if disposition == "skipped":
+            continue
+        number = judgment_number(row)
+        if number is None:
+            continue
+        shift = sum(1 for skipped in skipped_by_group.get(group_key(row), []) if skipped < number)
+        if shift:
+            row.tipo_registro = f"Julgamento {number - shift}"
+
+
 def publish_preview_rows(
     rows: list[PublishPreviewRow],
     notion_client: NotionSessoesClient,
@@ -7429,9 +7988,13 @@ def publish_preview_rows(
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     definitive_processos: set[str] = set()
+    assessed: list[tuple[PublishPreviewRow, str, list[str]]] = []
     for row in rows:
         row = validate_preview_row(row, notion_schema)
         disposition, reasons = assess_row_publishability(row)
+        assessed.append((row, disposition, reasons))
+    _renumber_judgments_after_skips([(row, disposition) for row, disposition, _ in assessed])
+    for row, disposition, reasons in assessed:
         if disposition == "skipped":
             results.append(
                 {

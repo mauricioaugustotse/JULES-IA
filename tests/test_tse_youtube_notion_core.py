@@ -27,6 +27,8 @@ from tse_youtube_notion_core import (
     TranscriptSnippet,
     ThemePunchlineRepairBatchResult,
     build_preview_rows,
+    consolidate_rows_composicao,
+    _grounding_rationale_is_inconclusive,
     compute_suspenso_star_updates,
     build_fallback_tema,
     build_editorial_punchline_fallback,
@@ -2307,6 +2309,424 @@ def test_publish_preview_rows_skips_blocked_and_updates_existing():
     assert results[0]["status"] == "updated"
     assert results[1]["status"] == "blocked"
     assert notion.updated and not notion.created
+
+
+def test_rows_from_editor_records_roundtrip():
+    schema = make_schema()
+    notion = FakeNotionClient()
+    rows = build_preview_rows(make_analysis(), "https://youtu.be/abc123", schema, notion)
+    records = core.rows_to_editor_records(rows)
+    rebuilt = core.rows_from_editor_records(records, schema)
+    assert rebuilt[0].numero_processo == rows[0].numero_processo
+    assert rebuilt[0].tema == rows[0].tema
+    assert rebuilt[0].relator == rows[0].relator
+
+
+def _snippets(*pairs):
+    result = []
+    for start, text in pairs:
+        result.append(TranscriptSnippet(text=text, start_seconds=start, end_seconds=start + 4))
+    return result
+
+
+def test_detect_rito_events_matches_asr_variants():
+    snippets = _snippets(
+        (100, "Chamo a julgamento o Processo Administrativo nº 0.600.904.54"),
+        (400, "Chama julgamento o agravo regimental no recurso ordinário"),
+        (700, "Chamo em mesa para o julgamento o primeiro item desta pauta."),
+        (1000, "Não havendo divergência, proclamo"),
+        (1004, "o resultado. O tribunal, por unanimidade,"),
+        (1300, "Pede vista de forma antecipada o ministro Dias Toffoli"),
+        (1600, "Chamo para julgamento as duas listas desta pauta que foram afixadas"),
+        (1900, "dou início à sessão administrativa. Chamo em mesa para julgamento o primeiro item"),
+        (2200, "e declaro encerrada a sessão administrativa e aberta a sessão jurisdicional"),
+    )
+    events = core.detect_rito_events(snippets)
+    kinds = [(event.kind, event.start_seconds) for event in events]
+    assert ("apregoamento", 100) in kinds
+    assert ("apregoamento", 400) in kinds
+    assert ("apregoamento", 700) in kinds
+    assert ("proclamacao", 1000) in kinds  # marcador quebrado entre dois snippets
+    assert ("vista", 1300) in kinds
+    assert ("lista", 1600) in kinds
+    assert not any(kind == "apregoamento" and start == 1600 for kind, start in kinds)
+    assert ("admin_open", 1900) in kinds
+    assert ("admin_close", 2200) in kinds
+
+
+def test_refine_windows_merges_vote_slices_between_apregoamento_and_proclamacao():
+    session = SessionExtraction(
+        data_sessao="30/06/2026",
+        judgments=[
+            SessionWindow(title_hint="060021213", start_seconds=90, end_seconds=400,
+                          mentioned_process_numbers=["0600212-13"]),
+            SessionWindow(title_hint="Não identificado", start_seconds=390, end_seconds=700),
+            SessionWindow(title_hint="REI 060154245", start_seconds=690, end_seconds=1000,
+                          mentioned_process_numbers=["0601542-45"]),
+            SessionWindow(title_hint="embargos", start_seconds=1290, end_seconds=1500,
+                          mentioned_process_numbers=["0600940-96"]),
+        ],
+    )
+    events = [
+        core.RitoEvent(kind="apregoamento", start_seconds=100, end_seconds=104),
+        core.RitoEvent(kind="proclamacao", start_seconds=1200, end_seconds=1204),
+        core.RitoEvent(kind="apregoamento", start_seconds=1280, end_seconds=1284),
+    ]
+    refined, report = core.refine_session_windows_with_rito(session, events)
+    merged = [w for w in refined.judgments if not w.should_ignore]
+    assert len(merged) == 2
+    assert merged[0].start_seconds == 90
+    assert merged[0].end_seconds == 1000
+    assert merged[0].mentioned_process_numbers == ["0600212-13", "0601542-45"]
+    assert merged[1].mentioned_process_numbers == ["0600940-96"]
+    assert any(adj["type"] == "merge" for adj in report["adjustments"])
+
+
+def test_refine_windows_never_merges_windows_from_distinct_segments():
+    session = SessionExtraction(
+        judgments=[
+            SessionWindow(title_hint="A", start_seconds=90, end_seconds=400,
+                          mentioned_process_numbers=["111-11"]),
+            SessionWindow(title_hint="B", start_seconds=490, end_seconds=900,
+                          mentioned_process_numbers=["222-22"]),
+        ],
+    )
+    events = [
+        core.RitoEvent(kind="apregoamento", start_seconds=100, end_seconds=104),
+        core.RitoEvent(kind="proclamacao", start_seconds=450, end_seconds=454),
+        core.RitoEvent(kind="apregoamento", start_seconds=500, end_seconds=504),
+        core.RitoEvent(kind="proclamacao", start_seconds=880, end_seconds=884),
+    ]
+    refined, report = core.refine_session_windows_with_rito(session, events)
+    assert len(refined.judgments) == 2
+    assert not any(adj["type"] == "merge" for adj in report["adjustments"])
+
+
+def test_refine_windows_unignores_admin_session_with_apregoamento():
+    session = SessionExtraction(
+        judgments=[
+            SessionWindow(title_hint="0600354-59", start_seconds=60, end_seconds=400,
+                          should_ignore=True,
+                          ignore_reason="Bloco cerimonial ou administrativo sem julgamento."),
+        ],
+    )
+    events = [
+        core.RitoEvent(kind="admin_open", start_seconds=50, end_seconds=54),
+        core.RitoEvent(kind="apregoamento", start_seconds=100, end_seconds=104),
+        core.RitoEvent(kind="admin_close", start_seconds=800, end_seconds=804),
+    ]
+    refined, report = core.refine_session_windows_with_rito(session, events)
+    assert refined.judgments[0].should_ignore is False
+    assert any(adj["type"] == "unignore_admin" for adj in report["adjustments"])
+
+
+def test_refine_windows_marks_lista_windows():
+    session = SessionExtraction(
+        judgments=[
+            SessionWindow(title_hint="listas finais", start_seconds=1050, end_seconds=1300),
+        ],
+    )
+    events = [core.RitoEvent(kind="lista", start_seconds=1000, end_seconds=1004)]
+    refined, report = core.refine_session_windows_with_rito(session, events)
+    assert refined.judgments[0].should_ignore is True
+    assert "lista" in refined.judgments[0].ignore_reason.lower()
+    assert any(adj["type"] == "mark_lista" for adj in report["adjustments"])
+
+
+def test_refine_windows_ignores_pre_session_content():
+    session = SessionExtraction(
+        judgments=[
+            SessionWindow(title_hint="vinheta", start_seconds=270, end_seconds=570,
+                          mentioned_process_numbers=["0600814-85"]),
+            SessionWindow(title_hint="PA real", start_seconds=1163, end_seconds=1322,
+                          mentioned_process_numbers=["0600904-54"]),
+        ],
+    )
+    events = [
+        core.RitoEvent(kind="sessao_open", start_seconds=1092, end_seconds=1096),
+        core.RitoEvent(kind="apregoamento", start_seconds=1155, end_seconds=1159),
+        core.RitoEvent(kind="proclamacao", start_seconds=1303, end_seconds=1307),
+    ]
+    refined, report = core.refine_session_windows_with_rito(session, events)
+    assert refined.judgments[0].should_ignore is True
+    assert "pré-abertura" in refined.judgments[0].ignore_reason
+    assert refined.judgments[1].should_ignore is False
+    assert any(adj["type"] == "ignore_pre_session" for adj in report["adjustments"])
+
+
+def test_refine_windows_splits_group_on_proclamacao_with_disjoint_numbers():
+    # Apregoamento do 2º julgamento perdido na legenda: proclamação entre as
+    # janelas + números disjuntos deve impedir a fusão.
+    session = SessionExtraction(
+        judgments=[
+            SessionWindow(title_hint="A", start_seconds=1620, end_seconds=1690,
+                          mentioned_process_numbers=["0600669-77"]),
+            SessionWindow(title_hint="B", start_seconds=1706, end_seconds=2335,
+                          mentioned_process_numbers=["0600379-88"]),
+        ],
+    )
+    events = [
+        core.RitoEvent(kind="apregoamento", start_seconds=1398, end_seconds=1402),
+        core.RitoEvent(kind="proclamacao", start_seconds=1690, end_seconds=1694),
+        core.RitoEvent(kind="proclamacao", start_seconds=2309, end_seconds=2313),
+        core.RitoEvent(kind="apregoamento", start_seconds=2323, end_seconds=2327),
+    ]
+    refined, report = core.refine_session_windows_with_rito(session, events)
+    active = [w for w in refined.judgments if not w.should_ignore]
+    assert len(active) == 2
+    assert not any(adj["type"] == "merge" for adj in report["adjustments"])
+
+
+def test_refine_windows_noop_without_events():
+    session = SessionExtraction(
+        judgments=[SessionWindow(title_hint="A", start_seconds=100, end_seconds=400)],
+    )
+    refined, report = core.refine_session_windows_with_rito(session, [])
+    assert refined is session
+    assert report["windows_after"] == 1
+    assert report["adjustments"] == []
+
+
+def test_apply_rag_checks_flags_cnj_uf_mismatch():
+    row = PublishPreviewRow(
+        numero_processo="0600013-53.2026.6.06.0004",
+        tribunal="TRE-PR",
+        origem="Araucária/PR",
+    )
+    core.apply_rag_consistency_checks(row)
+    assert any(w.startswith("CNJ indica UF CE") for w in row.warnings)
+
+
+def test_apply_rag_checks_accepts_matching_cnj_uf():
+    row = PublishPreviewRow(
+        numero_processo="0600669-77.2024.6.02.0008",
+        tribunal="TRE-AL",
+        origem="Pilar/AL",
+    )
+    core.apply_rag_consistency_checks(row)
+    assert not any(w.startswith("CNJ indica UF") for w in row.warnings)
+
+
+def test_apply_rag_checks_blocks_suspenso_por_vista_sem_pedido_vista():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema",
+        resultado="Suspenso por vista",
+        pedido_vista="",
+    )
+    core.apply_rag_consistency_checks(row)
+    assert any("sem pedido_vista" in e for e in row.errors)
+    ok = PublishPreviewRow(resultado="Suspenso por vista", pedido_vista="Min. André Mendonça")
+    core.apply_rag_consistency_checks(ok)
+    assert not ok.errors
+    # aprovado em vistoria: rebaixa para warning
+    approved = PublishPreviewRow(
+        resultado="Suspenso por vista",
+        pedido_vista="",
+        warnings=["Aprovado em vistoria: gate revisto."],
+    )
+    core.apply_rag_consistency_checks(approved)
+    assert not approved.errors
+    assert any("aceito em vistoria" in w for w in approved.warnings)
+    del schema
+
+
+def test_apply_rag_checks_flags_resultado_incompativel_com_classe():
+    row = PublishPreviewRow(classe_processo="PC", resultado="Provido")
+    core.apply_rag_consistency_checks(row)
+    assert any("incompatível com a classe" in w for w in row.warnings)
+    ok = PublishPreviewRow(classe_processo="AgRg-REspe", resultado="Desprovido")
+    core.apply_rag_consistency_checks(ok)
+    assert not any("incompatível" in w for w in ok.warnings)
+
+
+def test_apply_rag_checks_idempotente_em_revalidacao():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema útil",
+        numero_processo="0600013-53.2026.6.06.0004",
+        tribunal="TRE-PR",
+        origem="Araucária/PR",
+        classe_processo="PC",
+        resultado="Provido",
+        relator="Min. Cármen Lúcia",
+        votacao="Unânime",
+        data_sessao="2026-06-23",
+    )
+    validate_preview_row(row, schema)
+    validate_preview_row(row, schema)
+    converged = sorted(row.warnings)
+    assert len(converged) == len(set(converged))
+    validate_preview_row(row, schema)
+    assert sorted(row.warnings) == converged
+
+
+def test_count_individual_apregoamentos_excludes_lista_block():
+    events = [
+        core.RitoEvent(kind="apregoamento", start_seconds=100, end_seconds=104),
+        core.RitoEvent(kind="apregoamento", start_seconds=500, end_seconds=504),
+        core.RitoEvent(kind="lista", start_seconds=900, end_seconds=904),
+        core.RitoEvent(kind="apregoamento", start_seconds=950, end_seconds=954),
+    ]
+    assert core.count_individual_apregoamentos(events) == 2
+
+
+def _make_item(**overrides):
+    base = dict(
+        data_sessao="23/06/2026",
+        eleicao="",
+        classe_processo="PA",
+        numero_processo="0600904-54",
+        origem="Brasília/DF",
+        tre="",
+        partes=[],
+        advogados=[],
+        composicao=["Min. Cármen Lúcia", "Min. André Mendonça"],
+        relator="Min. Cármen Lúcia",
+        pedido_vista="",
+        tema="Tema real",
+        punchline="Punchline",
+        analise_do_conteudo_juridico="Análise do julgamento.",
+        fundamentacao_normativa="",
+        precedentes_citados="",
+        raciocinio_juridico="",
+        pontos_processuais_relevantes="",
+        efeitos_e_providencias_praticas="",
+        resolucoes_citadas="",
+        votacao="por unanimidade",
+        resultado_final="aprovada",
+    )
+    base.update(overrides)
+    return JudgmentItemExtraction(**base)
+
+
+def _make_session_analysis(bundles):
+    return AnalysisResult(
+        session=SessionExtraction(data_sessao="23/06/2026", composicao=[], judgments=[]),
+        bundles=bundles,
+    )
+
+
+def test_build_preview_rows_drops_placeholder_and_institutional_items():
+    schema = make_schema()
+    analysis = _make_session_analysis(
+        [
+            JudgmentBundleExtraction(
+                start_seconds=540,
+                items=[
+                    _make_item(
+                        numero_processo="0600000-00.0000.0.00.0000",
+                        classe_processo="",
+                        relator="",
+                        resultado_final="",
+                        votacao="",
+                        tema="",
+                        analise_do_conteudo_juridico=(
+                            "O trecho do vídeo não apresenta o julgamento de um processo judicial, "
+                            "mas sim uma peça institucional de conscientização da Justiça Eleitoral."
+                        ),
+                    )
+                ],
+            ),
+            JudgmentBundleExtraction(start_seconds=1163, items=[_make_item()]),
+            JudgmentBundleExtraction(
+                start_seconds=1500,
+                items=[_make_item(numero_processo="0600669-77.2024.6.02.0008", classe_processo="AgRg-REspe")],
+            ),
+        ]
+    )
+    rows = build_preview_rows(analysis, "https://youtu.be/abc123", schema, None)
+    assert [row.tipo_registro for row in rows] == ["Julgamento 1", "Julgamento 2"]
+    assert rows[0].numero_processo == "0600904-54"
+
+
+def test_consolidate_rows_composicao_filters_unknown_and_caps_to_participants():
+    schema = make_schema()
+    row = PublishPreviewRow(
+        tema="Tema",
+        relator="Min. Cármen Lúcia",
+        pedido_vista="Min. André Mendonça",
+        composicao=[
+            "Min. Cármen Lúcia",
+            "Ministra Cármen Lúcia",
+            "Min. André Mendonça",
+            "Min. Diestéfali",
+            "Min. Nome A",
+            "Min. Nome B",
+            "Min. Nome C",
+            "Min. Nome D",
+            "Min. Nome E",
+            "Min. Nome F",
+        ],
+    )
+    consolidate_rows_composicao([row], schema)
+    assert row.composicao == ["Min. Cármen Lúcia", "Min. André Mendonça"]
+    assert any("fora do elenco conhecido" in w for w in row.warnings)
+
+
+def test_grounding_rationale_is_inconclusive():
+    assert _grounding_rationale_is_inconclusive(
+        "O texto afirma explicitamente que o número está incompleto, não foi localizado "
+        "e a data informada é futura, impossibilitando a existência de um julgamento."
+    )
+    assert not _grounding_rationale_is_inconclusive(
+        "O número aparece apenas como precedente citado no julgamento de outro processo."
+    )
+
+
+def test_publish_preview_rows_renumbers_sequence_after_skipped_item():
+    schema = make_schema()
+    notion = FakeNotionClient()
+
+    def make_row(number: int, numero_processo: str) -> PublishPreviewRow:
+        return PublishPreviewRow(
+            tema=f"Tema {number}",
+            tipo_registro=f"Julgamento {number}",
+            numero_processo=numero_processo,
+            youtube_link=f"https://www.youtube.com/watch?v=abc123&t={number * 600}",
+            relator="Min. Cármen Lúcia",
+            resultado="Desprovido",
+            votacao="Unânime",
+            data_sessao="2026-06-23",
+        )
+
+    first = make_row(1, "0600814-85.2022.6.00.0000")
+    skipped = make_row(2, "0600904-54")
+    skipped.errors = [
+        "Busca Google indicou que o número consultado aparece como precedente citado, não como processo julgado."
+    ]
+    third = make_row(3, "0600669-77.2024.6.02.0008")
+    fourth = make_row(4, "0600379-88.2024.6.19.0105")
+
+    results = publish_preview_rows([first, skipped, third, fourth], notion, schema)
+
+    assert [result["status"] for result in results] == ["created", "skipped", "created", "created"]
+    assert first.tipo_registro == "Julgamento 1"
+    assert third.tipo_registro == "Julgamento 2"
+    assert fourth.tipo_registro == "Julgamento 3"
+    assert [row.tipo_registro for row in notion.created] == [
+        "Julgamento 1",
+        "Julgamento 2",
+        "Julgamento 3",
+    ]
+
+
+def test_publish_preview_rows_keeps_numbers_when_nothing_is_skipped():
+    schema = make_schema()
+    notion = FakeNotionClient()
+    partial = PublishPreviewRow(
+        tema="Publicação avulsa",
+        tipo_registro="Julgamento 3",
+        numero_processo="0600669-77.2024.6.02.0008",
+        youtube_link="https://www.youtube.com/watch?v=abc123&t=1800",
+        relator="Min. Cármen Lúcia",
+        resultado="Desprovido",
+        votacao="Unânime",
+        data_sessao="2026-06-23",
+    )
+    results = publish_preview_rows([partial], notion, schema)
+    assert results[0]["status"] == "created"
+    assert partial.tipo_registro == "Julgamento 3"
 
 
 def test_find_existing_row_matches_same_video_even_with_different_timestamp():

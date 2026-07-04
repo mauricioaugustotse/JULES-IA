@@ -11,7 +11,9 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -39,8 +41,12 @@ from tse_youtube_notion_core import (
     extract_youtube_video_id,
     normalize_youtube_link,
     publish_preview_rows,
+    require_youtube_transcript_api,
     validate_preview_row,
 )
+from tse_normalization import infer_session_date_from_video_title
+
+import vistoria_queue
 
 
 LOGGER = logging.getLogger("tse_youtube_notion_batch_gui")
@@ -129,6 +135,23 @@ def open_path(path: Path) -> None:
 
 def count_result_status(results: list[dict[str, Any]], status: str) -> int:
     return sum(1 for item in results if item.get("status") == status)
+
+
+def summarize_link_meta(title: str) -> str:
+    """Resumo "título — data" exibido na coluna Sessão da lista de links."""
+    clean_title = re.sub(r"\s+", " ", str(title or "")).strip()
+    session_date = infer_session_date_from_video_title(clean_title) or ""
+    display = clean_title[:70] + ("..." if len(clean_title) > 70 else "")
+    if session_date:
+        return f"{display} — {session_date}" if display else session_date
+    return display or "(título indisponível)"
+
+
+def fetch_video_title_oembed(url: str, timeout: float = 10.0) -> str:
+    oembed_url = "https://www.youtube.com/oembed?" + urllib.parse.urlencode({"url": url, "format": "json"})
+    with urllib.request.urlopen(oembed_url, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return str(payload.get("title", "") or "")
 
 
 def format_elapsed(seconds: float) -> str:
@@ -250,6 +273,22 @@ def process_single_video(
         publish_results = publish_preview_rows(rows, notion_client, notion_schema)
         artifact_store.write_json("05_publish_results.json", publish_results)
 
+    rito_count_check = _build_rito_count_check(artifact_store, rows)
+    if rito_count_check is not None:
+        artifact_store.write_json("04c_rito_count_check.json", rito_count_check)
+
+    vistoria_items = vistoria_queue.collect_video_vistoria_items(
+        rows,
+        publish_results,
+        video_id=video.video_id,
+        youtube_url=video.url,
+        artifact_dir=str(artifact_store.root_dir),
+        rito_check=rito_count_check,
+        published=bool(options.publish),
+    )
+    if vistoria_items:
+        artifact_store.write_json("04d_vistoria_items.json", vistoria_items)
+
     summary = {
         "position": video.position,
         "video_id": video.video_id,
@@ -262,8 +301,37 @@ def process_single_video(
         "skipped": count_result_status(publish_results, "skipped"),
         "publish_results": publish_results,
     }
+    if rito_count_check is not None:
+        summary["rito_count_check"] = rito_count_check
+    summary["vistoria_items"] = len(vistoria_items)
     artifact_store.write_json("06_batch_video_summary.json", summary)
     return summary
+
+
+def _build_rito_count_check(artifact_store: RunArtifacts, rows: list[Any]) -> dict[str, Any] | None:
+    """Confere o nº de linhas extraídas contra os apregoamentos individuais do rito.
+
+    Divergência não bloqueia nada: vira item de vistoria (a transcrição pode ter
+    marcadores perdidos e julgamentos conjuntos geram mais linhas que apregoamentos).
+    """
+    if not artifact_store.exists("01b_rito_refinement.json"):
+        return None
+    try:
+        rito_report = artifact_store.read_json("01b_rito_refinement.json")
+    except Exception:
+        return None
+    if not rito_report.get("transcript_available"):
+        return None
+    apregoamentos = rito_report.get("apregoamentos_individuais")
+    if not isinstance(apregoamentos, int) or apregoamentos <= 0:
+        return None
+    delta = apregoamentos - len(rows)
+    return {
+        "apregoamentos": apregoamentos,
+        "rows": len(rows),
+        "delta": delta,
+        "verdict": "ok" if delta <= 0 else "verificar",
+    }
 
 
 def _gf_dir() -> Path:
@@ -583,6 +651,29 @@ def process_video_batch(
             post_publish["dje"] = _gf_run_dje_once(options.dje_dir, options.dje_apply, output_queue)
         output_queue.put(("status", "__post__", "Pos-publicacao concluida.", ""))
 
+    # ===== FILA DE VISTORIA: consolida os itens do run e alimenta a fila global =====
+    run_vistoria_items: list[dict[str, Any]] = []
+    for item in summaries:
+        artifact_dir = item.get("artifact_dir", "")
+        vistoria_path = Path(artifact_dir) / "04d_vistoria_items.json" if artifact_dir else None
+        if vistoria_path and vistoria_path.exists():
+            try:
+                run_vistoria_items.extend(json.loads(vistoria_path.read_text(encoding="utf-8")))
+            except Exception as exc:
+                LOGGER.warning("Falha ao ler %s: %s", vistoria_path, exc)
+    if run_vistoria_items:
+        (run_root / "vistoria_queue.json").write_text(
+            json.dumps(run_vistoria_items, ensure_ascii=False, indent=1),
+            encoding="utf-8",
+        )
+        try:
+            added = vistoria_queue.append_items(run_vistoria_items)
+            output_queue.put(
+                ("log", f"Fila de vistoria: {added} item(ns) novo(s) de {len(run_vistoria_items)} coletado(s).\n")
+            )
+        except Exception as exc:
+            LOGGER.warning("Falha ao alimentar a fila de vistoria: %s", exc)
+
     summary_payload = {
         "post_publish": post_publish,
         "started_at": run_root.name,
@@ -620,6 +711,7 @@ class BatchGuiApp:
         self.current_video_index = 0
         self.stage_labels: dict[str, str] = {}
         self.stage_started_at: dict[str, float] = {}
+        self.link_meta: dict[str, tuple[str, str]] = {}  # video_id -> (sessão, badge CC)
 
         self.link_var = tk.StringVar()
         self.model_var = tk.StringVar(value=DEFAULT_GEMINI_MODEL)
@@ -643,15 +735,16 @@ class BatchGuiApp:
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill=tk.BOTH, expand=True)
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(5, weight=1)
-        main.rowconfigure(6, weight=2)
+        main.rowconfigure(3, weight=3)
+        main.rowconfigure(4, weight=2)
+        main.rowconfigure(5, weight=2)
 
         header = ttk.Frame(main)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(header, text="TSE YouTube > Notion", font=("Segoe UI", 15, "bold")).pack(anchor=tk.W)
         ttk.Label(header, textvariable=self.target_var).pack(anchor=tk.W, pady=(2, 0))
 
-        input_frame = ttk.LabelFrame(main, text="Links do YouTube", padding=8)
+        input_frame = ttk.LabelFrame(main, text="1. Links do YouTube", padding=8)
         input_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         input_frame.columnconfigure(0, weight=1)
         ttk.Entry(input_frame, textvariable=self.link_var).grid(row=0, column=0, sticky="ew", padx=(0, 8))
@@ -659,7 +752,7 @@ class BatchGuiApp:
         ttk.Button(input_frame, text="Colar da area", command=self._paste_links).grid(row=0, column=2)
         ttk.Label(input_frame, textvariable=self.count_var).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
 
-        options = ttk.LabelFrame(main, text="Fluxo", padding=8)
+        options = ttk.LabelFrame(main, text="2. Fluxo", padding=8)
         options.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         options.columnconfigure(1, weight=1)
         options.columnconfigure(3, weight=1)
@@ -693,8 +786,13 @@ class BatchGuiApp:
         ttk.Checkbutton(options, text="Processar CSVs DJE",
                         variable=self.watch_dje_var).grid(row=2, column=3, sticky=tk.W, pady=(6, 0))
 
-        actions = ttk.Frame(main)
-        actions.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        exec_frame = ttk.LabelFrame(main, text="3. Execução", padding=8)
+        exec_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+        exec_frame.columnconfigure(0, weight=1)
+        exec_frame.rowconfigure(2, weight=1)
+
+        actions = ttk.Frame(exec_frame)
+        actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self.start_button = ttk.Button(actions, text="Processar lote", command=self._start_batch)
         self.start_button.pack(side=tk.LEFT)
         self.stop_button = ttk.Button(actions, text="Parar apos video atual", command=self._request_stop, state=tk.DISABLED)
@@ -704,8 +802,8 @@ class BatchGuiApp:
         ttk.Button(actions, text="Abrir artifacts", command=self._open_artifacts).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Retomar artifacts", command=self._load_resume_root).pack(side=tk.LEFT, padx=(8, 0))
 
-        progress_frame = ttk.Frame(main)
-        progress_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        progress_frame = ttk.Frame(exec_frame)
+        progress_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         progress_frame.columnconfigure(0, weight=1)
         ttk.Progressbar(
             progress_frame,
@@ -715,22 +813,66 @@ class BatchGuiApp:
         ).grid(row=0, column=0, sticky="ew", padx=(0, 10))
         ttk.Label(progress_frame, textvariable=self.progress_text_var, width=52).grid(row=0, column=1, sticky=tk.E)
 
-        columns = ("pos", "video_id", "status", "result", "url")
-        self.tree = ttk.Treeview(main, columns=columns, show="headings", height=9)
-        self.tree.grid(row=5, column=0, sticky="nsew")
+        columns = ("pos", "video_id", "sessao", "cc", "status", "result", "url")
+        self.tree = ttk.Treeview(exec_frame, columns=columns, show="headings", height=7)
+        self.tree.grid(row=2, column=0, sticky="nsew")
         self.tree.heading("pos", text="#")
         self.tree.heading("video_id", text="Video ID")
+        self.tree.heading("sessao", text="Sessão")
+        self.tree.heading("cc", text="CC")
         self.tree.heading("status", text="Status")
         self.tree.heading("result", text="Resultado")
         self.tree.heading("url", text="URL")
-        self.tree.column("pos", width=48, stretch=False, anchor=tk.CENTER)
-        self.tree.column("video_id", width=130, stretch=False)
-        self.tree.column("status", width=150, stretch=False)
-        self.tree.column("result", width=360, stretch=True)
-        self.tree.column("url", width=420, stretch=True)
+        self.tree.column("pos", width=40, stretch=False, anchor=tk.CENTER)
+        self.tree.column("video_id", width=110, stretch=False)
+        self.tree.column("sessao", width=260, stretch=True)
+        self.tree.column("cc", width=36, stretch=False, anchor=tk.CENTER)
+        self.tree.column("status", width=140, stretch=False)
+        self.tree.column("result", width=300, stretch=True)
+        self.tree.column("url", width=300, stretch=True)
+
+        vistoria_frame = ttk.LabelFrame(main, text="4. Fila de vistoria (itens não publicados que merecem revisão)", padding=8)
+        vistoria_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
+        vistoria_frame.columnconfigure(0, weight=1)
+        vistoria_frame.rowconfigure(1, weight=1)
+        vistoria_actions = ttk.Frame(vistoria_frame)
+        vistoria_actions.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(vistoria_actions, text="Recarregar", command=self._reload_vistoria).pack(side=tk.LEFT)
+        self.vistoria_publish_button = ttk.Button(
+            vistoria_actions, text="Aprovar e publicar", command=self._approve_selected_vistoria
+        )
+        self.vistoria_publish_button.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(vistoria_actions, text="Descartar item", command=self._reject_selected_vistoria).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(vistoria_actions, text="Abrir vídeo", command=self._open_selected_vistoria_video).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        vistoria_columns = ("origem", "video", "data", "numero", "disp", "motivo")
+        self.vistoria_tree = ttk.Treeview(
+            vistoria_frame, columns=vistoria_columns, show="headings", height=5
+        )
+        self.vistoria_tree.grid(row=1, column=0, sticky="nsew")
+        self.vistoria_tree.heading("origem", text="Origem")
+        self.vistoria_tree.heading("video", text="Vídeo")
+        self.vistoria_tree.heading("data", text="Sessão")
+        self.vistoria_tree.heading("numero", text="Processo")
+        self.vistoria_tree.heading("disp", text="Situação")
+        self.vistoria_tree.heading("motivo", text="Motivo")
+        self.vistoria_tree.column("origem", width=70, stretch=False)
+        self.vistoria_tree.column("video", width=110, stretch=False)
+        self.vistoria_tree.column("data", width=90, stretch=False)
+        self.vistoria_tree.column("numero", width=180, stretch=False)
+        self.vistoria_tree.column("disp", width=110, stretch=False)
+        self.vistoria_tree.column("motivo", width=520, stretch=True)
+        vistoria_scroll = ttk.Scrollbar(vistoria_frame, orient=tk.VERTICAL, command=self.vistoria_tree.yview)
+        vistoria_scroll.grid(row=1, column=1, sticky="ns")
+        self.vistoria_tree.configure(yscrollcommand=vistoria_scroll.set)
+        self.vistoria_items: dict[str, dict[str, Any]] = {}
+        self._reload_vistoria()
 
         log_frame = ttk.LabelFrame(main, text="Saida", padding=8)
-        log_frame.grid(row=6, column=0, sticky="nsew", pady=(8, 0))
+        log_frame.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.output_text = tk.Text(log_frame, wrap=tk.WORD)
@@ -772,6 +914,7 @@ class BatchGuiApp:
             existing_ids.add(video.video_id)
             added = True
             self.resume_root = None
+            threading.Thread(target=self._probe_link_metadata, args=(video,), daemon=True).start()
         self._refresh_tree()
         if errors:
             messagebox.showwarning("Links", "\n".join(errors[:8]))
@@ -784,11 +927,12 @@ class BatchGuiApp:
         for index, video in enumerate(self.videos, start=1):
             refreshed_video = VideoInput(position=index, url=video.url, video_id=video.video_id)
             refreshed.append(refreshed_video)
+            sessao, cc_badge = self.link_meta.get(video.video_id, ("(verificando...)", "?"))
             self.tree.insert(
                 "",
                 tk.END,
                 iid=video.video_id,
-                values=(index, video.video_id, "Pendente", "", video.url),
+                values=(index, video.video_id, sessao, cc_badge, "Pendente", "", video.url),
             )
         self.videos = refreshed
         self.count_var.set(f"{len(self.videos)}/{MAX_LINKS} links")
@@ -955,6 +1099,15 @@ class BatchGuiApp:
                     self.stage_started_at.pop(str(video_id), None)
                     self.current_video_id = ""
                     self._refresh_live_progress(reschedule=False)
+                elif event == "link_meta":
+                    _, video_id, sessao, cc_badge = item
+                    self.link_meta[str(video_id)] = (str(sessao), str(cc_badge))
+                    if self.tree.exists(str(video_id)):
+                        self.tree.set(str(video_id), "sessao", str(sessao))
+                        self.tree.set(str(video_id), "cc", str(cc_badge))
+                elif event == "vistoria_done":
+                    self.vistoria_publish_button.configure(state=tk.NORMAL)
+                    self._reload_vistoria()
                 elif event == "batch_artifact_dir":
                     self.batch_artifact_dir = str(item[1])
                 elif event == "batch_done":
@@ -992,15 +1145,11 @@ class BatchGuiApp:
             if previous != status:
                 self.stage_started_at[video_id] = time.monotonic()
 
-        values = list(self.tree.item(video_id, "values"))
-        if len(values) < 5:
-            return
-        values[2] = self._display_status(video_id, status)
+        self.tree.set(video_id, "status", self._display_status(video_id, status))
         if result:
-            values[3] = result
+            self.tree.set(video_id, "result", result)
         elif status not in TERMINAL_STATUSES and status != "Pendente":
-            values[3] = "Em execucao"
-        self.tree.item(video_id, values=values)
+            self.tree.set(video_id, "result", "Em execucao")
         self.tree.see(video_id)
         self._refresh_live_progress(reschedule=False)
 
@@ -1048,17 +1197,126 @@ class BatchGuiApp:
         status = self.stage_labels.get(video_id, "")
         if not status:
             return
-        values = list(self.tree.item(video_id, "values"))
-        if len(values) < 5:
-            return
-        values[2] = self._display_status(video_id, status)
-        if values[3] in {"", "Em execucao"}:
-            values[3] = "Em execucao"
-        self.tree.item(video_id, values=values)
+        self.tree.set(video_id, "status", self._display_status(video_id, status))
+        if self.tree.set(video_id, "result") in {"", "Em execucao"}:
+            self.tree.set(video_id, "result", "Em execucao")
 
     def _append_output(self, text: str) -> None:
         self.output_text.insert(tk.END, text)
         self.output_text.see(tk.END)
+
+    # ----- validação visual dos links (thread daemon; UI só via output_queue) -----
+
+    def _probe_link_metadata(self, video: VideoInput) -> None:
+        try:
+            title = fetch_video_title_oembed(video.url)
+        except Exception:
+            title = ""
+        sessao = summarize_link_meta(title)
+        cc_badge = "?"
+        try:
+            api_cls = require_youtube_transcript_api()
+            transcripts = api_cls().list(video.video_id)
+            cc_badge = "CC" if any(True for _ in transcripts) else "—"
+        except Exception:
+            cc_badge = "—"
+        self.output_queue.put(("link_meta", video.video_id, sessao, cc_badge))
+
+    # ----- fila de vistoria -----
+
+    def _reload_vistoria(self) -> None:
+        try:
+            items = vistoria_queue.load_items("pending")
+        except Exception as exc:
+            self._append_output(f"Falha ao carregar a fila de vistoria: {exc}\n")
+            return
+        self.vistoria_items = {str(item["id"]): item for item in items}
+        self.vistoria_tree.delete(*self.vistoria_tree.get_children())
+        for item in items:
+            row = item.get("row") or {}
+            motivo = "; ".join(item.get("reasons") or [])[:200]
+            self.vistoria_tree.insert(
+                "",
+                tk.END,
+                iid=str(item["id"]),
+                values=(
+                    item.get("source", ""),
+                    item.get("video_id", ""),
+                    item.get("data_sessao", ""),
+                    row.get("numero_processo", "") if row else "",
+                    item.get("disposition", ""),
+                    motivo,
+                ),
+            )
+
+    def _selected_vistoria_items(self) -> list[dict[str, Any]]:
+        return [self.vistoria_items[iid] for iid in self.vistoria_tree.selection() if iid in self.vistoria_items]
+
+    def _approve_selected_vistoria(self) -> None:
+        selected = self._selected_vistoria_items()
+        publishable = [item for item in selected if item.get("row")]
+        if not selected:
+            messagebox.showinfo("Fila de vistoria", "Selecione ao menos um item.")
+            return
+        if not publishable:
+            messagebox.showinfo(
+                "Fila de vistoria",
+                "Os itens selecionados são informativos (sem linha para publicar). Use 'Descartar item' para fechá-los.",
+            )
+            return
+        if not messagebox.askyesno(
+            "Aprovar e publicar",
+            f"Publicar {len(publishable)} item(ns) aprovados no Notion?",
+        ):
+            return
+        self.vistoria_publish_button.configure(state=tk.DISABLED)
+        threading.Thread(target=self._publish_vistoria_worker, args=(publishable,), daemon=True).start()
+
+    def _publish_vistoria_worker(self, items: list[dict[str, Any]]) -> None:
+        try:
+            runtime = build_runtime_context()
+            client = NotionSessoesClient(
+                runtime["notion_api_key"],
+                data_source_id=runtime["notion_data_source_id"],
+                logger=LOGGER,
+            )
+            schema = client.fetch_schema()
+            results = vistoria_queue.publish_approved_items(items, client, schema, apply=True)
+            published_ids = [
+                str(result.get("id"))
+                for result in results
+                if result.get("status") in {"created", "updated"}
+            ]
+            if published_ids:
+                vistoria_queue.update_status(published_ids, "published")
+            lines = [
+                f"  {result.get('numero_processo', result.get('id', ''))}: {result.get('status')}"
+                for result in results
+            ]
+            self.output_queue.put(("log", "Vistoria publicada:\n" + "\n".join(lines) + "\n"))
+        except Exception as exc:
+            self.output_queue.put(("log", f"ERRO ao publicar itens da vistoria: {exc}\n"))
+        finally:
+            self.output_queue.put(("vistoria_done",))
+
+    def _reject_selected_vistoria(self) -> None:
+        selected = self._selected_vistoria_items()
+        if not selected:
+            messagebox.showinfo("Fila de vistoria", "Selecione ao menos um item.")
+            return
+        if not messagebox.askyesno("Descartar", f"Descartar {len(selected)} item(ns) da fila?"):
+            return
+        vistoria_queue.update_status([str(item["id"]) for item in selected], "rejected")
+        self._reload_vistoria()
+
+    def _open_selected_vistoria_video(self) -> None:
+        for item in self._selected_vistoria_items():
+            url = item.get("youtube_url") or ""
+            row = item.get("row") or {}
+            url = row.get("youtube_link") or url
+            if url:
+                webbrowser.open(url)
+                break
 
 
 def main() -> None:
