@@ -191,7 +191,10 @@ def transcript_apregoamento_count(video_id: str, cache_dir: Path) -> Optional[in
         count = count_individual_apregoamentos(detect_rito_events(snippets))
     except Exception as exc:
         LOGGER.info("Sem transcrição para %s: %s", video_id, exc)
-        count = None
+        # Falha NÃO é cacheada: bloqueio temporário do YouTube (IP/rate limit)
+        # não pode impedir o retry numa rodada futura.
+        time.sleep(1.0)
+        return None
     cache_file.write_text(json.dumps({"apregoamentos": count}, ensure_ascii=False), encoding="utf-8")
     time.sleep(1.0)
     return count
