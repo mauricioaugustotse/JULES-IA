@@ -155,6 +155,63 @@ def fetch_video_title_oembed(url: str, timeout: float = 10.0) -> str:
     return str(payload.get("title", "") or "")
 
 
+class Tooltip:
+    """Balão de ajuda: aparece ~0,5s depois que o mouse pousa no widget."""
+
+    def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 500, wraplength: int = 440) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self.wraplength = wraplength
+        self._tip: tk.Toplevel | None = None
+        self._after_id: str | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 16
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        self._tip = tip_window = tk.Toplevel(self.widget)
+        tip_window.wm_overrideredirect(True)
+        try:
+            tip_window.attributes("-topmost", True)
+        except Exception:
+            pass
+        tk.Label(
+            tip_window, text=self.text, justify=tk.LEFT, background="#fffbe6",
+            foreground="#333333", relief=tk.SOLID, borderwidth=1,
+            font=("Segoe UI", 9), wraplength=self.wraplength, padx=8, pady=6,
+        ).pack()
+        tip_window.wm_geometry(f"+{x}+{y}")
+
+    def _hide(self, _event=None) -> None:
+        self._cancel()
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
+
+
+def tip(widget, text: str):
+    """Anexa um tooltip e devolve o próprio widget (uso inline na construção da UI)."""
+    Tooltip(widget, text)
+    return widget
+
+
 def format_elapsed(seconds: float) -> str:
     total = max(0, int(seconds))
     minutes, remainder = divmod(total, 60)
@@ -759,9 +816,16 @@ class BatchGuiApp:
         )
         notion_link.pack(side=tk.RIGHT, pady=(8, 0))
         notion_link.bind("<Button-1>", lambda _e: webbrowser.open(DEFAULT_NOTION_DATABASE_URL))
+        Tooltip(notion_link, "Abre no navegador a base de sessões do TSE no Notion, onde as linhas são publicadas.")
 
         self.notebook = ttk.Notebook(main)
         self.notebook.pack(fill=tk.BOTH, expand=True)
+        Tooltip(
+            self.notebook,
+            "Duas áreas de trabalho:\n• Processar lote — extrai e publica os julgamentos de novos vídeos de sessão.\n"
+            "• Fila de vistoria — itens que o fluxo NÃO publicou e aguardam a sua decisão (o número no título é "
+            "a quantidade pendente).",
+        )
         process_tab = ttk.Frame(self.notebook, padding=10)
         vistoria_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(process_tab, text="  Processar lote  ")
@@ -770,18 +834,21 @@ class BatchGuiApp:
 
         statusbar = ttk.Frame(main)
         statusbar.pack(fill=tk.X, pady=(8, 0))
-        ttk.Progressbar(
-            statusbar, variable=self.progress_var, maximum=100, mode="determinate", length=300
+        tip(
+            ttk.Progressbar(statusbar, variable=self.progress_var, maximum=100, mode="determinate", length=300),
+            "Progresso do lote em execução (vídeos concluídos e etapa atual).",
         ).pack(side=tk.LEFT)
-        ttk.Label(statusbar, textvariable=self.progress_text_var, style="Muted.TLabel").pack(
-            side=tk.LEFT, padx=(10, 0)
-        )
+        tip(
+            ttk.Label(statusbar, textvariable=self.progress_text_var, style="Muted.TLabel"),
+            "Etapa em andamento no vídeo atual e tempo decorrido nela.",
+        ).pack(side=tk.LEFT, padx=(10, 0))
         self.vistoria_hint_var = tk.StringVar(value="")
         vistoria_hint = ttk.Label(
             statusbar, textvariable=self.vistoria_hint_var, style="Hint.TLabel", cursor="hand2"
         )
         vistoria_hint.pack(side=tk.RIGHT)
         vistoria_hint.bind("<Button-1>", lambda _e: self.notebook.select(self.vistoria_tab_index))
+        Tooltip(vistoria_hint, "Atalho: clique para ir direto à Fila de vistoria com os itens que aguardam sua decisão.")
 
         # ================= ABA 1 — PROCESSAR LOTE =================
         process_tab.columnconfigure(0, weight=1)
@@ -795,46 +862,80 @@ class BatchGuiApp:
         )
         input_frame.grid(row=0, column=0, sticky="ew")
         input_frame.columnconfigure(0, weight=1)
-        ttk.Entry(input_frame, textvariable=self.link_var).grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        ttk.Button(input_frame, text="Adicionar link", command=self._add_link).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(input_frame, text="Colar da área", command=self._paste_links).grid(row=0, column=2)
-        ttk.Label(input_frame, textvariable=self.count_var, style="Muted.TLabel").grid(
-            row=1, column=0, sticky=tk.W, pady=(6, 0)
-        )
+        tip(
+            ttk.Entry(input_frame, textvariable=self.link_var),
+            "Cole aqui a URL de um vídeo de sessão plenária do TSE no YouTube. Aceita várias URLs de uma vez "
+            "(separadas por espaço, vírgula ou quebra de linha).",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        tip(
+            ttk.Button(input_frame, text="Adicionar link", command=self._add_link),
+            "Valida a URL digitada e acrescenta o vídeo à lista do lote. Em segundo plano são verificados o "
+            "título, a data da sessão e a existência de legenda (colunas Sessão e CC da tabela).",
+        ).grid(row=0, column=1, padx=(0, 8))
+        tip(
+            ttk.Button(input_frame, text="Colar da área", command=self._paste_links),
+            "Adiciona de uma vez todos os links de vídeo copiados na área de transferência (Ctrl+C).",
+        ).grid(row=0, column=2)
+        tip(
+            ttk.Label(input_frame, textvariable=self.count_var, style="Muted.TLabel"),
+            "Quantos vídeos já estão na lista e o limite por lote.",
+        ).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
 
         options = ttk.LabelFrame(process_tab, text="2. Opções do fluxo", padding=8)
         options.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         options.columnconfigure(1, weight=1)
         options.columnconfigure(3, weight=1)
-        ttk.Label(options, text="Modelo Gemini").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
-        ttk.Entry(options, textvariable=self.model_var).grid(row=0, column=1, sticky="ew", padx=(0, 14))
-        ttk.Label(options, text="Modelo noticias").grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
-        ttk.Entry(options, textvariable=self.news_model_var).grid(row=0, column=3, sticky="ew")
-        ttk.Checkbutton(options, text="Buscar noticias antes de publicar", variable=self.with_news_var).grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            sticky=tk.W,
-            pady=(6, 0),
-        )
-        ttk.Checkbutton(options, text="Publicar direto no Notion", variable=self.publish_var).grid(
-            row=1,
-            column=2,
-            sticky=tk.W,
-            pady=(6, 0),
-        )
-        ttk.Checkbutton(options, text="Continuar se um link falhar", variable=self.continue_on_error_var).grid(
-            row=1,
-            column=3,
-            sticky=tk.W,
-            pady=(6, 0),
-        )
-        ttk.Checkbutton(options, text="Pos-publicacao: tratar dados (materia/Suspenso/classe/sanear)",
-                        variable=self.post_publish_var).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
-        ttk.Checkbutton(options, text="Recolorir etiquetas (Edge :9222)",
-                        variable=self.recolor_labels_var).grid(row=2, column=2, sticky=tk.W, pady=(6, 0))
-        ttk.Checkbutton(options, text="Processar CSVs DJE",
-                        variable=self.watch_dje_var).grid(row=2, column=3, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Label(options, text="Modelo Gemini"),
+            "Modelo de IA que assiste ao vídeo e extrai os julgamentos (número, relator, resultado, análise). "
+            "O padrão preenchido é o recomendado; só altere se souber o que está fazendo.",
+        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        tip(
+            ttk.Entry(options, textvariable=self.model_var),
+            "Nome do modelo Gemini usado na EXTRAÇÃO dos julgamentos do vídeo.",
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 14))
+        tip(
+            ttk.Label(options, text="Modelo noticias"),
+            "Modelo de IA usado na etapa de busca de notícias relacionadas a cada julgamento.",
+        ).grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
+        tip(
+            ttk.Entry(options, textvariable=self.news_model_var),
+            "Nome do modelo Gemini usado na BUSCA/validação de notícias (TSE, TREs e imprensa).",
+        ).grid(row=0, column=3, sticky="ew")
+        tip(
+            ttk.Checkbutton(options, text="Buscar noticias antes de publicar", variable=self.with_news_var),
+            "Antes de gravar no Notion, procura notícias oficiais (TSE/TREs) e da imprensa sobre cada julgamento "
+            "e anexa os links aprovados à linha. Desmarque para um lote mais rápido e sem notícias.",
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(options, text="Publicar direto no Notion", variable=self.publish_var),
+            "Marcado: as linhas extraídas são gravadas na base do Notion ao final. Desmarcado: o lote apenas gera "
+            "os arquivos de prévia (artifacts) para conferência, sem publicar nada.",
+        ).grid(row=1, column=2, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(options, text="Continuar se um link falhar", variable=self.continue_on_error_var),
+            "Se um vídeo der erro (ex.: transmissão recém-encerrada ainda sem VOD), o lote registra a falha e "
+            "segue para o próximo vídeo em vez de parar tudo.",
+        ).grid(row=1, column=3, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(options, text="Pos-publicacao: tratar dados (materia/Suspenso/classe/sanear)",
+                            variable=self.post_publish_var),
+            "Depois de publicar, roda os tratamentos automáticos de qualidade: vincular matéria semelhante, "
+            "reconciliar julgamentos 'Suspenso' concluídos depois, normalizar classe processual e sanear dados.",
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(options, text="Recolorir etiquetas (Edge :9222)",
+                            variable=self.recolor_labels_var),
+            "Ajusta as cores das etiquetas (selects) na base do Notion usando um Edge oculto automatizado. "
+            "Puramente estético; requer o Microsoft Edge instalado.",
+        ).grid(row=2, column=2, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(options, text="Processar CSVs DJE",
+                            variable=self.watch_dje_var),
+            "Roda UMA passada do confronto com os CSVs do Diário da Justiça Eletrônico ao final do lote. "
+            "Normalmente desnecessário: o monitor automático (tarefa WatchDJe_Notion) já vigia a pasta DJe "
+            "continuamente e processa qualquer CSV novo.",
+        ).grid(row=2, column=3, sticky=tk.W, pady=(6, 0))
 
         exec_frame = ttk.LabelFrame(process_tab, text="3. Execução", padding=8)
         exec_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
@@ -843,17 +944,43 @@ class BatchGuiApp:
 
         actions = ttk.Frame(exec_frame)
         actions.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        self.start_button = ttk.Button(actions, text="▶  Processar lote", style="Accent.TButton", command=self._start_batch)
+        self.start_button = tip(
+            ttk.Button(actions, text="▶  Processar lote", style="Accent.TButton", command=self._start_batch),
+            "Inicia o processamento dos vídeos da lista: extração por IA (corrigida pelos marcadores do rito da "
+            "sessão na transcrição), enriquecimentos (CNJ, tema, notícias) e publicação no Notion.",
+        )
         self.start_button.pack(side=tk.LEFT)
-        self.stop_button = ttk.Button(actions, text="Parar após vídeo atual", command=self._request_stop, state=tk.DISABLED)
+        self.stop_button = tip(
+            ttk.Button(actions, text="Parar após vídeo atual", command=self._request_stop, state=tk.DISABLED),
+            "Pede a parada do lote: o vídeo em andamento é concluído normalmente e os seguintes não são iniciados.",
+        )
         self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(actions, text="Remover selecionado", command=self._remove_selected).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(actions, text="Limpar lista", command=self._clear_links).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(actions, text="Abrir artifacts", command=self._open_artifacts).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(actions, text="Retomar artifacts", command=self._load_resume_root).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(actions, text="Remover selecionado", command=self._remove_selected),
+            "Remove da lista o(s) vídeo(s) selecionado(s) na tabela abaixo (antes de iniciar o lote).",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(actions, text="Limpar lista", command=self._clear_links),
+            "Esvazia a lista de vídeos do lote.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(actions, text="Abrir artifacts", command=self._open_artifacts),
+            "Abre no Explorer a pasta dos arquivos intermediários do lote (extrações, prévias e resultados de "
+            "publicação) — útil para auditoria e diagnóstico.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(actions, text="Retomar artifacts", command=self._load_resume_root),
+            "Reaproveita a extração de IA de um lote anterior (pasta de artifacts) para reprocessar as etapas "
+            "seguintes sem gastar nova análise de vídeo.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         columns = ("pos", "video_id", "sessao", "cc", "status", "result", "url")
-        self.tree = ttk.Treeview(exec_frame, columns=columns, show="headings", height=8)
+        self.tree = tip(
+            ttk.Treeview(exec_frame, columns=columns, show="headings", height=8),
+            "Vídeos do lote e seu andamento. Colunas: # ordem; Video ID código do YouTube; Sessão = título e "
+            "data detectados ao adicionar; CC = legenda disponível (CC) ou não (—); Status = etapa atual; "
+            "Resultado = resumo ao concluir (criadas/atualizadas/bloqueadas/ignoradas).",
+        )
         self.tree.grid(row=1, column=0, sticky="nsew")
         tree_scroll = ttk.Scrollbar(exec_frame, orient=tk.VERTICAL, command=self.tree.yview)
         tree_scroll.grid(row=1, column=1, sticky="ns")
@@ -877,7 +1004,10 @@ class BatchGuiApp:
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
-        self.output_text = tk.Text(log_frame, wrap=tk.WORD, height=7, font=("Consolas", 9), relief=tk.FLAT, background="#f7f7f7")
+        self.output_text = tip(
+            tk.Text(log_frame, wrap=tk.WORD, height=7, font=("Consolas", 9), relief=tk.FLAT, background="#f7f7f7"),
+            "Log do processamento: mensagens de cada etapa, avisos, erros e o resumo final do lote.",
+        )
         self.output_text.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.output_text.yview)
         scroll.grid(row=0, column=1, sticky="ns")
@@ -899,41 +1029,71 @@ class BatchGuiApp:
 
         vistoria_actions = ttk.Frame(vistoria_tab)
         vistoria_actions.grid(row=1, column=0, sticky="ew", pady=(8, 6))
-        self.vistoria_publish_button = ttk.Button(
-            vistoria_actions, text="✔  Aprovar e publicar", style="Accent.TButton",
-            command=self._approve_selected_vistoria,
+        self.vistoria_publish_button = tip(
+            ttk.Button(
+                vistoria_actions, text="✔  Aprovar e publicar", style="Accent.TButton",
+                command=self._approve_selected_vistoria,
+            ),
+            "Publica no Notion o(s) item(ns) selecionado(s): os erros que os bloquearam viram avisos "
+            "'Aprovado em vistoria'. Só funciona para itens que carregam a linha pronta (skipped/blocked do "
+            "lote); itens informativos (duplicatas, contagem do rito) não têm o que publicar.",
         )
         self.vistoria_publish_button.pack(side=tk.LEFT)
-        ttk.Button(vistoria_actions, text="Descartar item", command=self._reject_selected_vistoria).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-        ttk.Button(vistoria_actions, text="Abrir vídeo", command=self._open_selected_vistoria_video).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-        ttk.Button(vistoria_actions, text="Abrir artifacts", command=self._open_selected_vistoria_artifact).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-        ttk.Button(vistoria_actions, text="Recarregar", command=self._reload_vistoria).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(vistoria_actions, text="Situação:").pack(side=tk.LEFT, padx=(24, 6))
+        tip(
+            ttk.Button(vistoria_actions, text="Descartar item", command=self._reject_selected_vistoria),
+            "Fecha o(s) item(ns) selecionado(s) sem publicar (ex.: era mesmo um precedente citado, não um "
+            "julgamento). Reversível: o histórico fica no arquivo da fila.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(vistoria_actions, text="Abrir vídeo", command=self._open_selected_vistoria_video),
+            "Abre no navegador o vídeo da sessão de origem do item, já no trecho do julgamento quando houver "
+            "timestamp registrado.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(vistoria_actions, text="Abrir artifacts", command=self._open_selected_vistoria_artifact),
+            "Abre no Explorer a pasta de artifacts do vídeo que gerou o item (extrações e transcrições usadas "
+            "como evidência).",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(vistoria_actions, text="Recarregar", command=self._reload_vistoria),
+            "Relê a fila de vistoria do disco — use após rodar um lote ou uma auditoria em paralelo.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Label(vistoria_actions, text="Situação:"),
+            "Filtra a tabela por tipo de pendência.",
+        ).pack(side=tk.LEFT, padx=(24, 6))
         self.vistoria_filter_var = tk.StringVar(value="Todas")
-        vistoria_filter = ttk.Combobox(
-            vistoria_actions, textvariable=self.vistoria_filter_var, state="readonly", width=18,
-            values=("Todas", "skipped", "blocked", "duplicata_numero", "faltante_dje", "contagem_rito"),
+        vistoria_filter = tip(
+            ttk.Combobox(
+                vistoria_actions, textvariable=self.vistoria_filter_var, state="readonly", width=18,
+                values=("Todas", "skipped", "blocked", "duplicata_numero", "faltante_dje", "contagem_rito"),
+            ),
+            "Tipos de pendência:\n"
+            "• skipped — o fluxo descartou o item (ex.: possível precedente citado, densidade baixa);\n"
+            "• blocked — barrado por dados insuficientes/incoerentes (sem resultado, tema vazio, vista sem ministro);\n"
+            "• duplicata_numero — mesmo julgamento aparece com dois números divergentes na base;\n"
+            "• faltante_dje — consta do CSV oficial do DJE e é mencionado no vídeo, mas não tinha página;\n"
+            "• contagem_rito — a transcrição indica mais julgamentos apregoados do que linhas na base.",
         )
         vistoria_filter.pack(side=tk.LEFT)
         vistoria_filter.bind("<<ComboboxSelected>>", lambda _e: self._reload_vistoria())
         self.vistoria_summary_var = tk.StringVar(value="")
-        ttk.Label(vistoria_actions, textvariable=self.vistoria_summary_var, style="Muted.TLabel").pack(
-            side=tk.RIGHT
-        )
+        tip(
+            ttk.Label(vistoria_actions, textvariable=self.vistoria_summary_var, style="Muted.TLabel"),
+            "Total de pendências e distribuição por situação (sem considerar o filtro).",
+        ).pack(side=tk.RIGHT)
 
         vistoria_table = ttk.Frame(vistoria_tab)
         vistoria_table.grid(row=2, column=0, sticky="nsew")
         vistoria_table.columnconfigure(0, weight=1)
         vistoria_table.rowconfigure(0, weight=1)
         vistoria_columns = ("data", "numero", "tema", "disp", "origem", "video")
-        self.vistoria_tree = ttk.Treeview(
-            vistoria_table, columns=vistoria_columns, show="headings", height=12
+        self.vistoria_tree = tip(
+            ttk.Treeview(vistoria_table, columns=vistoria_columns, show="headings", height=12),
+            "Um item por julgamento candidato. Cores: âmbar = skipped (descartado pelo fluxo), vermelho = "
+            "blocked (dados insuficientes), azul = informativo (duplicata/contagem). Colunas: Sessão = data; "
+            "Processo = nº CNJ quando conhecido; Tema = assunto ou motivo; Fonte = quem detectou (batch, "
+            "auditoria, dje, rito). Clique numa linha para ver os motivos completos no painel abaixo.",
         )
         self.vistoria_tree.grid(row=0, column=0, sticky="nsew")
         self.vistoria_tree.heading("data", text="Sessão")
@@ -960,9 +1120,13 @@ class BatchGuiApp:
         details_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         details_frame.columnconfigure(0, weight=1)
         details_frame.rowconfigure(0, weight=1)
-        self.vistoria_details = tk.Text(
-            details_frame, wrap=tk.WORD, height=6, font=("Segoe UI", 9), relief=tk.FLAT,
-            background="#fbf8f2", state=tk.DISABLED,
+        self.vistoria_details = tip(
+            tk.Text(
+                details_frame, wrap=tk.WORD, height=6, font=("Segoe UI", 9), relief=tk.FLAT,
+                background="#fbf8f2", state=tk.DISABLED,
+            ),
+            "Detalhes do item selecionado na tabela: processo, sessão, motivos completos do descarte/bloqueio, "
+            "ementa oficial do DJE (quando houver) e o caminho da pasta de artifacts com as evidências.",
         )
         self.vistoria_details.grid(row=0, column=0, sticky="nsew")
         details_scroll = ttk.Scrollbar(details_frame, orient=tk.VERTICAL, command=self.vistoria_details.yview)
