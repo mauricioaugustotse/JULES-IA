@@ -182,16 +182,24 @@ def find_mention_timestamp(video_dir: Path, cnj20: str) -> int | None:
     return best
 
 
-def load_full_rows(csv_path: Path, wanted_cnj20: set[str]) -> dict[str, dict]:
-    """Uma passada streaming pelo CSV bruto coletando as linhas completas."""
+def load_full_rows(csv_path: Path, wanted: dict[str, str]) -> dict[str, dict]:
+    """Linha completa por CNJ-20 NA DATA esperada (wanted: cnj20 -> data ISO).
+
+    Processos têm várias decisões no consolidado (monocráticas, acórdãos
+    anteriores); pegar a primeira ocorrência importa a decisão ERRADA.
+    """
     found: dict[str, dict] = {}
     with open(csv_path, encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
             cnj20 = digits(row.get("numeroUnico"))[:20]
-            if cnj20 in wanted_cnj20 and cnj20 not in found:
-                found[cnj20] = dict(row)
-                if len(found) == len(wanted_cnj20):
-                    break
+            expected = wanted.get(cnj20)
+            if expected is None or cnj20 in found:
+                continue
+            if iso(row.get("dataDecisao")) != expected:
+                continue
+            found[cnj20] = dict(row)
+            if len(found) == len(wanted):
+                break
     return found
 
 
@@ -213,6 +221,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", required=True, help="CSV BRUTO consolidado do DJE.")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--include-published",
+        action="store_true",
+        help="Reprocessa também itens já publicados (upsert corrige páginas existentes).",
+    )
     parser.add_argument("--skip-theme-enricher", action="store_true", help="Não chama o Gemini (tema determinístico).")
     parser.add_argument("--model", default=DEFAULT_GEMINI_MODEL)
     parser.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
@@ -220,15 +233,24 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
 
-    items = [i for i in vistoria_queue.load_items("pending") if i.get("source") == "dje"]
+    statuses = {"pending", "published"} if args.include_published else {"pending"}
+    items = [
+        i for i in vistoria_queue.load_items(None)
+        if i.get("source") == "dje" and i.get("status") in statuses
+    ]
     if not items:
         LOGGER.info("Nenhum faltante DJE pendente na fila.")
         return 0
-    LOGGER.info("Faltantes DJE pendentes: %s", len(items))
+    LOGGER.info("Faltantes DJE a processar: %s", len(items))
 
-    wanted = {str((i.get("extra") or {}).get("dje", {}).get("cnj20", "")) for i in items}
-    wanted.discard("")
-    LOGGER.info("Relendo o CSV bruto para %s CNJs...", len(wanted))
+    wanted: dict[str, str] = {}
+    for i in items:
+        record = (i.get("extra") or {}).get("dje", {})
+        cnj20 = str(record.get("cnj20", ""))
+        data = i.get("data_sessao", "") or iso(record.get("dataDecisao", ""))
+        if cnj20 and data:
+            wanted[cnj20] = data
+    LOGGER.info("Relendo o CSV bruto para %s CNJs (na data da sessão)...", len(wanted))
     full_rows = load_full_rows(Path(args.csv), wanted)
     LOGGER.info("Linhas completas localizadas: %s", len(full_rows))
 
@@ -289,6 +311,22 @@ def main() -> int:
             "Importado do confronto DJE (CSV oficial); posição na pauta não verificada; "
             "partes/advogados/composição serão preenchidos pelo confronto oficial."
         )
+        # Upsert: se a página já existe (re-execução/correção), atualiza em vez de
+        # duplicar, preservando o "Julgamento N" já atribuído.
+        try:
+            cond = client.build_filter_condition(schema, "numero_processo", row.numero_processo)
+            for page in client.query_data_source(cond):
+                page_data = (client._extract_property_text(page, schema, "data_sessao") or "")[:10]
+                if page_data == row.data_sessao:
+                    row.page_id = page.get("id", "")
+                    row.action = "update"
+                    existing_tipo = client._extract_property_text(page, schema, "tipo_registro") or ""
+                    if existing_tipo:
+                        row.tipo_registro = existing_tipo
+                        counters[data_sessao] -= 1
+                    break
+        except Exception as exc:
+            LOGGER.warning("Upsert lookup falhou para %s: %s", row.numero_processo, exc)
         rows.append(row)
         row_items.append(item)
 
