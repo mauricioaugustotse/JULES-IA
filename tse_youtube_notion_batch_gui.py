@@ -1033,11 +1033,14 @@ class BatchGuiApp:
         self.tree.heading("url", text="URL")
         self.tree.column("pos", width=40, stretch=False, anchor=tk.CENTER)
         self.tree.column("video_id", width=110, stretch=False)
-        self.tree.column("sessao", width=260, stretch=True)
+        self.tree.column("sessao", width=300, stretch=False)
         self.tree.column("cc", width=36, stretch=False, anchor=tk.CENTER)
         self.tree.column("status", width=140, stretch=False)
-        self.tree.column("result", width=300, stretch=True)
-        self.tree.column("url", width=300, stretch=True)
+        self.tree.column("result", width=320, stretch=False)
+        self.tree.column("url", width=320, stretch=False)
+        tree_xscroll = ttk.Scrollbar(exec_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        tree_xscroll.grid(row=2, column=0, sticky="ew")
+        self.tree.configure(xscrollcommand=tree_xscroll.set)
 
         log_frame = ttk.LabelFrame(process_tab, text="Saída", padding=8)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
@@ -1152,16 +1155,20 @@ class BatchGuiApp:
         self.vistoria_tree.heading("disp", text="Situação")
         self.vistoria_tree.heading("origem", text="Fonte")
         self.vistoria_tree.heading("video", text="Vídeo")
+        # stretch=False em todas: coluna elástica "rouba" de volta o espaço quando a
+        # janela redesenha, desfazendo o redimensionamento manual do usuário.
         self.vistoria_tree.column("data", width=95, stretch=False)
         self.vistoria_tree.column("ts", width=75, stretch=False, anchor=tk.CENTER)
         self.vistoria_tree.column("numero", width=205, stretch=False)
-        self.vistoria_tree.column("tema", width=420, stretch=True)
+        self.vistoria_tree.column("tema", width=520, stretch=False)
         self.vistoria_tree.column("disp", width=125, stretch=False)
         self.vistoria_tree.column("origem", width=80, stretch=False)
         self.vistoria_tree.column("video", width=110, stretch=False)
         vistoria_scroll = ttk.Scrollbar(vistoria_table, orient=tk.VERTICAL, command=self.vistoria_tree.yview)
         vistoria_scroll.grid(row=0, column=1, sticky="ns")
-        self.vistoria_tree.configure(yscrollcommand=vistoria_scroll.set)
+        vistoria_xscroll = ttk.Scrollbar(vistoria_table, orient=tk.HORIZONTAL, command=self.vistoria_tree.xview)
+        vistoria_xscroll.grid(row=1, column=0, sticky="ew")
+        self.vistoria_tree.configure(yscrollcommand=vistoria_scroll.set, xscrollcommand=vistoria_xscroll.set)
         self.vistoria_tree.bind("<<TreeviewSelect>>", self._show_vistoria_details)
         self.vistoria_tree.tag_configure("skipped", foreground="#7a4a00")
         self.vistoria_tree.tag_configure("blocked", foreground="#8a1f1f")
@@ -1547,12 +1554,12 @@ class BatchGuiApp:
 
         self.vistoria_items = {str(item["id"]): item for item in items}
         self.vistoria_tree.delete(*self.vistoria_tree.get_children())
-        # Itens com marcador de tempo primeiro (validação visual mais fácil), depois por data.
-        def sort_key(item):
-            timestamp = item_timestamp_seconds(item)
-            return (0 if timestamp is not None else 1, item.get("data_sessao") or "", item.get("id", ""))
+        # Itens com marcador de tempo primeiro (validação visual mais fácil); dentro
+        # de cada grupo, sessão mais RECENTE primeiro (dois sorts estáveis).
+        ordered = sorted(items, key=lambda x: (x.get("data_sessao") or "", x.get("id", "")), reverse=True)
+        ordered = sorted(ordered, key=lambda x: 0 if item_timestamp_seconds(x) is not None else 1)
 
-        for item in sorted(items, key=sort_key):
+        for item in ordered:
             row = item.get("row") or {}
             dje = (item.get("extra") or {}).get("dje") or {}
             numero = row.get("numero_processo") or dje.get("numeroUnico") or item.get("numero_hint") or ""
