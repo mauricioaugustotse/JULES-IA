@@ -1059,6 +1059,7 @@ class BatchGuiApp:
         self.tree.configure(xscrollcommand=tree_xscroll.set)
         self.tree.bind("<Button-3>", self._videos_context_menu)
         self.tree.bind("<Control-c>", lambda _e: self._copy_tree_selection(self.tree))
+        self.tree.bind("<Control-a>", lambda _e: self._select_all_tree(self.tree))
 
         log_frame = ttk.LabelFrame(process_tab, text="Saída", padding=8)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
@@ -1203,6 +1204,7 @@ class BatchGuiApp:
         self.vistoria_tree.bind("<<TreeviewSelect>>", self._show_vistoria_details)
         self.vistoria_tree.bind("<Button-3>", self._vistoria_context_menu)
         self.vistoria_tree.bind("<Control-c>", lambda _e: self._copy_tree_selection(self.vistoria_tree))
+        self.vistoria_tree.bind("<Control-a>", lambda _e: self._select_all_tree(self.vistoria_tree))
         self.vistoria_tree.tag_configure("skipped", foreground="#7a4a00")
         self.vistoria_tree.tag_configure("blocked", foreground="#8a1f1f")
         self.vistoria_tree.tag_configure("info", foreground="#1f3a5f")
@@ -1676,6 +1678,21 @@ class BatchGuiApp:
         if lines:
             self._copy_clip("\n".join(lines))
 
+    def _select_all_tree(self, tree: ttk.Treeview) -> str:
+        tree.selection_set(tree.get_children())
+        return "break"
+
+    def _copy_entire_tree(self, tree: ttk.Treeview) -> None:
+        """Copia TODAS as linhas visíveis (filtro atual) com cabeçalho, separadas
+        por tab — pronto para colar em planilha."""
+        headers = [tree.heading(column, "text") for column in tree["columns"]]
+        lines = ["\t".join(headers)]
+        for iid in tree.get_children():
+            lines.append("\t".join(str(v) for v in tree.item(iid, "values")))
+        if len(lines) > 1:
+            self._copy_clip("\n".join(lines))
+            self._append_output(f"Lista copiada: {len(lines) - 1} linha(s) + cabeçalho.\n")
+
     def _cell_under_cursor(self, tree: ttk.Treeview, event) -> tuple[str, str]:
         row_id = tree.identify_row(event.y)
         cell = ""
@@ -1714,6 +1731,14 @@ class BatchGuiApp:
             label="Copiar linha inteira",
             command=lambda: self._copy_tree_selection(self.vistoria_tree),
         )
+        menu.add_command(
+            label="Selecionar tudo  (Ctrl+A)",
+            command=lambda: self._select_all_tree(self.vistoria_tree),
+        )
+        menu.add_command(
+            label="Copiar LISTA inteira (filtro atual, com cabeçalho)",
+            command=lambda: self._copy_entire_tree(self.vistoria_tree),
+        )
         menu.tk_popup(event.x_root, event.y_root)
 
     def _videos_context_menu(self, event) -> None:
@@ -1729,6 +1754,11 @@ class BatchGuiApp:
             menu.add_command(label="Copiar URL do vídeo", command=lambda v=url: self._copy_clip(v))
         menu.add_separator()
         menu.add_command(label="Copiar linha inteira", command=lambda: self._copy_tree_selection(self.tree))
+        menu.add_command(label="Selecionar tudo  (Ctrl+A)", command=lambda: self._select_all_tree(self.tree))
+        menu.add_command(
+            label="Copiar LISTA inteira (com cabeçalho)",
+            command=lambda: self._copy_entire_tree(self.tree),
+        )
         menu.tk_popup(event.x_root, event.y_root)
 
     def _details_context_menu(self, event) -> None:
