@@ -1041,6 +1041,8 @@ class BatchGuiApp:
         tree_xscroll = ttk.Scrollbar(exec_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
         tree_xscroll.grid(row=2, column=0, sticky="ew")
         self.tree.configure(xscrollcommand=tree_xscroll.set)
+        self.tree.bind("<Button-3>", self._videos_context_menu)
+        self.tree.bind("<Control-c>", lambda _e: self._copy_tree_selection(self.tree))
 
         log_frame = ttk.LabelFrame(process_tab, text="Saída", padding=8)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
@@ -1170,6 +1172,8 @@ class BatchGuiApp:
         vistoria_xscroll.grid(row=1, column=0, sticky="ew")
         self.vistoria_tree.configure(yscrollcommand=vistoria_scroll.set, xscrollcommand=vistoria_xscroll.set)
         self.vistoria_tree.bind("<<TreeviewSelect>>", self._show_vistoria_details)
+        self.vistoria_tree.bind("<Button-3>", self._vistoria_context_menu)
+        self.vistoria_tree.bind("<Control-c>", lambda _e: self._copy_tree_selection(self.vistoria_tree))
         self.vistoria_tree.tag_configure("skipped", foreground="#7a4a00")
         self.vistoria_tree.tag_configure("blocked", foreground="#8a1f1f")
         self.vistoria_tree.tag_configure("info", foreground="#1f3a5f")
@@ -1181,12 +1185,16 @@ class BatchGuiApp:
         self.vistoria_details = tip(
             tk.Text(
                 details_frame, wrap=tk.WORD, height=6, font=("Segoe UI", 9), relief=tk.FLAT,
-                background="#fbf8f2", state=tk.DISABLED,
+                background="#fbf8f2",
             ),
             "Detalhes do item selecionado na tabela: processo, sessão, motivos completos do descarte/bloqueio, "
-            "ementa oficial do DJE (quando houver) e o caminho da pasta de artifacts com as evidências.",
+            "ementa oficial do DJE (quando houver) e o caminho da pasta de artifacts. O texto é selecionável: "
+            "arraste o mouse e copie com Ctrl+C.",
         )
         self.vistoria_details.grid(row=0, column=0, sticky="nsew")
+        # Somente leitura SEM state=DISABLED: o usuário seleciona e copia livremente,
+        # mas qualquer tecla de edição é bloqueada.
+        self.vistoria_details.bind("<Key>", self._readonly_text_key)
         details_scroll = ttk.Scrollbar(details_frame, orient=tk.VERTICAL, command=self.vistoria_details.yview)
         details_scroll.grid(row=0, column=1, sticky="ns")
         self.vistoria_details.configure(yscrollcommand=details_scroll.set)
@@ -1592,9 +1600,84 @@ class BatchGuiApp:
         self.notebook.tab(self.vistoria_tab_index, text=f"  Fila de vistoria ({total})  ")
         self.vistoria_hint_var.set(f"⚠ {total} pendência(s) aguardam sua decisão — clique aqui" if total else "")
 
+    def _readonly_text_key(self, event):
+        """Permite navegação e cópia no Text, bloqueando qualquer edição."""
+        ctrl = bool(event.state & 0x4)
+        if ctrl and event.keysym.lower() in ("c", "a"):
+            if event.keysym.lower() == "a":
+                event.widget.tag_add(tk.SEL, "1.0", tk.END)
+                return "break"
+            return None
+        if event.keysym in ("Up", "Down", "Left", "Right", "Prior", "Next", "Home", "End"):
+            return None
+        return "break"
+
+    def _copy_clip(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _copy_tree_selection(self, tree: ttk.Treeview) -> None:
+        lines = ["\t".join(str(v) for v in tree.item(iid, "values")) for iid in tree.selection()]
+        if lines:
+            self._copy_clip("\n".join(lines))
+
+    def _cell_under_cursor(self, tree: ttk.Treeview, event) -> tuple[str, str]:
+        row_id = tree.identify_row(event.y)
+        cell = ""
+        if row_id:
+            tree.selection_set(row_id)
+            tree.focus(row_id)
+            column_id = tree.identify_column(event.x)
+            if column_id.startswith("#"):
+                index = int(column_id[1:]) - 1
+                values = tree.item(row_id, "values")
+                if 0 <= index < len(values):
+                    cell = str(values[index])
+        return row_id, cell
+
+    def _vistoria_context_menu(self, event) -> None:
+        row_id, cell = self._cell_under_cursor(self.vistoria_tree, event)
+        if not row_id:
+            return
+        item = self.vistoria_items.get(row_id) or {}
+        row = item.get("row") or {}
+        dje = (item.get("extra") or {}).get("dje") or {}
+        numero = str(row.get("numero_processo") or dje.get("numeroUnico") or item.get("numero_hint") or "")
+        link = item_video_link(item)
+        menu = tk.Menu(self.vistoria_tree, tearoff=0)
+        if cell and cell != "—":
+            menu.add_command(label=f'Copiar "{cell[:60]}"', command=lambda v=cell: self._copy_clip(v))
+        if numero:
+            menu.add_command(label=f"Copiar processo  {numero}", command=lambda v=numero: self._copy_clip(v))
+        if link:
+            menu.add_command(label="Copiar link do vídeo", command=lambda v=link: self._copy_clip(v))
+        reasons = "\n".join(item.get("reasons") or [])
+        if reasons:
+            menu.add_command(label="Copiar motivos completos", command=lambda v=reasons: self._copy_clip(v))
+        menu.add_separator()
+        menu.add_command(
+            label="Copiar linha inteira",
+            command=lambda: self._copy_tree_selection(self.vistoria_tree),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _videos_context_menu(self, event) -> None:
+        row_id, cell = self._cell_under_cursor(self.tree, event)
+        if not row_id:
+            return
+        values = self.tree.item(row_id, "values")
+        url = values[-1] if values else ""
+        menu = tk.Menu(self.tree, tearoff=0)
+        if cell:
+            menu.add_command(label=f'Copiar "{cell[:60]}"', command=lambda v=cell: self._copy_clip(v))
+        if url:
+            menu.add_command(label="Copiar URL do vídeo", command=lambda v=url: self._copy_clip(v))
+        menu.add_separator()
+        menu.add_command(label="Copiar linha inteira", command=lambda: self._copy_tree_selection(self.tree))
+        menu.tk_popup(event.x_root, event.y_root)
+
     def _show_vistoria_details(self, _event=None) -> None:
         selected = self._selected_vistoria_items()
-        self.vistoria_details.configure(state=tk.NORMAL)
         self.vistoria_details.delete("1.0", tk.END)
         if selected:
             item = selected[0]
@@ -1617,7 +1700,6 @@ class BatchGuiApp:
                 lines.append("")
                 lines.append(f"Artifacts: {item['artifact_dir']}")
             self.vistoria_details.insert("1.0", "\n".join(lines))
-        self.vistoria_details.configure(state=tk.DISABLED)
 
     def _open_selected_vistoria_artifact(self) -> None:
         for item in self._selected_vistoria_items():
