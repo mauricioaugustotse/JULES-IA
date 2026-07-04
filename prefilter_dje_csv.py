@@ -121,13 +121,18 @@ def _missing_record(row: dict, cnj20: str) -> dict:
     }
 
 
-def _queue_missing_with_artifact_evidence(missing_rows: list[dict], batch_root: Path) -> tuple[int, int]:
+def _queue_missing_with_artifact_evidence(
+    missing_rows: list[dict],
+    batch_root: Path,
+    backlog_root: Path | None = None,
+) -> tuple[int, int]:
     """Cruza faltantes com os artifacts dos vídeos: só entra na fila quem tem o
     número citado no vídeo da MESMA data (evidência de julgamento individual);
     o resto é presumido "em lista" e fica só no relatório."""
     import json as _json
 
     import vistoria_queue
+    from tse_normalization import infer_session_date_from_video_title
 
     videos_by_date: dict[str, list[Path]] = {}
     for rows_file in batch_root.glob("*/*/04b_enriched_preview_rows.json"):
@@ -138,6 +143,16 @@ def _queue_missing_with_artifact_evidence(missing_rows: list[dict], batch_root: 
         for data in {str(r.get("data_sessao", "") or "")[:10] for r in rows if isinstance(r, dict)}:
             if data:
                 videos_by_date.setdefault(data, []).append(rows_file.parent)
+    if backlog_root is not None and backlog_root.exists():
+        # Backlog de playlists (Drive): data da sessão vem do título no 07_backfill_summary.
+        for summary_file in backlog_root.glob("[0-9][0-9][0-9][0-9]_PL*/*/07_backfill_summary.json"):
+            try:
+                title = str(_json.loads(summary_file.read_text(encoding="utf-8")).get("title", "") or "")
+            except Exception:
+                continue
+            data = infer_session_date_from_video_title(title) or ""
+            if data:
+                videos_by_date.setdefault(data, []).append(summary_file.parent)
 
     digits_cache: dict[Path, str] = {}
 
@@ -210,6 +225,11 @@ def main() -> int:
             "Faltantes com o numero mencionado no video da mesma data entram na fila de vistoria; "
             "os demais sao presumidos 'julgados em lista' e ficam so no relatorio."
         ),
+    )
+    ap.add_argument(
+        "--queue-from-backlog",
+        default="",
+        help="Raiz adicional do backlog de playlists (ex.: H:\\Meu Drive\\TSE_YOUTUBE_NOTION_BACKLOG\\backfill_2025).",
     )
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()
@@ -300,8 +320,9 @@ def main() -> int:
         }
         if args.queue_from_artifacts and missing_rows:
             batch_root = Path(args.queue_from_artifacts)
+            backlog_root = Path(args.queue_from_backlog) if args.queue_from_backlog else None
             if batch_root.exists():
-                queued, presumed_lista = _queue_missing_with_artifact_evidence(missing_rows, batch_root)
+                queued, presumed_lista = _queue_missing_with_artifact_evidence(missing_rows, batch_root, backlog_root)
                 summary["queued"] = queued
                 summary["presumed_lista"] = presumed_lista
                 LOGGER.info(
