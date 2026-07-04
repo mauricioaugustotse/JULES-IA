@@ -184,8 +184,6 @@ class Tooltip:
     def _show(self) -> None:
         if self._tip or not self.text:
             return
-        x = self.widget.winfo_rootx() + 16
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
         self._tip = tip_window = tk.Toplevel(self.widget)
         tip_window.wm_overrideredirect(True)
         try:
@@ -197,6 +195,21 @@ class Tooltip:
             foreground="#333333", relief=tk.SOLID, borderwidth=1,
             font=("Segoe UI", 9), wraplength=self.wraplength, padx=8, pady=6,
         ).pack()
+        # Posiciona junto ao CURSOR (não abaixo do widget: em tabelas/abas altas o
+        # balão iria parar cortado no rodapé da tela) e mantém dentro da área útil.
+        tip_window.update_idletasks()
+        tip_w = tip_window.winfo_reqwidth()
+        tip_h = tip_window.winfo_reqheight()
+        screen_w = self.widget.winfo_screenwidth()
+        screen_h = self.widget.winfo_screenheight()
+        pointer_x = self.widget.winfo_pointerx()
+        pointer_y = self.widget.winfo_pointery()
+        x = min(pointer_x + 14, screen_w - tip_w - 8)
+        y = pointer_y + 20
+        if y + tip_h > screen_h - 56:  # não invade a barra de tarefas: abre ACIMA do cursor
+            y = pointer_y - tip_h - 14
+        x = max(x, 8)
+        y = max(y, 8)
         tip_window.wm_geometry(f"+{x}+{y}")
 
     def _hide(self, _event=None) -> None:
