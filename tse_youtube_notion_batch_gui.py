@@ -138,6 +138,12 @@ def count_result_status(results: list[dict[str, Any]], status: str) -> int:
     return sum(1 for item in results if item.get("status") == status)
 
 
+def item_has_strong_evidence(item: dict[str, Any]) -> bool:
+    """Itens em que o gate registrou 'prova local forte do julgamento' no vídeo:
+    fortes candidatos à aprovação, destacados em grupo próprio na fila."""
+    return any("prova local forte" in str(reason) for reason in item.get("reasons") or [])
+
+
 def item_video_link(item: dict[str, Any]) -> str:
     row = item.get("row") or {}
     return str(row.get("youtube_link") or item.get("youtube_url") or "")
@@ -1109,10 +1115,15 @@ class BatchGuiApp:
         self.vistoria_filter_var = tk.StringVar(value="Todas")
         vistoria_filter = tip(
             ttk.Combobox(
-                vistoria_actions, textvariable=self.vistoria_filter_var, state="readonly", width=18,
-                values=("Todas", "skipped", "blocked", "duplicata_numero", "faltante_dje", "contagem_rito"),
+                vistoria_actions, textvariable=self.vistoria_filter_var, state="readonly", width=22,
+                values=(
+                    "Todas", "⭐ prova local forte", "skipped", "blocked",
+                    "duplicata_numero", "faltante_dje", "contagem_rito",
+                ),
             ),
             "Tipos de pendência:\n"
+            "• ⭐ prova local forte — o próprio vídeo comprova o julgamento (número citado em vários trechos), "
+            "mas o item foi barrado por outro motivo: FORTES candidatos à aprovação (fundo verde, topo da lista);\n"
             "• skipped — o fluxo descartou o item (ex.: possível precedente citado, densidade baixa);\n"
             "• blocked — barrado por dados insuficientes/incoerentes (sem resultado, tema vazio, vista sem ministro);\n"
             "• duplicata_numero — mesmo julgamento aparece com dois números divergentes na base;\n"
@@ -1177,6 +1188,7 @@ class BatchGuiApp:
         self.vistoria_tree.tag_configure("skipped", foreground="#7a4a00")
         self.vistoria_tree.tag_configure("blocked", foreground="#8a1f1f")
         self.vistoria_tree.tag_configure("info", foreground="#1f3a5f")
+        self.vistoria_tree.tag_configure("strong", background="#e6f4e6", foreground="#1b5e20")
 
         details_frame = ttk.LabelFrame(vistoria_tab, text="Detalhes do item selecionado", padding=8)
         details_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
@@ -1554,18 +1566,27 @@ class BatchGuiApp:
         total = len(items)
         counts = Counter(item.get("disposition", "?") for item in items)
         with_ts_total = sum(1 for item in items if item_timestamp_seconds(item) is not None)
+        strong_total = sum(1 for item in items if item_has_strong_evidence(item))
         selected_filter = self.vistoria_filter_var.get() if hasattr(self, "vistoria_filter_var") else "Todas"
-        if selected_filter != "Todas":
+        if selected_filter.startswith("⭐"):
+            items = [item for item in items if item_has_strong_evidence(item)]
+        elif selected_filter != "Todas":
             items = [item for item in items if item.get("disposition") == selected_filter]
         if getattr(self, "vistoria_only_ts_var", None) and self.vistoria_only_ts_var.get():
             items = [item for item in items if item_timestamp_seconds(item) is not None]
 
         self.vistoria_items = {str(item["id"]): item for item in items}
         self.vistoria_tree.delete(*self.vistoria_tree.get_children())
-        # Itens com marcador de tempo primeiro (validação visual mais fácil); dentro
-        # de cada grupo, sessão mais RECENTE primeiro (dois sorts estáveis).
+        # Prioridade: ⭐ prova local forte no topo, depois quem tem marcador de tempo;
+        # dentro de cada grupo, sessão mais RECENTE primeiro (sorts estáveis).
         ordered = sorted(items, key=lambda x: (x.get("data_sessao") or "", x.get("id", "")), reverse=True)
-        ordered = sorted(ordered, key=lambda x: 0 if item_timestamp_seconds(x) is not None else 1)
+        ordered = sorted(
+            ordered,
+            key=lambda x: (
+                0 if item_has_strong_evidence(x) else 1,
+                0 if item_timestamp_seconds(x) is not None else 1,
+            ),
+        )
 
         for item in ordered:
             row = item.get("row") or {}
@@ -1576,7 +1597,8 @@ class BatchGuiApp:
                 or "; ".join(item.get("reasons") or [])
             )
             disposition = item.get("disposition", "")
-            tag = disposition if disposition in ("skipped", "blocked") else "info"
+            strong = item_has_strong_evidence(item)
+            tag = "strong" if strong else (disposition if disposition in ("skipped", "blocked") else "info")
             timestamp = item_timestamp_seconds(item)
             self.vistoria_tree.insert(
                 "",
@@ -1587,7 +1609,7 @@ class BatchGuiApp:
                     item.get("data_sessao", ""),
                     format_elapsed(timestamp) if timestamp is not None else "—",
                     numero,
-                    str(tema)[:120],
+                    ("⭐ " if strong else "") + str(tema)[:120],
                     disposition,
                     item.get("source", ""),
                     item.get("video_id", ""),
@@ -1595,7 +1617,9 @@ class BatchGuiApp:
             )
         resumo = "  |  ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
         self.vistoria_summary_var.set(
-            f"{total} pendente(s)  (⏱ {with_ts_total})   {resumo}" if total else "Fila vazia — nada aguardando revisão."
+            f"{total} pendente(s)  (⭐ {strong_total} | ⏱ {with_ts_total})   {resumo}"
+            if total
+            else "Fila vazia — nada aguardando revisão."
         )
         self.notebook.tab(self.vistoria_tab_index, text=f"  Fila de vistoria ({total})  ")
         self.vistoria_hint_var.set(f"⚠ {total} pendência(s) aguardam sua decisão — clique aqui" if total else "")
