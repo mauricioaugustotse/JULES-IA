@@ -1777,14 +1777,21 @@ class BatchGuiApp:
 
     def _approve_selected_vistoria(self) -> None:
         selected = self._selected_vistoria_items()
-        publishable = [item for item in selected if item.get("row")]
         if not selected:
             messagebox.showinfo("Fila de vistoria", "Selecione ao menos um item.")
             return
+        publishable = [
+            item for item in selected
+            if item.get("row")
+            or (item.get("disposition") in ("skipped", "blocked") and item.get("artifact_dir"))
+        ]
         if not publishable:
             messagebox.showinfo(
                 "Fila de vistoria",
-                "Os itens selecionados são informativos (sem linha para publicar). Use 'Descartar item' para fechá-los.",
+                "Os itens selecionados são apenas informativos (duplicata de número / contagem do rito / "
+                "faltante DJE): não carregam julgamento publicável por aqui. Duplicatas e contagens se "
+                "resolvem corrigindo a base; faltantes DJE são importados pelo import_dje_faltantes.py. "
+                "Use 'Descartar item' para fechá-los quando tratados.",
             )
             return
         if not messagebox.askyesno(
