@@ -138,10 +138,20 @@ def count_result_status(results: list[dict[str, Any]], status: str) -> int:
     return sum(1 for item in results if item.get("status") == status)
 
 
+STRONG_EVIDENCE_RE = re.compile(
+    r"prova local forte"                      # gate reconheceu o julgamento no vídeo
+    r"|partes com opç\w+ novas? no Notion:"   # partes NOMEADAS: a extração viu a
+    r"|advogados com opç\w+ novas? no Notion:"  # qualificação de um julgamento real,
+    r"|partes \(indicados da lista tríplice\)",  # não uma citação de precedente
+    re.IGNORECASE,
+)
+
+
 def item_has_strong_evidence(item: dict[str, Any]) -> bool:
-    """Itens em que o gate registrou 'prova local forte do julgamento' no vídeo:
-    fortes candidatos à aprovação, destacados em grupo próprio na fila."""
-    return any("prova local forte" in str(reason) for reason in item.get("reasons") or [])
+    """Fortes candidatos à aprovação, destacados em grupo próprio (⭐): o gate
+    registrou prova local forte OU o motivo cita nomes próprios de partes/
+    advogados — sinal de julgamento concreto, não de precedente citado."""
+    return any(STRONG_EVIDENCE_RE.search(str(reason)) for reason in item.get("reasons") or [])
 
 
 def item_video_link(item: dict[str, Any]) -> str:
@@ -1129,8 +1139,9 @@ class BatchGuiApp:
             ),
             "Tipos de pendência (e a visão 🗑 descartados, que lista os itens já fechados para "
             "conferência ou restauração):\n"
-            "• ⭐ prova local forte — o próprio vídeo comprova o julgamento (número citado em vários trechos), "
-            "mas o item foi barrado por outro motivo: FORTES candidatos à aprovação (fundo verde, topo da lista);\n"
+            "• ⭐ prova local forte — o próprio vídeo comprova o julgamento (número citado em vários trechos "
+            "OU partes/advogados NOMEADOS no motivo), mas o item foi barrado por outra razão: FORTES candidatos "
+            "à aprovação (fundo verde, topo da lista);\n"
             "• skipped — o fluxo descartou o item (ex.: possível precedente citado, densidade baixa);\n"
             "• blocked — barrado por dados insuficientes/incoerentes (sem resultado, tema vazio, vista sem ministro);\n"
             "• duplicata_numero — mesmo julgamento aparece com dois números divergentes na base;\n"
