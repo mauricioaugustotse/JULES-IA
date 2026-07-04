@@ -14,6 +14,7 @@ import traceback
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -696,8 +697,8 @@ class BatchGuiApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("TSE YouTube > Notion - lote pos-noticias")
-        self.root.geometry("1120x760")
-        self.root.minsize(960, 680)
+        self.root.geometry("1280x840")
+        self.root.minsize(1100, 720)
 
         self.output_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -732,28 +733,77 @@ class BatchGuiApp:
         self.root.after(1000, self._refresh_live_progress)
 
     def _build_ui(self) -> None:
-        main = ttk.Frame(self.root, padding=12)
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("vista")
+        except tk.TclError:
+            pass
+        self.root.option_add("*Font", ("Segoe UI", 10))
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"), foreground="#1f3a5f")
+        style.configure("Treeview", rowheight=24, font=("Segoe UI", 9))
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=(14, 6))
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("Hint.TLabel", foreground="#a15c00", font=("Segoe UI", 10, "bold"))
+        style.configure("Muted.TLabel", foreground="#666666", font=("Segoe UI", 9))
+
+        main = ttk.Frame(self.root, padding=(12, 10))
         main.pack(fill=tk.BOTH, expand=True)
-        main.columnconfigure(0, weight=1)
-        main.rowconfigure(3, weight=3)
-        main.rowconfigure(4, weight=2)
-        main.rowconfigure(5, weight=2)
 
         header = ttk.Frame(main)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(header, text="TSE YouTube > Notion", font=("Segoe UI", 15, "bold")).pack(anchor=tk.W)
-        ttk.Label(header, textvariable=self.target_var).pack(anchor=tk.W, pady=(2, 0))
+        header.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(header, text="TSE YouTube → Notion", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
+        notion_link = ttk.Label(
+            header, text="abrir base no Notion ↗", foreground="#0b5cad", cursor="hand2",
+            font=("Segoe UI", 9, "underline"),
+        )
+        notion_link.pack(side=tk.RIGHT, pady=(8, 0))
+        notion_link.bind("<Button-1>", lambda _e: webbrowser.open(DEFAULT_NOTION_DATABASE_URL))
 
-        input_frame = ttk.LabelFrame(main, text="1. Links do YouTube", padding=8)
-        input_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.notebook = ttk.Notebook(main)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        process_tab = ttk.Frame(self.notebook, padding=10)
+        vistoria_tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(process_tab, text="  Processar lote  ")
+        self.notebook.add(vistoria_tab, text="  Fila de vistoria  ")
+        self.vistoria_tab_index = 1
+
+        statusbar = ttk.Frame(main)
+        statusbar.pack(fill=tk.X, pady=(8, 0))
+        ttk.Progressbar(
+            statusbar, variable=self.progress_var, maximum=100, mode="determinate", length=300
+        ).pack(side=tk.LEFT)
+        ttk.Label(statusbar, textvariable=self.progress_text_var, style="Muted.TLabel").pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+        self.vistoria_hint_var = tk.StringVar(value="")
+        vistoria_hint = ttk.Label(
+            statusbar, textvariable=self.vistoria_hint_var, style="Hint.TLabel", cursor="hand2"
+        )
+        vistoria_hint.pack(side=tk.RIGHT)
+        vistoria_hint.bind("<Button-1>", lambda _e: self.notebook.select(self.vistoria_tab_index))
+
+        # ================= ABA 1 — PROCESSAR LOTE =================
+        process_tab.columnconfigure(0, weight=1)
+        process_tab.rowconfigure(2, weight=3)
+        process_tab.rowconfigure(3, weight=1)
+
+        input_frame = ttk.LabelFrame(
+            process_tab,
+            text="1. Links do YouTube  (título, data da sessão e legenda são verificados ao adicionar)",
+            padding=8,
+        )
+        input_frame.grid(row=0, column=0, sticky="ew")
         input_frame.columnconfigure(0, weight=1)
         ttk.Entry(input_frame, textvariable=self.link_var).grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(input_frame, text="Adicionar link", command=self._add_link).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(input_frame, text="Colar da area", command=self._paste_links).grid(row=0, column=2)
-        ttk.Label(input_frame, textvariable=self.count_var).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        ttk.Button(input_frame, text="Colar da área", command=self._paste_links).grid(row=0, column=2)
+        ttk.Label(input_frame, textvariable=self.count_var, style="Muted.TLabel").grid(
+            row=1, column=0, sticky=tk.W, pady=(6, 0)
+        )
 
-        options = ttk.LabelFrame(main, text="2. Fluxo", padding=8)
-        options.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        options = ttk.LabelFrame(process_tab, text="2. Opções do fluxo", padding=8)
+        options.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         options.columnconfigure(1, weight=1)
         options.columnconfigure(3, weight=1)
         ttk.Label(options, text="Modelo Gemini").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
@@ -786,36 +836,28 @@ class BatchGuiApp:
         ttk.Checkbutton(options, text="Processar CSVs DJE",
                         variable=self.watch_dje_var).grid(row=2, column=3, sticky=tk.W, pady=(6, 0))
 
-        exec_frame = ttk.LabelFrame(main, text="3. Execução", padding=8)
-        exec_frame.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+        exec_frame = ttk.LabelFrame(process_tab, text="3. Execução", padding=8)
+        exec_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         exec_frame.columnconfigure(0, weight=1)
-        exec_frame.rowconfigure(2, weight=1)
+        exec_frame.rowconfigure(1, weight=1)
 
         actions = ttk.Frame(exec_frame)
-        actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        self.start_button = ttk.Button(actions, text="Processar lote", command=self._start_batch)
+        actions.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.start_button = ttk.Button(actions, text="▶  Processar lote", style="Accent.TButton", command=self._start_batch)
         self.start_button.pack(side=tk.LEFT)
-        self.stop_button = ttk.Button(actions, text="Parar apos video atual", command=self._request_stop, state=tk.DISABLED)
+        self.stop_button = ttk.Button(actions, text="Parar após vídeo atual", command=self._request_stop, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Remover selecionado", command=self._remove_selected).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Limpar lista", command=self._clear_links).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Abrir artifacts", command=self._open_artifacts).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Retomar artifacts", command=self._load_resume_root).pack(side=tk.LEFT, padx=(8, 0))
 
-        progress_frame = ttk.Frame(exec_frame)
-        progress_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        progress_frame.columnconfigure(0, weight=1)
-        ttk.Progressbar(
-            progress_frame,
-            variable=self.progress_var,
-            maximum=100,
-            mode="determinate",
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        ttk.Label(progress_frame, textvariable=self.progress_text_var, width=52).grid(row=0, column=1, sticky=tk.E)
-
         columns = ("pos", "video_id", "sessao", "cc", "status", "result", "url")
-        self.tree = ttk.Treeview(exec_frame, columns=columns, show="headings", height=7)
-        self.tree.grid(row=2, column=0, sticky="nsew")
+        self.tree = ttk.Treeview(exec_frame, columns=columns, show="headings", height=8)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(exec_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        tree_scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.heading("pos", text="#")
         self.tree.heading("video_id", text="Video ID")
         self.tree.heading("sessao", text="Sessão")
@@ -831,55 +873,104 @@ class BatchGuiApp:
         self.tree.column("result", width=300, stretch=True)
         self.tree.column("url", width=300, stretch=True)
 
-        vistoria_frame = ttk.LabelFrame(main, text="4. Fila de vistoria (itens não publicados que merecem revisão)", padding=8)
-        vistoria_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
-        vistoria_frame.columnconfigure(0, weight=1)
-        vistoria_frame.rowconfigure(1, weight=1)
-        vistoria_actions = ttk.Frame(vistoria_frame)
-        vistoria_actions.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Button(vistoria_actions, text="Recarregar", command=self._reload_vistoria).pack(side=tk.LEFT)
+        log_frame = ttk.LabelFrame(process_tab, text="Saída", padding=8)
+        log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.output_text = tk.Text(log_frame, wrap=tk.WORD, height=7, font=("Consolas", 9), relief=tk.FLAT, background="#f7f7f7")
+        self.output_text.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.output_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.output_text.configure(yscrollcommand=scroll.set)
+
+        # ================= ABA 2 — FILA DE VISTORIA =================
+        vistoria_tab.columnconfigure(0, weight=1)
+        vistoria_tab.rowconfigure(2, weight=3)
+        vistoria_tab.rowconfigure(3, weight=1)
+
+        ttk.Label(
+            vistoria_tab,
+            text="Julgamentos que o fluxo NÃO publicou e aguardam a sua decisão: selecione um item para ver os "
+            "motivos completos abaixo, depois aprove (publica no Notion) ou descarte.",
+            style="Muted.TLabel",
+            wraplength=1150,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="w")
+
+        vistoria_actions = ttk.Frame(vistoria_tab)
+        vistoria_actions.grid(row=1, column=0, sticky="ew", pady=(8, 6))
         self.vistoria_publish_button = ttk.Button(
-            vistoria_actions, text="Aprovar e publicar", command=self._approve_selected_vistoria
+            vistoria_actions, text="✔  Aprovar e publicar", style="Accent.TButton",
+            command=self._approve_selected_vistoria,
         )
-        self.vistoria_publish_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.vistoria_publish_button.pack(side=tk.LEFT)
         ttk.Button(vistoria_actions, text="Descartar item", command=self._reject_selected_vistoria).pack(
             side=tk.LEFT, padx=(8, 0)
         )
         ttk.Button(vistoria_actions, text="Abrir vídeo", command=self._open_selected_vistoria_video).pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        vistoria_columns = ("origem", "video", "data", "numero", "disp", "motivo")
-        self.vistoria_tree = ttk.Treeview(
-            vistoria_frame, columns=vistoria_columns, show="headings", height=5
+        ttk.Button(vistoria_actions, text="Abrir artifacts", command=self._open_selected_vistoria_artifact).pack(
+            side=tk.LEFT, padx=(8, 0)
         )
-        self.vistoria_tree.grid(row=1, column=0, sticky="nsew")
-        self.vistoria_tree.heading("origem", text="Origem")
-        self.vistoria_tree.heading("video", text="Vídeo")
+        ttk.Button(vistoria_actions, text="Recarregar", command=self._reload_vistoria).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(vistoria_actions, text="Situação:").pack(side=tk.LEFT, padx=(24, 6))
+        self.vistoria_filter_var = tk.StringVar(value="Todas")
+        vistoria_filter = ttk.Combobox(
+            vistoria_actions, textvariable=self.vistoria_filter_var, state="readonly", width=18,
+            values=("Todas", "skipped", "blocked", "duplicata_numero", "faltante_dje", "contagem_rito"),
+        )
+        vistoria_filter.pack(side=tk.LEFT)
+        vistoria_filter.bind("<<ComboboxSelected>>", lambda _e: self._reload_vistoria())
+        self.vistoria_summary_var = tk.StringVar(value="")
+        ttk.Label(vistoria_actions, textvariable=self.vistoria_summary_var, style="Muted.TLabel").pack(
+            side=tk.RIGHT
+        )
+
+        vistoria_table = ttk.Frame(vistoria_tab)
+        vistoria_table.grid(row=2, column=0, sticky="nsew")
+        vistoria_table.columnconfigure(0, weight=1)
+        vistoria_table.rowconfigure(0, weight=1)
+        vistoria_columns = ("data", "numero", "tema", "disp", "origem", "video")
+        self.vistoria_tree = ttk.Treeview(
+            vistoria_table, columns=vistoria_columns, show="headings", height=12
+        )
+        self.vistoria_tree.grid(row=0, column=0, sticky="nsew")
         self.vistoria_tree.heading("data", text="Sessão")
         self.vistoria_tree.heading("numero", text="Processo")
+        self.vistoria_tree.heading("tema", text="Tema")
         self.vistoria_tree.heading("disp", text="Situação")
-        self.vistoria_tree.heading("motivo", text="Motivo")
-        self.vistoria_tree.column("origem", width=70, stretch=False)
+        self.vistoria_tree.heading("origem", text="Fonte")
+        self.vistoria_tree.heading("video", text="Vídeo")
+        self.vistoria_tree.column("data", width=95, stretch=False)
+        self.vistoria_tree.column("numero", width=210, stretch=False)
+        self.vistoria_tree.column("tema", width=460, stretch=True)
+        self.vistoria_tree.column("disp", width=130, stretch=False)
+        self.vistoria_tree.column("origem", width=80, stretch=False)
         self.vistoria_tree.column("video", width=110, stretch=False)
-        self.vistoria_tree.column("data", width=90, stretch=False)
-        self.vistoria_tree.column("numero", width=180, stretch=False)
-        self.vistoria_tree.column("disp", width=110, stretch=False)
-        self.vistoria_tree.column("motivo", width=520, stretch=True)
-        vistoria_scroll = ttk.Scrollbar(vistoria_frame, orient=tk.VERTICAL, command=self.vistoria_tree.yview)
-        vistoria_scroll.grid(row=1, column=1, sticky="ns")
+        vistoria_scroll = ttk.Scrollbar(vistoria_table, orient=tk.VERTICAL, command=self.vistoria_tree.yview)
+        vistoria_scroll.grid(row=0, column=1, sticky="ns")
         self.vistoria_tree.configure(yscrollcommand=vistoria_scroll.set)
+        self.vistoria_tree.bind("<<TreeviewSelect>>", self._show_vistoria_details)
+        self.vistoria_tree.tag_configure("skipped", foreground="#7a4a00")
+        self.vistoria_tree.tag_configure("blocked", foreground="#8a1f1f")
+        self.vistoria_tree.tag_configure("info", foreground="#1f3a5f")
+
+        details_frame = ttk.LabelFrame(vistoria_tab, text="Detalhes do item selecionado", padding=8)
+        details_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        details_frame.columnconfigure(0, weight=1)
+        details_frame.rowconfigure(0, weight=1)
+        self.vistoria_details = tk.Text(
+            details_frame, wrap=tk.WORD, height=6, font=("Segoe UI", 9), relief=tk.FLAT,
+            background="#fbf8f2", state=tk.DISABLED,
+        )
+        self.vistoria_details.grid(row=0, column=0, sticky="nsew")
+        details_scroll = ttk.Scrollbar(details_frame, orient=tk.VERTICAL, command=self.vistoria_details.yview)
+        details_scroll.grid(row=0, column=1, sticky="ns")
+        self.vistoria_details.configure(yscrollcommand=details_scroll.set)
+
         self.vistoria_items: dict[str, dict[str, Any]] = {}
         self._reload_vistoria()
-
-        log_frame = ttk.LabelFrame(main, text="Saida", padding=8)
-        log_frame.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        self.output_text = tk.Text(log_frame, wrap=tk.WORD)
-        self.output_text.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.output_text.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.output_text.configure(yscrollcommand=scroll.set)
 
     def _add_link(self) -> None:
         text = self.link_var.get()
@@ -1230,24 +1321,74 @@ class BatchGuiApp:
         except Exception as exc:
             self._append_output(f"Falha ao carregar a fila de vistoria: {exc}\n")
             return
+        total = len(items)
+        counts = Counter(item.get("disposition", "?") for item in items)
+        selected_filter = self.vistoria_filter_var.get() if hasattr(self, "vistoria_filter_var") else "Todas"
+        if selected_filter != "Todas":
+            items = [item for item in items if item.get("disposition") == selected_filter]
+
         self.vistoria_items = {str(item["id"]): item for item in items}
         self.vistoria_tree.delete(*self.vistoria_tree.get_children())
-        for item in items:
+        for item in sorted(items, key=lambda x: (x.get("data_sessao") or "", x.get("id", ""))):
             row = item.get("row") or {}
-            motivo = "; ".join(item.get("reasons") or [])[:200]
+            dje = (item.get("extra") or {}).get("dje") or {}
+            numero = row.get("numero_processo") or dje.get("numeroUnico") or ""
+            tema = row.get("tema") or dje.get("ementa") or "; ".join(item.get("reasons") or [])
+            disposition = item.get("disposition", "")
+            tag = disposition if disposition in ("skipped", "blocked") else "info"
             self.vistoria_tree.insert(
                 "",
                 tk.END,
                 iid=str(item["id"]),
+                tags=(tag,),
                 values=(
+                    item.get("data_sessao", ""),
+                    numero,
+                    str(tema)[:120],
+                    disposition,
                     item.get("source", ""),
                     item.get("video_id", ""),
-                    item.get("data_sessao", ""),
-                    row.get("numero_processo", "") if row else "",
-                    item.get("disposition", ""),
-                    motivo,
                 ),
             )
+        resumo = "  |  ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+        self.vistoria_summary_var.set(f"{total} pendente(s)   {resumo}" if total else "Fila vazia — nada aguardando revisão.")
+        self.notebook.tab(self.vistoria_tab_index, text=f"  Fila de vistoria ({total})  ")
+        self.vistoria_hint_var.set(f"⚠ {total} pendência(s) aguardam sua decisão — clique aqui" if total else "")
+
+    def _show_vistoria_details(self, _event=None) -> None:
+        selected = self._selected_vistoria_items()
+        self.vistoria_details.configure(state=tk.NORMAL)
+        self.vistoria_details.delete("1.0", tk.END)
+        if selected:
+            item = selected[0]
+            row = item.get("row") or {}
+            dje = (item.get("extra") or {}).get("dje") or {}
+            lines = [
+                f"Processo: {row.get('numero_processo') or dje.get('numeroUnico') or '(sem número)'}    "
+                f"Sessão: {item.get('data_sessao') or '?'}    Situação: {item.get('disposition')}    "
+                f"Fonte: {item.get('source')}",
+            ]
+            if row.get("tema"):
+                lines.append(f"Tema: {row['tema']}")
+            if dje.get("ementa"):
+                lines.append(f"Ementa (DJE): {dje['ementa']}")
+            lines.append("")
+            lines.append("Motivos:")
+            for reason in item.get("reasons") or ["(sem motivo registrado)"]:
+                lines.append(f"  • {reason}")
+            if item.get("artifact_dir"):
+                lines.append("")
+                lines.append(f"Artifacts: {item['artifact_dir']}")
+            self.vistoria_details.insert("1.0", "\n".join(lines))
+        self.vistoria_details.configure(state=tk.DISABLED)
+
+    def _open_selected_vistoria_artifact(self) -> None:
+        for item in self._selected_vistoria_items():
+            artifact_dir = item.get("artifact_dir") or ""
+            if artifact_dir and Path(artifact_dir).exists():
+                open_path(Path(artifact_dir))
+                return
+        messagebox.showinfo("Fila de vistoria", "O item selecionado não tem pasta de artifacts registrada.")
 
     def _selected_vistoria_items(self) -> list[dict[str, Any]]:
         return [self.vistoria_items[iid] for iid in self.vistoria_tree.selection() if iid in self.vistoria_items]
