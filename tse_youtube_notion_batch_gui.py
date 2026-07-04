@@ -1555,8 +1555,11 @@ class BatchGuiApp:
         for item in sorted(items, key=sort_key):
             row = item.get("row") or {}
             dje = (item.get("extra") or {}).get("dje") or {}
-            numero = row.get("numero_processo") or dje.get("numeroUnico") or ""
-            tema = row.get("tema") or dje.get("ementa") or "; ".join(item.get("reasons") or [])
+            numero = row.get("numero_processo") or dje.get("numeroUnico") or item.get("numero_hint") or ""
+            tema = (
+                row.get("tema") or dje.get("ementa") or item.get("tema_hint")
+                or "; ".join(item.get("reasons") or [])
+            )
             disposition = item.get("disposition", "")
             tag = disposition if disposition in ("skipped", "blocked") else "info"
             timestamp = item_timestamp_seconds(item)
@@ -1591,12 +1594,12 @@ class BatchGuiApp:
             row = item.get("row") or {}
             dje = (item.get("extra") or {}).get("dje") or {}
             lines = [
-                f"Processo: {row.get('numero_processo') or dje.get('numeroUnico') or '(sem número)'}    "
+                f"Processo: {row.get('numero_processo') or dje.get('numeroUnico') or item.get('numero_hint') or '(sem número)'}    "
                 f"Sessão: {item.get('data_sessao') or '?'}    Situação: {item.get('disposition')}    "
                 f"Fonte: {item.get('source')}",
             ]
-            if row.get("tema"):
-                lines.append(f"Tema: {row['tema']}")
+            if row.get("tema") or item.get("tema_hint"):
+                lines.append(f"Tema: {row.get('tema') or item.get('tema_hint')}")
             if dje.get("ementa"):
                 lines.append(f"Ementa (DJE): {dje['ementa']}")
             lines.append("")
