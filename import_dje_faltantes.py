@@ -311,10 +311,12 @@ def main() -> int:
             "Importado do confronto DJE (CSV oficial); posição na pauta não verificada; "
             "partes/advogados/composição serão preenchidos pelo confronto oficial."
         )
-        # Upsert: se a página já existe (re-execução/correção), atualiza em vez de
-        # duplicar, preservando o "Julgamento N" já atribuído.
+        # Upsert por NÚCLEO (NNNNNNN-DD) + data: acha tanto a página exata quanto a
+        # variante com CNJ corrompido pela transcrição (ano/TR/zona errados) — nesse
+        # caso o update corrige o número para o oficial em vez de duplicar.
         try:
-            cond = client.build_filter_condition(schema, "numero_processo", row.numero_processo)
+            nucleo = format_cnj20(cnj20)[:10]
+            cond = {"property": "numero_processo", "rich_text": {"contains": nucleo}}
             for page in client.query_data_source(cond):
                 page_data = (client._extract_property_text(page, schema, "data_sessao") or "")[:10]
                 if page_data == row.data_sessao:
