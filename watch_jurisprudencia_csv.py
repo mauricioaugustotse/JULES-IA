@@ -253,17 +253,17 @@ def _run_one(path: Path, label: str, staging: Path, apply: bool, data_source_id:
         log(f"  ! {label} retornou {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-400:]}")
 
 
-# CSV acima deste tamanho é tratado como CONSOLIDADO: além dos pipelines de
-# correção, roda a detecção de FALTANTES (prefilter --missing-out) alimentando a
-# fila de vistoria com os que têm menção individual nos vídeos (anti-lista).
-MISSING_SCAN_MIN_BYTES = 50 * 1024 * 1024
+# Todo CSV novo passa também pela detecção de FALTANTES (prefilter
+# --missing-out), alimentando a fila de vistoria com os que têm menção
+# individual nos vídeos (anti-lista). Vale para o consolidado gigante e para
+# recortes leves baixados do site do TSE.
 PREFILTER = SCRIPT_DIR / "prefilter_dje_csv.py"
 BATCH_ARTIFACTS_ROOT = SCRIPT_DIR / "artifacts" / "tse_youtube_notion" / "batch_gui"
 MISSING_OUT_DIR = SCRIPT_DIR / "artifacts" / "dje_missing"
 
 
 def _run_missing_scan(csv_path: Path, data_source_id: str | None, env: dict) -> None:
-    log(f"  Consolidado detectado ({csv_path.stat().st_size // (1024*1024)} MB): varrendo FALTANTES...")
+    log(f"  Varrendo FALTANTES em {csv_path.name} ({max(1, csv_path.stat().st_size // (1024*1024))} MB)...")
     cmd = [
         sys.executable, str(PREFILTER),
         "--input", str(csv_path),
@@ -295,8 +295,7 @@ def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict
     _run_one(PIPELINE_META, "metadata", staging, apply, data_source_id, env)
     if apply:
         for csv_path in sorted(staging.glob("*.csv")):
-            if csv_path.stat().st_size >= MISSING_SCAN_MIN_BYTES:
-                _run_missing_scan(csv_path, data_source_id, env)
+            _run_missing_scan(csv_path, data_source_id, env)
     return newest_report_summary()
 
 
