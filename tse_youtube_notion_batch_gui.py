@@ -138,6 +138,17 @@ def count_result_status(results: list[dict[str, Any]], status: str) -> int:
     return sum(1 for item in results if item.get("status") == status)
 
 
+def item_video_link(item: dict[str, Any]) -> str:
+    row = item.get("row") or {}
+    return str(row.get("youtube_link") or item.get("youtube_url") or "")
+
+
+def item_timestamp_seconds(item: dict[str, Any]) -> int | None:
+    """Timestamp (t=) do link do julgamento, quando registrado no item."""
+    match = re.search(r"[?&]t=(\d+)", item_video_link(item))
+    return int(match.group(1)) if match else None
+
+
 def summarize_link_meta(title: str) -> str:
     """Resumo "título — data" exibido na coluna Sessão da lista de links."""
     clean_title = re.sub(r"\s+", " ", str(title or "")).strip()
@@ -156,7 +167,15 @@ def fetch_video_title_oembed(url: str, timeout: float = 10.0) -> str:
 
 
 class Tooltip:
-    """Balão de ajuda: aparece ~0,5s depois que o mouse pousa no widget."""
+    """Balão de ajuda: aparece ~0,5s depois que o mouse pousa no widget.
+
+    Singleton visual: só UM balão na tela por vez (mostrar um fecha o anterior —
+    widgets aninhados não empilham balões) e autoexpira após alguns segundos
+    para nunca ficar órfão sobre a interface.
+    """
+
+    _active: "Tooltip | None" = None
+    AUTO_HIDE_MS = 8000
 
     def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 500, wraplength: int = 440) -> None:
         self.widget = widget
@@ -165,6 +184,7 @@ class Tooltip:
         self.wraplength = wraplength
         self._tip: tk.Toplevel | None = None
         self._after_id: str | None = None
+        self._expire_id: str | None = None
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
@@ -184,6 +204,9 @@ class Tooltip:
     def _show(self) -> None:
         if self._tip or not self.text:
             return
+        if Tooltip._active is not None and Tooltip._active is not self:
+            Tooltip._active._hide()
+        Tooltip._active = self
         self._tip = tip_window = tk.Toplevel(self.widget)
         tip_window.wm_overrideredirect(True)
         try:
@@ -211,12 +234,21 @@ class Tooltip:
         x = max(x, 8)
         y = max(y, 8)
         tip_window.wm_geometry(f"+{x}+{y}")
+        self._expire_id = self.widget.after(self.AUTO_HIDE_MS, self._hide)
 
     def _hide(self, _event=None) -> None:
         self._cancel()
+        if self._expire_id:
+            try:
+                self.widget.after_cancel(self._expire_id)
+            except Exception:
+                pass
+            self._expire_id = None
         if self._tip:
             self._tip.destroy()
             self._tip = None
+        if Tooltip._active is self:
+            Tooltip._active = None
 
 
 def tip(widget, text: str):
@@ -833,12 +865,6 @@ class BatchGuiApp:
 
         self.notebook = ttk.Notebook(main)
         self.notebook.pack(fill=tk.BOTH, expand=True)
-        Tooltip(
-            self.notebook,
-            "Duas áreas de trabalho:\n• Processar lote — extrai e publica os julgamentos de novos vídeos de sessão.\n"
-            "• Fila de vistoria — itens que o fluxo NÃO publicou e aguardam a sua decisão (o número no título é "
-            "a quantidade pendente).",
-        )
         process_tab = ttk.Frame(self.notebook, padding=10)
         vistoria_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(process_tab, text="  Processar lote  ")
@@ -1090,6 +1116,15 @@ class BatchGuiApp:
         )
         vistoria_filter.pack(side=tk.LEFT)
         vistoria_filter.bind("<<ComboboxSelected>>", lambda _e: self._reload_vistoria())
+        self.vistoria_only_ts_var = tk.BooleanVar(value=False)
+        tip(
+            ttk.Checkbutton(
+                vistoria_actions, text="Só com ⏱", variable=self.vistoria_only_ts_var,
+                command=self._reload_vistoria,
+            ),
+            "Mostra apenas os itens cujo link do vídeo já tem o marcador de tempo (t=) apontando o momento do "
+            "apregoamento — os casos mais fáceis de validar visualmente. A lista sempre ordena esses primeiro.",
+        ).pack(side=tk.LEFT, padx=(12, 0))
         self.vistoria_summary_var = tk.StringVar(value="")
         tip(
             ttk.Label(vistoria_actions, textvariable=self.vistoria_summary_var, style="Muted.TLabel"),
@@ -1100,25 +1135,28 @@ class BatchGuiApp:
         vistoria_table.grid(row=2, column=0, sticky="nsew")
         vistoria_table.columnconfigure(0, weight=1)
         vistoria_table.rowconfigure(0, weight=1)
-        vistoria_columns = ("data", "numero", "tema", "disp", "origem", "video")
+        vistoria_columns = ("data", "ts", "numero", "tema", "disp", "origem", "video")
         self.vistoria_tree = tip(
             ttk.Treeview(vistoria_table, columns=vistoria_columns, show="headings", height=12),
-            "Um item por julgamento candidato. Cores: âmbar = skipped (descartado pelo fluxo), vermelho = "
-            "blocked (dados insuficientes), azul = informativo (duplicata/contagem). Colunas: Sessão = data; "
-            "Processo = nº CNJ quando conhecido; Tema = assunto ou motivo; Fonte = quem detectou (batch, "
-            "auditoria, dje, rito). Clique numa linha para ver os motivos completos no painel abaixo.",
+            "Um item por julgamento candidato, ordenado com os que têm marcador de tempo (⏱) primeiro. Cores: "
+            "âmbar = skipped (descartado pelo fluxo), vermelho = blocked (dados insuficientes), azul = "
+            "informativo (duplicata/contagem). ⏱ = momento do apregoamento no vídeo (facilita a validação "
+            "visual); Processo = nº CNJ quando conhecido; Fonte = quem detectou (batch, auditoria, dje, rito). "
+            "Clique numa linha para ver os motivos completos no painel abaixo.",
         )
         self.vistoria_tree.grid(row=0, column=0, sticky="nsew")
         self.vistoria_tree.heading("data", text="Sessão")
+        self.vistoria_tree.heading("ts", text="⏱")
         self.vistoria_tree.heading("numero", text="Processo")
         self.vistoria_tree.heading("tema", text="Tema")
         self.vistoria_tree.heading("disp", text="Situação")
         self.vistoria_tree.heading("origem", text="Fonte")
         self.vistoria_tree.heading("video", text="Vídeo")
         self.vistoria_tree.column("data", width=95, stretch=False)
-        self.vistoria_tree.column("numero", width=210, stretch=False)
-        self.vistoria_tree.column("tema", width=460, stretch=True)
-        self.vistoria_tree.column("disp", width=130, stretch=False)
+        self.vistoria_tree.column("ts", width=75, stretch=False, anchor=tk.CENTER)
+        self.vistoria_tree.column("numero", width=205, stretch=False)
+        self.vistoria_tree.column("tema", width=420, stretch=True)
+        self.vistoria_tree.column("disp", width=125, stretch=False)
         self.vistoria_tree.column("origem", width=80, stretch=False)
         self.vistoria_tree.column("video", width=110, stretch=False)
         vistoria_scroll = ttk.Scrollbar(vistoria_table, orient=tk.VERTICAL, command=self.vistoria_tree.yview)
@@ -1500,19 +1538,28 @@ class BatchGuiApp:
             return
         total = len(items)
         counts = Counter(item.get("disposition", "?") for item in items)
+        with_ts_total = sum(1 for item in items if item_timestamp_seconds(item) is not None)
         selected_filter = self.vistoria_filter_var.get() if hasattr(self, "vistoria_filter_var") else "Todas"
         if selected_filter != "Todas":
             items = [item for item in items if item.get("disposition") == selected_filter]
+        if getattr(self, "vistoria_only_ts_var", None) and self.vistoria_only_ts_var.get():
+            items = [item for item in items if item_timestamp_seconds(item) is not None]
 
         self.vistoria_items = {str(item["id"]): item for item in items}
         self.vistoria_tree.delete(*self.vistoria_tree.get_children())
-        for item in sorted(items, key=lambda x: (x.get("data_sessao") or "", x.get("id", ""))):
+        # Itens com marcador de tempo primeiro (validação visual mais fácil), depois por data.
+        def sort_key(item):
+            timestamp = item_timestamp_seconds(item)
+            return (0 if timestamp is not None else 1, item.get("data_sessao") or "", item.get("id", ""))
+
+        for item in sorted(items, key=sort_key):
             row = item.get("row") or {}
             dje = (item.get("extra") or {}).get("dje") or {}
             numero = row.get("numero_processo") or dje.get("numeroUnico") or ""
             tema = row.get("tema") or dje.get("ementa") or "; ".join(item.get("reasons") or [])
             disposition = item.get("disposition", "")
             tag = disposition if disposition in ("skipped", "blocked") else "info"
+            timestamp = item_timestamp_seconds(item)
             self.vistoria_tree.insert(
                 "",
                 tk.END,
@@ -1520,6 +1567,7 @@ class BatchGuiApp:
                 tags=(tag,),
                 values=(
                     item.get("data_sessao", ""),
+                    format_elapsed(timestamp) if timestamp is not None else "—",
                     numero,
                     str(tema)[:120],
                     disposition,
@@ -1528,7 +1576,9 @@ class BatchGuiApp:
                 ),
             )
         resumo = "  |  ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
-        self.vistoria_summary_var.set(f"{total} pendente(s)   {resumo}" if total else "Fila vazia — nada aguardando revisão.")
+        self.vistoria_summary_var.set(
+            f"{total} pendente(s)  (⏱ {with_ts_total})   {resumo}" if total else "Fila vazia — nada aguardando revisão."
+        )
         self.notebook.tab(self.vistoria_tab_index, text=f"  Fila de vistoria ({total})  ")
         self.vistoria_hint_var.set(f"⚠ {total} pendência(s) aguardam sua decisão — clique aqui" if total else "")
 
@@ -1629,12 +1679,49 @@ class BatchGuiApp:
 
     def _open_selected_vistoria_video(self) -> None:
         for item in self._selected_vistoria_items():
-            url = item.get("youtube_url") or ""
-            row = item.get("row") or {}
-            url = row.get("youtube_link") or url
-            if url:
-                webbrowser.open(url)
-                break
+            url = item_video_link(item)
+            if not url:
+                video_id = item.get("video_id") or ""
+                url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+            if not url:
+                continue
+            if item_timestamp_seconds(item) is None:
+                discovered = self._discover_vistoria_timestamp(item)
+                if discovered is not None:
+                    separator = "&" if "?" in url else "?"
+                    url = f"{url}{separator}t={discovered}"
+            webbrowser.open(url)
+            break
+
+    def _discover_vistoria_timestamp(self, item: dict[str, Any]) -> int | None:
+        """Procura o momento do apregoamento nos artifacts do vídeo (nº do processo
+        nos 02_judgment_NN.json) e grava a descoberta na fila para as próximas vezes."""
+        artifact_dir = Path(item.get("artifact_dir") or "")
+        row = item.get("row") or {}
+        dje = (item.get("extra") or {}).get("dje") or {}
+        numero = str(row.get("numero_processo") or dje.get("numeroUnico") or "")
+        digits = re.sub(r"\D", "", numero)
+        if not artifact_dir.exists() or len(digits) < 9:
+            return None
+        try:
+            from import_dje_faltantes import find_mention_timestamp
+
+            timestamp = find_mention_timestamp(artifact_dir, digits)
+        except Exception:
+            return None
+        if timestamp is None:
+            return None
+        base_url = item_video_link(item) or f"https://www.youtube.com/watch?v={item.get('video_id', '')}"
+        separator = "&" if "?" in base_url else "?"
+        enriched_url = f"{base_url}{separator}t={timestamp}"
+        try:
+            vistoria_queue.update_status([str(item["id"])], item.get("status", "pending"), extra={"youtube_url": enriched_url})
+            item["youtube_url"] = enriched_url
+            self._reload_vistoria()
+        except Exception:
+            pass
+        self._append_output(f"Timestamp localizado nos artifacts: t={timestamp}s para {numero or item.get('video_id')}\n")
+        return timestamp
 
 
 def main() -> None:
