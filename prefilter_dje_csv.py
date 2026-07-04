@@ -179,6 +179,7 @@ def _queue_missing_with_artifact_evidence(missing_rows: list[dict], batch_root: 
                 artifact_dir=str(video_dir),
                 data_sessao=session_date,
                 extra={"dje": record},
+                dedupe_key=record["cnj20"],
             )
         )
     if items:
