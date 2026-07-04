@@ -152,13 +152,30 @@ def parse_relator(text: str) -> str:
     return "Min. " + names[-1].strip()
 
 
+_ORIGEM_PARTICULAS = {"de", "da", "do", "das", "dos", "e"}
+
+
+def _title_pt(cidade: str) -> str:
+    """Capitalização pt-BR (partículas minúsculas; apóstrofo: Sant'Ana)."""
+    words = []
+    for index, word in enumerate(cidade.lower().split()):
+        if "'" in word:
+            word = "'".join(part.capitalize() for part in word.split("'"))
+        elif word in _ORIGEM_PARTICULAS and index > 0:
+            pass
+        else:
+            word = word.capitalize()
+        words.append(word)
+    return " ".join(words)
+
+
 def tribunal_origem_from_cnj(cnj20: str, municipio: str, uf: str) -> tuple[str, str]:
     tr_code = cnj20[14:16] if len(cnj20) >= 16 else ""
     if tr_code == "00":
         return "TSE", "Brasília/DF"
     tr_uf = CNJ_ELECTORAL_UF_BY_CODE.get(tr_code, "")
     uf = (uf or tr_uf or "").strip().upper()
-    municipio = clean_text(municipio)
+    municipio = _title_pt(clean_text(municipio))
     if not municipio and uf:
         municipio = UF_CAPITAL.get(uf, "")
     origem = f"{municipio}/{uf}" if municipio and uf else ""

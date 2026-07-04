@@ -253,17 +253,50 @@ def _run_one(path: Path, label: str, staging: Path, apply: bool, data_source_id:
         log(f"  ! {label} retornou {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-400:]}")
 
 
+# CSV acima deste tamanho é tratado como CONSOLIDADO: além dos pipelines de
+# correção, roda a detecção de FALTANTES (prefilter --missing-out) alimentando a
+# fila de vistoria com os que têm menção individual nos vídeos (anti-lista).
+MISSING_SCAN_MIN_BYTES = 50 * 1024 * 1024
+PREFILTER = SCRIPT_DIR / "prefilter_dje_csv.py"
+BATCH_ARTIFACTS_ROOT = SCRIPT_DIR / "artifacts" / "tse_youtube_notion" / "batch_gui"
+MISSING_OUT_DIR = SCRIPT_DIR / "artifacts" / "dje_missing"
+
+
+def _run_missing_scan(csv_path: Path, data_source_id: str | None, env: dict) -> None:
+    log(f"  Consolidado detectado ({csv_path.stat().st_size // (1024*1024)} MB): varrendo FALTANTES...")
+    cmd = [
+        sys.executable, str(PREFILTER),
+        "--input", str(csv_path),
+        "--out", str(MISSING_OUT_DIR / "reduzidos"),
+        "--missing-out", str(MISSING_OUT_DIR),
+        "--queue-from-artifacts", str(BATCH_ARTIFACTS_ROOT),
+        "--log-level", "WARNING",
+    ]
+    if data_source_id:
+        cmd += ["--data-source-id", data_source_id]
+    proc = subprocess.run(cmd, cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        log(f"  ! faltantes retornou {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-400:]}")
+    else:
+        log(f"  Faltantes: relatorio em {MISSING_OUT_DIR} (fila de vistoria alimentada; importe com import_dje_faltantes.py)")
+
+
 def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict:
     """Confronta o(s) CSV(s) do lote com a base de sessoes, na ordem:
     1) completa o CNJ-20 das paginas incompletas (amplia o match dos demais);
     2) partes+advogados; 3) composicao oficial; 4) classe canonica (anti-downgrade);
-    5) eleicao+origem oficiais. Cada um e seguro/idempotente (page-values)."""
+    5) eleicao+origem oficiais. Cada um e seguro/idempotente (page-values).
+    CSVs consolidados (grandes) tambem passam pela deteccao de faltantes."""
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     _run_one(PIPELINE_CNJ, "cnj", staging, apply, data_source_id, env)
     _run_one(PIPELINE, "partes/advogados", staging, apply, data_source_id, env)
     _run_one(PIPELINE_COMP, "composicao", staging, apply, data_source_id, env)
     _run_one(PIPELINE_CLASSE, "classe", staging, apply, data_source_id, env)
     _run_one(PIPELINE_META, "metadata", staging, apply, data_source_id, env)
+    if apply:
+        for csv_path in sorted(staging.glob("*.csv")):
+            if csv_path.stat().st_size >= MISSING_SCAN_MIN_BYTES:
+                _run_missing_scan(csv_path, data_source_id, env)
     return newest_report_summary()
 
 
