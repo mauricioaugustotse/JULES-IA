@@ -1092,7 +1092,13 @@ class BatchGuiApp:
         tip(
             ttk.Button(vistoria_actions, text="Descartar item", command=self._reject_selected_vistoria),
             "Fecha o(s) item(ns) selecionado(s) sem publicar (ex.: era mesmo um precedente citado, não um "
-            "julgamento). Reversível: o histórico fica no arquivo da fila.",
+            "julgamento). Para desfazer: escolha a visão '🗑 descartados' no filtro Situação, selecione o item "
+            "e clique em Restaurar item.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(vistoria_actions, text="Restaurar item", command=self._restore_selected_vistoria),
+            "Devolve para a fila (pendente) um item descartado. Use com a visão '🗑 descartados' selecionada "
+            "no filtro Situação para localizar o item.",
         ).pack(side=tk.LEFT, padx=(8, 0))
         tip(
             ttk.Button(vistoria_actions, text="Abrir vídeo", command=self._open_selected_vistoria_video),
@@ -1118,10 +1124,11 @@ class BatchGuiApp:
                 vistoria_actions, textvariable=self.vistoria_filter_var, state="readonly", width=22,
                 values=(
                     "Todas", "⭐ prova local forte", "skipped", "blocked",
-                    "duplicata_numero", "faltante_dje", "contagem_rito",
+                    "duplicata_numero", "faltante_dje", "contagem_rito", "🗑 descartados",
                 ),
             ),
-            "Tipos de pendência:\n"
+            "Tipos de pendência (e a visão 🗑 descartados, que lista os itens já fechados para "
+            "conferência ou restauração):\n"
             "• ⭐ prova local forte — o próprio vídeo comprova o julgamento (número citado em vários trechos), "
             "mas o item foi barrado por outro motivo: FORTES candidatos à aprovação (fundo verde, topo da lista);\n"
             "• skipped — o fluxo descartou o item (ex.: possível precedente citado, densidade baixa);\n"
@@ -1207,6 +1214,7 @@ class BatchGuiApp:
         # Somente leitura SEM state=DISABLED: o usuário seleciona e copia livremente,
         # mas qualquer tecla de edição é bloqueada.
         self.vistoria_details.bind("<Key>", self._readonly_text_key)
+        self.vistoria_details.bind("<Button-3>", self._details_context_menu)
         details_scroll = ttk.Scrollbar(details_frame, orient=tk.VERTICAL, command=self.vistoria_details.yview)
         details_scroll.grid(row=0, column=1, sticky="ns")
         self.vistoria_details.configure(yscrollcommand=details_scroll.set)
@@ -1568,7 +1576,14 @@ class BatchGuiApp:
         with_ts_total = sum(1 for item in items if item_timestamp_seconds(item) is not None)
         strong_total = sum(1 for item in items if item_has_strong_evidence(item))
         selected_filter = self.vistoria_filter_var.get() if hasattr(self, "vistoria_filter_var") else "Todas"
-        if selected_filter.startswith("⭐"):
+        showing_rejected = selected_filter.startswith("🗑")
+        if showing_rejected:
+            try:
+                items = vistoria_queue.load_items("rejected")
+            except Exception as exc:
+                self._append_output(f"Falha ao carregar descartados: {exc}\n")
+                return
+        elif selected_filter.startswith("⭐"):
             items = [item for item in items if item_has_strong_evidence(item)]
         elif selected_filter != "Todas":
             items = [item for item in items if item.get("disposition") == selected_filter]
@@ -1616,11 +1631,16 @@ class BatchGuiApp:
                 ),
             )
         resumo = "  |  ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
-        self.vistoria_summary_var.set(
-            f"{total} pendente(s)  (⭐ {strong_total} | ⏱ {with_ts_total})   {resumo}"
-            if total
-            else "Fila vazia — nada aguardando revisão."
-        )
+        if showing_rejected:
+            self.vistoria_summary_var.set(
+                f"exibindo {len(items)} descartado(s) — selecione e use 'Restaurar item'   |   pendentes: {total}"
+            )
+        else:
+            self.vistoria_summary_var.set(
+                f"{total} pendente(s)  (⭐ {strong_total} | ⏱ {with_ts_total})   {resumo}"
+                if total
+                else "Fila vazia — nada aguardando revisão."
+            )
         self.notebook.tab(self.vistoria_tab_index, text=f"  Fila de vistoria ({total})  ")
         self.vistoria_hint_var.set(f"⚠ {total} pendência(s) aguardam sua decisão — clique aqui" if total else "")
 
@@ -1698,6 +1718,25 @@ class BatchGuiApp:
             menu.add_command(label="Copiar URL do vídeo", command=lambda v=url: self._copy_clip(v))
         menu.add_separator()
         menu.add_command(label="Copiar linha inteira", command=lambda: self._copy_tree_selection(self.tree))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _details_context_menu(self, event) -> None:
+        text = self.vistoria_details
+        menu = tk.Menu(text, tearoff=0)
+        has_selection = bool(text.tag_ranges(tk.SEL))
+        if has_selection:
+            menu.add_command(
+                label="Copiar seleção",
+                command=lambda: self._copy_clip(text.get(tk.SEL_FIRST, tk.SEL_LAST)),
+            )
+        menu.add_command(
+            label="Copiar tudo",
+            command=lambda: self._copy_clip(text.get("1.0", tk.END).strip()),
+        )
+        menu.add_command(
+            label="Selecionar tudo",
+            command=lambda: text.tag_add(tk.SEL, "1.0", tk.END),
+        )
         menu.tk_popup(event.x_root, event.y_root)
 
     def _show_vistoria_details(self, _event=None) -> None:
@@ -1791,6 +1830,28 @@ class BatchGuiApp:
         if not messagebox.askyesno("Descartar", f"Descartar {len(selected)} item(ns) da fila?"):
             return
         vistoria_queue.update_status([str(item["id"]) for item in selected], "rejected")
+        self._reload_vistoria()
+
+    def _restore_selected_vistoria(self) -> None:
+        selected = self._selected_vistoria_items()
+        if not selected:
+            messagebox.showinfo(
+                "Restaurar item",
+                "Selecione o item a restaurar. Dica: escolha a visão '🗑 descartados' no filtro Situação "
+                "para listar os itens fechados.",
+            )
+            return
+        already_pending = [item for item in selected if item.get("status") == "pending"]
+        to_restore = [item for item in selected if item.get("status") != "pending"]
+        if not to_restore:
+            messagebox.showinfo("Restaurar item", "O(s) item(ns) selecionado(s) já estão pendentes na fila.")
+            return
+        vistoria_queue.update_status(
+            [str(item["id"]) for item in to_restore], "pending", extra={"triagem": "restaurado pelo usuário"}
+        )
+        self._append_output(f"Restaurado(s) para a fila: {len(to_restore)} item(ns).\n")
+        if already_pending:
+            self._append_output(f"(ignorados {len(already_pending)} já pendentes)\n")
         self._reload_vistoria()
 
     def _open_selected_vistoria_video(self) -> None:
