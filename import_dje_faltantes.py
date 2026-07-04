@@ -343,6 +343,23 @@ def main() -> int:
                     if existing_tipo:
                         row.tipo_registro = existing_tipo
                         counters[data_sessao] -= 1
+                    # A página do fluxo do vídeo tem conteúdo rico (análise dos votos,
+                    # tema contextual, link com timestamp): o update corrige número/
+                    # resultado/classe oficiais, mas os textos do vídeo prevalecem —
+                    # ementa/dispositivo oficiais só preenchem campos vazios.
+                    for field in (
+                        "tema",
+                        "punchline",
+                        "analise_do_conteudo_juridico",
+                        "fundamentacao_normativa",
+                        "raciocinio_juridico",
+                        "precedentes_citados",
+                        "resolucoes_citadas",
+                        "youtube_link",
+                    ):
+                        current = client._extract_property_text(page, schema, field) or ""
+                        if current.strip():
+                            setattr(row, field, current)
                     break
         except Exception as exc:
             LOGGER.warning("Upsert lookup falhou para %s: %s", row.numero_processo, exc)
