@@ -1,8 +1,22 @@
-"""Baixa em lote os CSVs da pesquisa de jurisprudência do TSE (já aberta no Edge CDP,
-com o captcha resolvido por você). Por página: marca 'selecionar tudo' (#checkAll),
-clica 'Exportar decisões', captura o CSV e salva; depois vai para a próxima página.
+"""OBSOLETO (30/07/2026) — use `C:\\Users\\mauri\\ProjetoConversor\\tse_coletor.py`.
 
-Uso:
+Este foi o primeiro coletor. Exigia que VOCÊ abrisse o portal, resolvesse o captcha e
+deixasse a pesquisa pronta numa aba do Edge em CDP; então ele clicava página por página.
+Ficou para trás por quatro motivos, todos descobertos na coleta de 29-30/07/2026 (822
+páginas / 191.958 decisões):
+
+  · sem `Browser.setDownloadBehavior`, o Chromium para de baixar depois de algumas
+    dezenas de arquivos — silenciosamente, sem erro nem diálogo;
+  · cliques por coordenada exigem foco, e o Edge o rouba abrindo `downloads-hub`;
+  · o seletor `#checkAll` mudou; hoje o master é achado pela geometria do botão
+    "Imprimir decisões selecionadas";
+  · sem particionamento por data, o portal corta em 10.000 resultados (40 × 250) —
+    era esse muro que escondia dados e produziu uma "queda do contencioso" inexistente.
+
+O substituto sobe o próprio Edge, particiona por janela de datas, deduplica contra o
+acervo e roda dentro das GUIs. Mantido aqui como registro do caminho percorrido.
+
+Uso (histórico):
     python tse_baixar_csvs.py --test            # processa SÓ a página atual (1 CSV)
     python tse_baixar_csvs.py --paginas 200      # processa N páginas a partir da atual
 """
