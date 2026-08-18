@@ -19,6 +19,45 @@ LABELED_SHORT_PROCESSO_REGEX = r"(?i)\b(?:re?sp(?:e)?|arespe|aresp|rhc|rms|ms|ro
 CANON_CSV_FILENAME = "padrões para canonizar.csv"
 CANON_DATA: Optional[dict[str, Any]] = None
 
+# Siglas CRUAS do portal de jurisprudencia / SADP -> vocabulario canonico da base.
+#
+# UNIFICADO em 30/07/2026. Estas conversoes viviam isoladas em
+# import_dje_faltantes.CLASSE_MAP, um script que so roda para os "faltantes" -- entao
+# classe_from_jurisprudencia.py, que le o mesmo CSV, nao as enxergava e caia no
+# fallback pelo `descricaoClasse`. Eram TRES dialetos de classe no projeto:
+# "REspEl" (DJe), "REspe" (sessoes) e este mapa escondido.
+#
+# Aplicado ANTES do CLASSE_PROCESSO_MAP (que e por regex sobre o nome por extenso),
+# porque aqui o casamento e exato e barato.
+CLASSE_SIGLA_CRUA_MAP = {
+    "REspEl": "REspe", "RESPE": "REspe", "REsp": "REspe",
+    "AREspEl": "AREspe", "ARESPE": "AREspe",
+    "RO-El": "RO", "ROEl": "RO", "RO_": "RO",
+    "AgR-REspEl": "AgRg-REspe", "AgR-AREspEl": "AgRg-AREspe", "AgR-RO-El": "AgRg-RO",
+    "ED-REspEl": "ED-REspe",
+    "CtaEl": "CTA", "Cta": "CTA",
+    "RCEd": "RCED",
+    "LT": "Lista Tríplice",
+    "CZER": "Czer",
+    "REP": "Rp",
+    "PA_": "PA", "PET_": "PET", "RMS_": "RMS",
+}
+
+
+def normalize_classe_sigla_crua(valor: str) -> str:
+    """Converte a sigla crua do portal/SADP no vocabulario canonico. Devolve '' se nao
+    conhecer -- o chamador decide se cai no mapa por extenso."""
+    v = (valor or "").strip()
+    if not v:
+        return ""
+    if v in CLASSE_SIGLA_CRUA_MAP:
+        return CLASSE_SIGLA_CRUA_MAP[v]
+    for k, canon in CLASSE_SIGLA_CRUA_MAP.items():   # tolera diferenca de caixa
+        if k.lower() == v.lower():
+            return canon
+    return ""
+
+
 CLASSE_PROCESSO_MAP = [
     (r"\bembargos de declaracao\b.*\b(agravo regimental|agravo interno|agrg|agr)\b.*\b(agravo em recurso especial eleitoral|arespe)\b", "ED-AgRg-AREspe"),
     (r"\bed\s+agrg\s+arespe\b", "ED-AgRg-AREspe"),
@@ -47,8 +86,12 @@ CLASSE_PROCESSO_MAP = [
     (r"\bpeticao civel\b|\bpetciv\b", "PetCiv"),
     (r"\ba[cç][aã]o direta de inconstitucionalidade por omiss[aã]o\b|\bado\b", "ADO"),
     (r"\ba[cç][aã]o direta de inconstitucionalidade\b|\badi\b", "ADI"),
-    (r"\brecurso especial eleitoral\b|\brespe\b", "REspe"),
+    # CORRIGIDO 30/07/2026: o AGRAVO tem de vir ANTES do recurso especial. A funcao
+    # retorna no primeiro match, e "recurso especial eleitoral" casa DENTRO de "agravo
+    # em recurso especial eleitoral" -- entao a ordem antiga classificava o agravo como
+    # REspe, perdendo o estagio recursal (grave para pesquisa de precedente).
     (r"\bagravo em recurso especial eleitoral\b|\barespe\b", "AREspe"),
+    (r"\brecurso especial eleitoral\b|\brespe\b", "REspe"),
     (r"\brecurso ordinario\b|\bro\b", "RO"),
     (r"\brecurso em habeas corpus\b|\brhc\b", "RHC"),
     (r"\brecurso em mandado de seguranca\b|\brms\b", "RMS"),

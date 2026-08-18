@@ -17,7 +17,7 @@ from typing import Any
 
 from audit_notion_sessoes_round2 import notion_request_with_retry
 from local_secrets import get_secret
-from tse_normalization import normalize_classe_processo
+from tse_normalization import normalize_classe_processo, normalize_classe_sigla_crua
 from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, SAFE_DYNAMIC_SELECT_OPTIONS, NotionSessoesClient
 
 csv.field_size_limit(50 * 1024 * 1024)  # textoDecisao pode passar do default (128 KB) e abortar o DictReader
@@ -37,9 +37,16 @@ def iso(d):
 def csv_classe(row, known):
     # sigla PRIMEIRO (AI/HC/AIJE/AC mapeiam melhor pela sigla que pela descricao por extenso);
     # so aceita se o resultado for uma classe CANONICA ja conhecida da base (evita gravar por
-    # extenso, ex.: "Agravo de Instrumento", ou siglas-variantes do CSV como "REspEl"/"AREspEl").
+    # extenso, ex.: "Agravo de Instrumento").
+    #
+    # 30/07/2026: antes disto, as siglas-variantes do CSV ("REspEl", "AREspEl", "RO-El",
+    # "CtaEl") NAO normalizavam e o codigo caia no `descricaoClasse` -- que, por sua vez,
+    # classificava "Agravo em Recurso Especial Eleitoral" como "REspe" (bug de ordem no
+    # CLASSE_PROCESSO_MAP, tambem corrigido). O mapa de siglas cruas estava isolado em
+    # import_dje_faltantes.CLASSE_MAP e agora vive em tse_normalization.
     for field in ("siglaClasse", "descricaoClasse"):
-        c = normalize_classe_processo(row.get(field, ""))
+        bruto = row.get(field, "")
+        c = normalize_classe_sigla_crua(bruto) or normalize_classe_processo(bruto)
         if c and c in known:
             return c
     return ""
