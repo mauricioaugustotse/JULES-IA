@@ -29,7 +29,9 @@ ESPECIFICO: dict[str, dict[str, Any]] = {
         "Min. Luis Fetipe Salomão": "Min. Luís Felipe Salomão",
         "Min. Ministra: Rosa Weber": "Min. Rosa Weber",
         "Min. s Luís Roberto Barroso": "Min. Luís Roberto Barroso",
-        "Min. Carlos Mário da Silva Velloso Filho": "Min. Carlos Mário Velloso Filho",
+        # INVERTIDO 18/08/2026: o canonico central (MINISTRO_ALIAS_MAP/MINISTROS_JURISTAS)
+        # e a forma LONGA; a entrada antiga (longa -> curta) desfazia a canonizacao a cada lote.
+        "Min. Carlos Mário Velloso Filho": "Min. Carlos Mário da Silva Velloso Filho",
         "Min. Edson Fachin Og Fernandes": ["Min. Edson Fachin", "Min. Og Fernandes"],
     },
     "advogados": {

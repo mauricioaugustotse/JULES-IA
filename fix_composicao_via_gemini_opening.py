@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from audit_notion_sessoes_round2 import notion_request_with_retry
 from local_secrets import get_secret
-from tse_normalization import parse_multi_value_text
+from tse_normalization import normalize_ministro_name, parse_multi_value_text
 from tse_youtube_notion_core import (DEFAULT_GEMINI_MODEL, DEFAULT_NOTION_DATA_SOURCE_ID,
                                      NotionSessoesClient, call_gemini_generate_content_rest)
 
@@ -131,7 +131,10 @@ def main() -> int:
                 r = max(r, 0.92)
             if r > br:
                 best, br = canon, r
-        return best if br >= 0.82 else ("Min. " + nm.strip().title())
+        chosen = best if br >= 0.82 else ("Min. " + nm.strip().title())
+        # canoniza SEMPRE (alias map central): o fallback cru reintroduzia grafias-variante
+        # no select (Andre Ramos Tavares, Bucchianeri Pinheiro, ...).
+        return normalize_ministro_name(chosen) or chosen
 
     def relator_in(rel, comp):
         rf = fold(rel)

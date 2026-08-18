@@ -19,7 +19,7 @@ from pathlib import Path
 
 from audit_notion_sessoes_round2 import notion_request_with_retry
 from local_secrets import get_secret
-from tse_normalization import parse_multi_value_text
+from tse_normalization import normalize_ministro_name, parse_multi_value_text
 from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, NotionSessoesClient
 
 LOGGER = logging.getLogger("fill_composicao_from_jurisprudencia")
@@ -85,6 +85,9 @@ def parse_ministros(blob: str, canon_fold: dict[str, str]) -> list[str]:
             if r > br:
                 best, br = canon, r
         chosen = best if (best and br >= 0.82) else ("Min. " + nm.title())
+        # canoniza SEMPRE (alias map central): sem isso o fallback cru do CSV reintroduzia
+        # grafias-variante no select (Andre Ramos Tavares, Bucchianeri Pinheiro, ...).
+        chosen = normalize_ministro_name(chosen) or chosen
         if fold(chosen) not in seen:
             seen.add(fold(chosen)); out.append(chosen)
     return out
