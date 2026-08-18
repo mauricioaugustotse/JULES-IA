@@ -87,6 +87,17 @@ class BatchOptions:
     dje_apply: bool = True               # grava no Notion (vs dry-run)
     dje_dir: str = r"C:\Users\mauri\OneDrive\Documentos\12 - Consultoria Legislativa\DJe"
     cdp_url: str = "http://127.0.0.1:9222"
+    # Baixa do portal do TSE as decisoes publicadas desde a ultima coleta, ANTES de
+    # processar os videos: dispensa o export manual de `jurisprudencia.csv`. O coletor
+    # deposita o CSV novo em `dje_dir`, de onde o watcher (ou o --once desta GUI) o pega.
+    atualizar_tse: bool = True
+    tse_coletor: str = r"C:\Users\mauri\ProjetoConversor\tse_coletor.py"
+    tse_max_idade_horas: float = 12.0
+    # Relations no Notion (mesmo processo dentro do DJe + DJe <-> sessoes), rodadas
+    # ao final da pos-publicacao. Incremental e idempotente: le a base, compara e
+    # so grava o que falta. Vive em ProjetoConversor, como o tse_coletor acima.
+    atualizar_relations: bool = False
+    relations_script: str = r"C:\Users\mauri\ProjetoConversor\relations_manutencao.py"
 
 
 @dataclass(frozen=True)
@@ -635,6 +646,42 @@ def _gf_run_label_recolor(cdp_url: str, notion_url: str, output_queue: "queue.Qu
         _gf_close_hidden_edge(edge_proc, edge_launched, output_queue)
 
 
+def _gf_python_com_playwright() -> str:
+    """O .venv-win desta GUI nao tem playwright; o Python 3.13 global tem. O coletor
+    tambem sabe se reexecutar sozinho, mas apontar direto evita o salto."""
+    cand = r"C:\Users\mauri\AppData\Local\Programs\Python\Python313\python.exe"
+    return cand if Path(cand).exists() else sys.executable
+
+
+def _gf_run_tse_update(coletor: str, max_idade_horas: float,
+                       output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
+    """Passo 0: baixa do portal do TSE o que foi publicado desde a ultima coleta.
+
+    Ao contrario de _gf_run_dje_once, transmite o log AO VIVO (Popen linha a linha):
+    a coleta pode pausar esperando captcha, e o usuario precisa ver o aviso na hora,
+    nao ao final. Falha aqui nao aborta o lote."""
+    import subprocess
+    if not Path(coletor).exists():
+        output_queue.put(("log", f"[tse] coletor nao encontrado: {coletor}\n"))
+        return "ausente"
+    cmd = [_gf_python_com_playwright(), "-X", "utf8", coletor, "atualizar",
+           "--max-idade-horas", str(max_idade_horas)]
+    try:
+        p = subprocess.Popen(cmd, cwd=str(Path(coletor).parent), stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, bufsize=1,
+                             encoding="utf-8", errors="replace",
+                             env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        assert p.stdout is not None
+        for ln in p.stdout:
+            if ln.strip():
+                output_queue.put(("log", f"[tse] {ln.rstrip()}\n"))
+        p.wait(timeout=7200)
+        return p.returncode
+    except Exception as exc:
+        output_queue.put(("log", f"[tse] erro: {exc}\n"))
+        return str(exc)
+
+
 def _gf_run_dje_once(dje_dir: str, apply: bool, output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
     """Processa os CSVs de jurisprudencia ja presentes em DJE (modo --once) -> fill partes/advogados."""
     import subprocess
@@ -650,6 +697,34 @@ def _gf_run_dje_once(dje_dir: str, apply: bool, output_queue: "queue.Queue[tuple
         return p.returncode
     except Exception as exc:
         output_queue.put(("log", f"[dje] erro: {exc}\n")); return str(exc)
+
+
+def _gf_run_relations(script: str, output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
+    """Relations no Notion via relations_manutencao.py (ProjetoConversor).
+
+    Mesmo padrao de streaming do _gf_run_tse_update: roda com o Python 3.13
+    global (o .venv-win desta GUI nao tem as deps de ProjetoConversor) e mostra
+    a saida ao vivo. Incremental: rodadas repetidas so gravam o delta.
+    """
+    import subprocess
+    if not Path(script).exists():
+        output_queue.put(("log", f"[relations] script nao encontrado: {script}\n"))
+        return "script ausente"
+    cmd = [_gf_python_com_playwright(), "-X", "utf8", script,
+           "--etapas", "interna,cross"]
+    try:
+        p = subprocess.Popen(cmd, cwd=str(Path(script).parent),
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, bufsize=1, encoding="utf-8",
+                             errors="replace",
+                             env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        for ln in p.stdout:  # type: ignore[union-attr]
+            if ln.strip():
+                output_queue.put(("log", f"[relations] {ln.rstrip()}\n"))
+        p.wait(timeout=14400)
+        return p.returncode
+    except Exception as exc:
+        output_queue.put(("log", f"[relations] erro: {exc}\n")); return str(exc)
 
 
 def process_video_batch(
@@ -679,6 +754,14 @@ def process_video_batch(
     LOGGER.info("Modelo Gemini: %s", options.model)
     LOGGER.info("Modelo noticias: %s", options.news_model)
     LOGGER.info("Timeout Gemini por chamada: %ss", DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS)
+
+    # Passo 0 — acervo do TSE em dia ANTES dos videos, para que o confronto com os CSVs
+    # do DJe (pos-publicacao, --once) e o watcher ja encontrem o material novo. Fica
+    # fora de qualquer condicao de publicacao: atualizar o acervo nao depende disso.
+    if options.atualizar_tse and not stop_event.is_set():
+        output_queue.put(("status", "__post__", "Atualizando o acervo do TSE...", ""))
+        LOGGER.info("Atualizando o acervo do TSE a partir do portal.")
+        _gf_run_tse_update(options.tse_coletor, options.tse_max_idade_horas, output_queue)
 
     notion_client = NotionSessoesClient(
         api_key=notion_key,
@@ -768,6 +851,9 @@ def process_video_batch(
         if options.watch_dje:
             output_queue.put(("status", "__post__", "Pos-publicacao: CSVs DJE (--once)...", ""))
             post_publish["dje"] = _gf_run_dje_once(options.dje_dir, options.dje_apply, output_queue)
+        if options.atualizar_relations:
+            output_queue.put(("status", "__post__", "Pos-publicacao: relations no Notion...", ""))
+            post_publish["relations"] = _gf_run_relations(options.relations_script, output_queue)
         output_queue.put(("status", "__post__", "Pos-publicacao concluida.", ""))
 
     # ===== FILA DE VISTORIA: consolida os itens do run e alimenta a fila global =====
@@ -814,9 +900,15 @@ def process_video_batch(
 class BatchGuiApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("TSE YouTube > Notion - lote pos-noticias")
-        self.root.geometry("1280x840")
-        self.root.minsize(1100, 720)
+        self.root.title("TSE YouTube → Notion — lote de vídeos")
+        # cabe na tela (inclusive com escala do Windows) e abre encostada no topo,
+        # senão o rodapé (progresso + aviso de vistoria) nasce atrás da barra de tarefas
+        larg = min(1280, self.root.winfo_screenwidth() - 40)
+        alt = min(840, self.root.winfo_screenheight() - 110)
+        x = max((self.root.winfo_screenwidth() - larg) // 2, 0)
+        self.root.geometry(f"{larg}x{alt}+{x}+8")
+        self.root.minsize(1000, 640)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.output_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -841,14 +933,49 @@ class BatchGuiApp:
         self.post_publish_var = tk.BooleanVar(value=True)
         self.recolor_labels_var = tk.BooleanVar(value=True)
         self.watch_dje_var = tk.BooleanVar(value=False)  # monitor independente (Tarefa WatchDJe_Notion) assume; marque p/ rodada --once manual
+        self.atualizar_tse_var = tk.BooleanVar(value=True)  # passo 0: acervo do TSE em dia (freio de 12 h no coletor)
+        self.atualizar_relations_var = tk.BooleanVar(value=False)  # pos-publicacao: relations no Notion
         self.count_var = tk.StringVar(value=f"0/{MAX_LINKS} links")
         self.target_var = tk.StringVar(value=f"Notion: {DEFAULT_NOTION_DATABASE_URL}")
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress_text_var = tk.StringVar(value="Pronto")
+        self.last_batch_dir, ultimo_txt = self._find_last_batch()
+        self.idle_status_text = f"Pronto — {ultimo_txt}" if ultimo_txt else "Pronto"
+        self.progress_text_var = tk.StringVar(value=self.idle_status_text)
 
         self._build_ui()
         self.root.after(200, self._drain_output_queue)
         self.root.after(1000, self._refresh_live_progress)
+
+    @staticmethod
+    def _find_last_batch() -> tuple[Path | None, str]:
+        """(pasta, rótulo) do lote mais recente em batch_gui — memória entre sessões."""
+        try:
+            pastas = sorted(
+                (p for p in BATCH_ARTIFACT_ROOT.iterdir()
+                 if p.is_dir() and re.match(r"^\d{8}_\d{6}$", p.name)),
+                key=lambda p: p.name, reverse=True)
+        except OSError:
+            return None, ""
+        if not pastas:
+            return None, ""
+        ultima = pastas[0]
+        quando = f"{ultima.name[6:8]}/{ultima.name[4:6]} {ultima.name[9:11]}:{ultima.name[11:13]}"
+        try:
+            resumo = json.loads((ultima / "batch_summary.json").read_text(encoding="utf-8"))
+            done, err = resumo.get("total_done", "?"), resumo.get("total_error", 0)
+            detalhe = f"{done} vídeo(s) ok" + (f", {err} com erro" if err else "")
+        except Exception:
+            detalhe = "interrompido"
+        return ultima, f"último lote: {quando} ({detalhe})"
+
+    def _on_close(self) -> None:
+        if self._is_running() and not messagebox.askyesno(
+                "Sair?",
+                "Há um lote em execução — sair mesmo assim?\n"
+                "O vídeo atual será interrompido e os tratamentos "
+                "pós-publicação não rodarão."):
+            return
+        self.root.destroy()
 
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
@@ -869,8 +996,9 @@ class BatchGuiApp:
         main.pack(fill=tk.BOTH, expand=True)
 
         header = ttk.Frame(main)
-        header.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(header, text="TSE YouTube → Notion", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
+        header.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(header, text="TSE YouTube → Notion — lote de vídeos",
+                  font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
         notion_link = ttk.Label(
             header, text="abrir base no Notion ↗", foreground="#0b5cad", cursor="hand2",
             font=("Segoe UI", 9, "underline"),
@@ -878,17 +1006,23 @@ class BatchGuiApp:
         notion_link.pack(side=tk.RIGHT, pady=(8, 0))
         notion_link.bind("<Button-1>", lambda _e: webbrowser.open(DEFAULT_NOTION_DATABASE_URL))
         Tooltip(notion_link, "Abre no navegador a base de sessões do TSE no Notion, onde as linhas são publicadas.")
+        ttk.Label(main, text="Fluxo: 1 links → 2 opções → 3 processar → 4 acompanhar a saída → "
+                             "5 decidir as pendências na Fila de vistoria.",
+                  style="Muted.TLabel").pack(fill=tk.X, pady=(0, 6))
+
+        # a barra de status é empacotada ANTES do notebook, com side=bottom:
+        # ganha prioridade de espaço e nunca é cortada em tela baixa (é nela
+        # que vivem o progresso, o "último lote" e o aviso âmbar da vistoria)
+        statusbar = ttk.Frame(main)
+        statusbar.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
 
         self.notebook = ttk.Notebook(main)
         self.notebook.pack(fill=tk.BOTH, expand=True)
         process_tab = ttk.Frame(self.notebook, padding=10)
         vistoria_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(process_tab, text="  Processar lote  ")
-        self.notebook.add(vistoria_tab, text="  Fila de vistoria  ")
+        self.notebook.add(vistoria_tab, text="  5 · Fila de vistoria  ")
         self.vistoria_tab_index = 1
-
-        statusbar = ttk.Frame(main)
-        statusbar.pack(fill=tk.X, pady=(8, 0))
         tip(
             ttk.Progressbar(statusbar, variable=self.progress_var, maximum=100, mode="determinate", length=300),
             "Progresso do lote em execução (vídeos concluídos e etapa atual).",
@@ -912,7 +1046,7 @@ class BatchGuiApp:
 
         input_frame = ttk.LabelFrame(
             process_tab,
-            text="1. Links do YouTube  (título, data da sessão e legenda são verificados ao adicionar)",
+            text="1 · Links do YouTube  (título, data da sessão e legenda são verificados ao adicionar)",
             padding=8,
         )
         input_frame.grid(row=0, column=0, sticky="ew")
@@ -936,7 +1070,7 @@ class BatchGuiApp:
             "Quantos vídeos já estão na lista e o limite por lote.",
         ).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
 
-        options = ttk.LabelFrame(process_tab, text="2. Opções do fluxo", padding=8)
+        options = ttk.LabelFrame(process_tab, text="2 · Opções do fluxo", padding=8)
         options.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         options.columnconfigure(1, weight=1)
         options.columnconfigure(3, weight=1)
@@ -950,7 +1084,7 @@ class BatchGuiApp:
             "Nome do modelo Gemini usado na EXTRAÇÃO dos julgamentos do vídeo.",
         ).grid(row=0, column=1, sticky="ew", padx=(0, 14))
         tip(
-            ttk.Label(options, text="Modelo noticias"),
+            ttk.Label(options, text="Modelo p/ notícias"),
             "Modelo de IA usado na etapa de busca de notícias relacionadas a cada julgamento.",
         ).grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
         tip(
@@ -958,7 +1092,7 @@ class BatchGuiApp:
             "Nome do modelo Gemini usado na BUSCA/validação de notícias (TSE, TREs e imprensa).",
         ).grid(row=0, column=3, sticky="ew")
         tip(
-            ttk.Checkbutton(options, text="Buscar noticias antes de publicar", variable=self.with_news_var),
+            ttk.Checkbutton(options, text="Buscar notícias antes de publicar", variable=self.with_news_var),
             "Antes de gravar no Notion, procura notícias oficiais (TSE/TREs) e da imprensa sobre cada julgamento "
             "e anexa os links aprovados à linha. Desmarque para um lote mais rápido e sem notícias.",
         ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
@@ -973,13 +1107,13 @@ class BatchGuiApp:
             "segue para o próximo vídeo em vez de parar tudo.",
         ).grid(row=1, column=3, sticky=tk.W, pady=(6, 0))
         tip(
-            ttk.Checkbutton(options, text="Pos-publicacao: tratar dados (materia/Suspenso/classe/sanear)",
+            ttk.Checkbutton(options, text="Tratar dados após publicar (matéria semelhante, suspensos, classes, advogados)",
                             variable=self.post_publish_var),
             "Depois de publicar, roda os tratamentos automáticos de qualidade: vincular matéria semelhante, "
             "reconciliar julgamentos 'Suspenso' concluídos depois, normalizar classe processual e sanear dados.",
         ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         tip(
-            ttk.Checkbutton(options, text="Recolorir etiquetas (Edge :9222)",
+            ttk.Checkbutton(options, text="Recolorir etiquetas no Notion (estético — Edge automatizado)",
                             variable=self.recolor_labels_var),
             "Ajusta as cores das etiquetas (selects) na base do Notion usando um Edge oculto automatizado. "
             "Puramente estético; requer o Microsoft Edge instalado.",
@@ -991,8 +1125,25 @@ class BatchGuiApp:
             "Normalmente desnecessário: o monitor automático (tarefa WatchDJe_Notion) já vigia a pasta DJe "
             "continuamente e processa qualquer CSV novo.",
         ).grid(row=2, column=3, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(options, text="Atualizar o acervo do TSE (baixa do portal)",
+                            variable=self.atualizar_tse_var),
+            "Antes de processar os vídeos, baixa do portal de jurisprudência as decisões publicadas desde "
+            "a última coleta e as acrescenta ao acervo consolidado, deixando o CSV novo na pasta DJe — "
+            "é o que dispensa o export manual.\nSó recoleta se a última atualização tiver mais de 12 h. "
+            "Uma janela do Edge abre durante a coleta: se o portal pedir captcha, resolva nela e o resto "
+            "segue sozinho.",
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(options, text="Atualizar relations no Notion (pós-publicação)",
+                            variable=self.atualizar_relations_var),
+            "Ao final da pós-publicação, religa as páginas do mesmo processo no Notion — dentro da base "
+            "DJe e entre DJe ↔ sessões (inclui as sessões publicadas por este lote).\nIncremental: lê a "
+            "base, compara com o que já está gravado e só escreve o que falta (~15-20 min + o delta). "
+            "Requer 'Publicar direto no Notion'.",
+        ).grid(row=3, column=2, columnspan=2, sticky=tk.W, pady=(6, 0))
 
-        exec_frame = ttk.LabelFrame(process_tab, text="3. Execução", padding=8)
+        exec_frame = ttk.LabelFrame(process_tab, text="3 · Execução", padding=8)
         exec_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         exec_frame.columnconfigure(0, weight=1)
         exec_frame.rowconfigure(1, weight=1)
@@ -1021,7 +1172,8 @@ class BatchGuiApp:
         tip(
             ttk.Button(actions, text="Abrir artifacts", command=self._open_artifacts),
             "Abre no Explorer a pasta dos arquivos intermediários do lote (extrações, prévias e resultados de "
-            "publicação) — útil para auditoria e diagnóstico.",
+            "publicação) — útil para auditoria e diagnóstico. Sem lote nesta sessão, abre a pasta do ÚLTIMO "
+            "lote processado.",
         ).pack(side=tk.LEFT, padx=(8, 0))
         tip(
             ttk.Button(actions, text="Retomar artifacts", command=self._load_resume_root),
@@ -1031,7 +1183,7 @@ class BatchGuiApp:
 
         columns = ("pos", "video_id", "sessao", "cc", "status", "result", "url")
         self.tree = tip(
-            ttk.Treeview(exec_frame, columns=columns, show="headings", height=8),
+            ttk.Treeview(exec_frame, columns=columns, show="headings", height=7),
             "Vídeos do lote e seu andamento. Colunas: # ordem; Video ID código do YouTube; Sessão = título e "
             "data detectados ao adicionar; CC = legenda disponível (CC) ou não (—); Status = etapa atual; "
             "Resultado = resumo ao concluir (criadas/atualizadas/bloqueadas/ignoradas).",
@@ -1061,13 +1213,14 @@ class BatchGuiApp:
         self.tree.bind("<Control-c>", lambda _e: self._copy_tree_selection(self.tree))
         self.tree.bind("<Control-a>", lambda _e: self._select_all_tree(self.tree))
 
-        log_frame = ttk.LabelFrame(process_tab, text="Saída", padding=8)
+        log_frame = ttk.LabelFrame(process_tab, text="4 · Saída (log)", padding=8)
         log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.output_text = tip(
-            tk.Text(log_frame, wrap=tk.WORD, height=7, font=("Consolas", 9), relief=tk.FLAT, background="#f7f7f7"),
-            "Log do processamento: mensagens de cada etapa, avisos, erros e o resumo final do lote.",
+            tk.Text(log_frame, wrap=tk.WORD, height=6, font=("Consolas", 9), relief=tk.FLAT, background="#f7f7f7"),
+            "Log do processamento: mensagens de cada etapa, avisos, erros e o resumo final do lote. "
+            "Uma cópia com data/hora fica em artifacts\\batch_gui\\gui.log.",
         )
         self.output_text.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.output_text.yview)
@@ -1311,7 +1464,8 @@ class BatchGuiApp:
         self.videos = []
         self.resume_root = None
         self._refresh_tree()
-        self.output_text.delete("1.0", tk.END)
+        # o log NÃO é apagado aqui — só no início de um novo lote (o efeito
+        # colateral de "Limpar lista" apagar a saída surpreendia o usuário)
 
     def _load_resume_root(self) -> None:
         if self._is_running():
@@ -1357,6 +1511,8 @@ class BatchGuiApp:
             post_publish_steps=("materia", "suspenso", "classe_nomes", "sanear") if self.post_publish_var.get() else (),
             recolor_labels=bool(self.recolor_labels_var.get()),
             watch_dje=bool(self.watch_dje_var.get()),
+            atualizar_tse=bool(self.atualizar_tse_var.get()),
+            atualizar_relations=bool(self.atualizar_relations_var.get()),
         )
 
     def _start_batch(self) -> None:
@@ -1420,11 +1576,20 @@ class BatchGuiApp:
 
     def _request_stop(self) -> None:
         self.stop_event.set()
-        self._append_output("\nParada solicitada. O video atual sera concluido antes de encerrar.\n")
+        self._append_output("\nParada solicitada — o lote encerra após o vídeo atual; "
+                            "os tratamentos pós-publicação NÃO rodarão.\n")
+        self.progress_text_var.set("Parada solicitada — encerrando após o vídeo atual "
+                                   "(sem tratamentos pós-publicação)")
         self.stop_button.configure(state=tk.DISABLED)
 
     def _open_artifacts(self) -> None:
-        path = Path(self.batch_artifact_dir) if self.batch_artifact_dir else BATCH_ARTIFACT_ROOT
+        # prioridade: lote da sessão atual > último lote encontrado no boot > raiz
+        if self.batch_artifact_dir:
+            path = Path(self.batch_artifact_dir)
+        elif self.last_batch_dir is not None:
+            path = self.last_batch_dir
+        else:
+            path = BATCH_ARTIFACT_ROOT
         open_path(path)
 
     def _is_running(self) -> bool:
@@ -1516,7 +1681,7 @@ class BatchGuiApp:
     def _refresh_live_progress(self, *, reschedule: bool = True) -> None:
         if self.total_videos <= 0:
             self.progress_var.set(0.0)
-            self.progress_text_var.set("Pronto")
+            self.progress_text_var.set(self.idle_status_text)
             if reschedule:
                 self.root.after(1000, self._refresh_live_progress)
             return
@@ -1654,7 +1819,7 @@ class BatchGuiApp:
                 if total
                 else "Fila vazia — nada aguardando revisão."
             )
-        self.notebook.tab(self.vistoria_tab_index, text=f"  Fila de vistoria ({total})  ")
+        self.notebook.tab(self.vistoria_tab_index, text=f"  5 · Fila de vistoria ({total})  ")
         self.vistoria_hint_var.set(f"⚠ {total} pendência(s) aguardam sua decisão — clique aqui" if total else "")
 
     def _readonly_text_key(self, event):
@@ -1950,6 +2115,15 @@ class BatchGuiApp:
 
 
 def main() -> None:
+    # log persistente da GUI: tudo que passa pelo logging durante os lotes fica
+    # em artifacts\batch_gui\gui.log (o widget de saída morre com a janela)
+    try:
+        BATCH_ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(BATCH_ARTIFACT_ROOT / "gui.log", encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logging.getLogger().addHandler(fh)
+    except OSError:
+        pass
     root = tk.Tk()
     BatchGuiApp(root)
     root.mainloop()
