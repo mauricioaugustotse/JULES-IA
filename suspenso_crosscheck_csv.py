@@ -48,12 +48,37 @@ def extract_uf(origem):
     return m.group(1) if m else ""
 
 
+def _e_acordao(row: dict) -> bool:
+    """Só ACÓRDÃO do TSE encerra um julgamento que estava suspenso por vista.
+
+    Mesma regra de prefilter_dje_csv._is_tse_colegiada: uma decisão monocrática ou um
+    despacho posterior NÃO significa que o colegiado retomou e concluiu o julgamento.
+    """
+    if (row.get("siglaTribunalJE") or "").strip().upper() not in ("", "TSE"):
+        return False
+    tipo = (row.get("descricaoTipoDecisao") or "").strip().lower()
+    if not tipo:
+        return False
+    if "monocr" in tipo or "despacho" in tipo:
+        return False
+    return "ac" in tipo and "rd" in tipo  # "Acórdão" / "Acordao"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--input-dir", default=r"C:\Users\mauri\Downloads")
+    # 30/07/2026: o default era C:\Users\mauri\Downloads, pasta que nao tem os CSVs de
+    # jurisprudencia. A unica execucao registrada deu "106 alvos, 0 flips, 106 sem
+    # evidencia" so por isso. O default correto e o acervo permanente do watcher.
+    ap.add_argument("--input-dir", default=str(Path(__file__).resolve().parent
+                                               / "artifacts" / "jurisprudencia_csv"))
     ap.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     ap.add_argument("--log-level", default="INFO")
+    # Um DESPACHO posterior nao prova que o julgamento suspenso terminou. Sem este
+    # filtro, o script marcaria "julgado depois" por qualquer movimentacao.
+    ap.add_argument("--aceitar-monocratica", action="store_true",
+                    help="aceita decisao monocratica como prova de julgamento "
+                         "(default: so acordao)")
     args = ap.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
 
@@ -67,6 +92,8 @@ def main() -> int:
                     d = parse_br(row.get("dataDecisao"))
                     if not d:
                         continue
+                    if not args.aceitar_monocratica and not _e_acordao(row):
+                        continue  # despacho/monocratica nao encerra julgamento suspenso
                     cnj = digits(row.get("numeroUnico"))[:20]
                     if len(cnj) >= 20:
                         if d > cnj_latest.get(cnj, datetime.date.min):
