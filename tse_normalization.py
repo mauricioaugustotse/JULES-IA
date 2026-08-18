@@ -2011,10 +2011,11 @@ def normalize_resultado_piece(value: str, classe_processo: str, allowed: Optiona
     if "parcial provimento" in lowered or "provido em parte" in lowered:
         return "Provido em parte"
     if (
-        "negado provimento" in lowered
-        or "negou provimento" in lowered
-        or "nego provimento" in lowered
-        or "nega provimento" in lowered
+        # CORRIGIDO 30/07/2026: faltavam "negar" e "negaram" -- justamente a forma do
+        # dispositivo colegiado ("ACORDAM os Ministros em NEGAR provimento"). Sem elas,
+        # a frase caia no regex generico de "provimento" logo abaixo e o resultado saia
+        # INVERTIDO como "Provido". O regex cobre as variacoes de uma vez.
+        re.search(r"\bneg(?:ar|aram|ado|ada|ados|adas|ou|o|a)\s+provimento\b", lowered)
         or "desprovido" in lowered
         or "não provido" in lowered
         or "nao provido" in lowered
