@@ -49,6 +49,13 @@ PIPELINE_COMP = SCRIPT_DIR / "fill_composicao_from_jurisprudencia.py"  # composi
 PIPELINE_CNJ = SCRIPT_DIR / "complete_cnj_from_jurisprudencia.py"      # completa CNJ-20 das paginas incompletas
 PIPELINE_CLASSE = SCRIPT_DIR / "classe_from_jurisprudencia.py"         # classe canonica (anti-downgrade)
 PIPELINE_META = SCRIPT_DIR / "fill_metadata_from_jurisprudencia.py"    # eleicao + origem oficiais
+# 30/07/2026 — os dois passos que fecham o ciclo "pedido de vista -> acordao publicado".
+# Existiam prontos e ficavam FORA do pipeline, dependendo de alguem lembrar de roda-los:
+# o crosscheck nunca funcionou de verdade (apontava para a pasta Downloads) e o inteiro
+# teor nunca entrou no fluxo automatico. Como a coleta virou automatica (tse_coletor
+# deposita o delta e este watcher o consome), a integracao tambem tem de ser.
+PIPELINE_VISTA = SCRIPT_DIR / "suspenso_crosscheck_csv.py"             # fecha "Suspenso por vista"
+PIPELINE_TEOR = SCRIPT_DIR / "fill_inteiro_teor.py"                    # inteiro teor no CORPO da pagina
 
 TSE_SIGNATURE_COLS = ("siglaTribunalJE", "textoDecisao", "partes", "relatores", "numeroProcesso")
 CNJ20_RE = re.compile(r"\d{20}")
@@ -83,6 +90,30 @@ def sha256_of(path: Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def sha256_cached(path: Path, state: dict) -> str:
+    """sha256 com cache por (nome, tamanho, mtime).
+
+    Sem isto, scan_once hasheia TODO CSV estavel da pasta a cada poll -- inclusive os
+    que ja foram processados, porque o hash e justamente o que decide isso. Com um
+    consolidado de centenas de MB na pasta e --poll-secs 3, vira I/O continuo sem fim
+    (diagnosticado em 30/07/2026). A tripla muda se o arquivo mudar, entao o cache
+    nunca devolve hash de conteudo desatualizado."""
+    try:
+        st = path.stat()
+        chave = f"{path.name}|{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        return sha256_of(path)
+    cache = state.setdefault("hash_cache", {})
+    if chave in cache:
+        return cache[chave]
+    h = sha256_of(path)
+    cache[chave] = h
+    if len(cache) > 2000:  # nao deixar o estado crescer sem limite
+        for k in list(cache)[: len(cache) - 1000]:
+            cache.pop(k, None)
+    return h
 
 
 def load_state() -> dict:
@@ -285,14 +316,22 @@ def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict
     """Confronta o(s) CSV(s) do lote com a base de sessoes, na ordem:
     1) completa o CNJ-20 das paginas incompletas (amplia o match dos demais);
     2) partes+advogados; 3) composicao oficial; 4) classe canonica (anti-downgrade);
-    5) eleicao+origem oficiais. Cada um e seguro/idempotente (page-values).
-    CSVs consolidados (grandes) tambem passam pela deteccao de faltantes."""
+    5) eleicao+origem oficiais; 6) fecha "Suspenso por vista" cujo acordao ja saiu;
+    7) grava o inteiro teor no CORPO da pagina do julgamento conclusivo.
+    Cada um e seguro/idempotente (page-values).
+    CSVs consolidados (grandes) tambem passam pela deteccao de faltantes.
+
+    A ORDEM DE 6 E 7 IMPORTA: o inteiro teor so deve ser gravado depois que o passo 6
+    definiu qual pagina e a do julgamento conclusivo -- senao o texto vai para a pagina
+    da sessao em que o julgamento foi SUSPENSO."""
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     _run_one(PIPELINE_CNJ, "cnj", staging, apply, data_source_id, env)
     _run_one(PIPELINE, "partes/advogados", staging, apply, data_source_id, env)
     _run_one(PIPELINE_COMP, "composicao", staging, apply, data_source_id, env)
     _run_one(PIPELINE_CLASSE, "classe", staging, apply, data_source_id, env)
     _run_one(PIPELINE_META, "metadata", staging, apply, data_source_id, env)
+    _run_one(PIPELINE_VISTA, "pedido de vista", staging, apply, data_source_id, env)
+    _run_one(PIPELINE_TEOR, "inteiro teor", staging, apply, data_source_id, env)
     if apply:
         for csv_path in sorted(staging.glob("*.csv")):
             _run_missing_scan(csv_path, data_source_id, env)
@@ -343,9 +382,12 @@ def already_done(h: str, state: dict, apply: bool) -> bool:
 def scan_once(watch_dir: Path, sizes: dict, state: dict, args) -> int:
     ready = stable_csvs(watch_dir, sizes)
     batch: list[Path] = []
+    dirty = False
     for p in ready:
         try:
-            h = sha256_of(p)
+            antes = len(state.get("hash_cache", {}))
+            h = sha256_cached(p, state)
+            dirty = dirty or len(state.get("hash_cache", {})) != antes
         except OSError:
             continue
         if already_done(h, state, args.apply):
@@ -360,6 +402,8 @@ def scan_once(watch_dir: Path, sizes: dict, state: dict, args) -> int:
         batch.append(p)
     if batch:
         process_batch(batch, state, args)
+    elif dirty:
+        save_state(state)  # persiste o cache de hash mesmo sem lote a processar
     return len(batch)
 
 
