@@ -176,8 +176,13 @@ def main() -> int:
         publish=not args.dry_run,
         continue_on_error=True,
         post_publish_steps=() if (args.no_post or args.dry_run) else ("materia", "suspenso", "classe_nomes", "sanear"),
-        recolor_labels=False,   # etiquetas Playwright exigem Edge interativo
         watch_dje=False,        # DJE exige CSVs/pasta especifica
+        # Pelo mesmo motivo do watch_dje: esta CLI republica DIAS faltantes, e as etapas abaixo
+        # tem escopo global (pasta inteira do DJe, ingestao com OpenAI, relations de ~50 min).
+        # Rode-as depois, pela GUI, quando quiser fechar as bases.
+        enriquecer_sessoes="nao",
+        ingerir_dje=False,
+        atualizar_relations=False,
         allow_transcript_fallback=args.allow_transcript,
     )
 

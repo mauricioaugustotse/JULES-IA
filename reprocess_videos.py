@@ -54,8 +54,13 @@ def main() -> int:
         publish=not args.dry_run,
         continue_on_error=True,
         post_publish_steps=() if (args.no_post or args.dry_run) else ("materia", "suspenso", "classe_nomes", "sanear"),
-        recolor_labels=False,
         watch_dje=False,
+        # Manutencao das bases fica de fora: esta CLI reprocessa VIDEOS pontuais, e as tres etapas
+        # abaixo sao caras e de escopo global (confronto da pasta inteira do DJe, ingestao com
+        # OpenAI, relations de ~50 min). Mesmo motivo pelo qual watch_dje ja era False aqui.
+        enriquecer_sessoes="nao",
+        ingerir_dje=False,
+        atualizar_relations=False,
         allow_transcript_fallback=args.allow_transcript,
     )
     LOGGER.info("Reprocessando %s video(s) via VIDEO: %s", len(videos), [v.video_id for v in videos])
