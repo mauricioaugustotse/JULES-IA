@@ -4966,3 +4966,107 @@ def test_coerce_aceita_as_chaves_de_composicao_que_o_modelo_inventa():
         texto = json.dumps({"data_sessao": "03/08/2026", chave: ["Min. Nunes Marques"], "julgamentos": []})
         parsed = core._coerce_gemini_response_model(SessionExtraction, texto)
         assert parsed.composicao == ["Min. Nunes Marques"], f"chave {chave} perdeu a composicao"
+
+
+def test_plano_totalmente_descartado_escala_para_o_proximo(tmp_path):
+    """Plano que respondeu mas cujo conteudo INTEIRO caiu na guarda de janela e plano
+    FRACASSADO, nao resultado vazio: tem de escalar para o plano de janelas curtas.
+
+    Sem isto o scan seguiria com zero janelas em silencio — nem o plano fallback nem a
+    transcricao entrariam, porque ambos so sao acionados por excecao.
+    """
+    extractor = GeminiSessionExtractor.__new__(GeminiSessionExtractor)
+    extractor.logger = logging.getLogger("test_escalona_descarte")
+    extractor.artifact_store = RunArtifacts(tmp_path)
+
+    planos_usados = []
+
+    def fake_call_gemini(**kwargs):
+        janela = (kwargs["start_seconds"], kwargs["end_seconds"])
+        planos_usados.append(janela)
+        if janela[1] - janela[0] > 200:  # plano primary (300s): so devolve lixo fora da janela
+            return SessionExtraction(
+                data_sessao="03/08/2026",
+                composicao=[],
+                judgments=[
+                    SessionWindow(
+                        title_hint="0601751-92.2026.6.00.0000",
+                        start_seconds=8000 + i * 100,
+                        mentioned_process_numbers=["0601751-92.2026.6.00.0000"],
+                    )
+                    for i in range(5)
+                ],
+            )
+        # plano fallback (120s): devolve um bloco legitimo dentro da janela
+        return SessionExtraction(
+            data_sessao="03/08/2026",
+            composicao=["Min. Nunes Marques"],
+            judgments=[
+                SessionWindow(
+                    title_hint="AgR no REspe 0600504-40",
+                    start_seconds=janela[0] + 10,
+                    mentioned_process_numbers=["0600504-40"],
+                )
+            ],
+        )
+
+    extractor._call_gemini = fake_call_gemini
+    extractor._merge_session_chunks = GeminiSessionExtractor._merge_session_chunks.__get__(
+        extractor, GeminiSessionExtractor
+    )
+
+    original_fetch = core.fetch_youtube_duration_seconds
+    original_chunker = core.chunk_video_windows
+    try:
+        core.fetch_youtube_duration_seconds = lambda youtube_url: 600
+        def fake_chunker(duration_seconds, window_seconds=None, overlap_seconds=None):
+            if window_seconds == core.GLOBAL_SCAN_FALLBACK_WINDOW_SECONDS:
+                return [(0, 120), (105, 225)]
+            return [(0, 300), (270, 600)]
+        core.chunk_video_windows = fake_chunker
+        merged = extractor._extract_session_windows("https://www.youtube.com/watch?v=abc123")
+    finally:
+        core.fetch_youtube_duration_seconds = original_fetch
+        core.chunk_video_windows = original_chunker
+
+    # o plano de janelas curtas foi de fato tentado...
+    assert any(fim - ini <= 120 for ini, fim in planos_usados), planos_usados
+    # ...e o resultado veio dele, nao vazio nem contaminado
+    numeros = [n for item in merged.judgments for n in item.mentioned_process_numbers]
+    assert numeros and all(n == "0600504-40" for n in numeros), numeros
+
+
+def test_video_sem_julgamento_nao_escala(tmp_path):
+    """Zero blocos SEM descarte nenhum e resultado valido (sessao solene, por exemplo):
+    nao pode ser confundido com plano fracassado nem disparar o plano seguinte."""
+    extractor = GeminiSessionExtractor.__new__(GeminiSessionExtractor)
+    extractor.logger = logging.getLogger("test_sem_julgamento")
+    extractor.artifact_store = RunArtifacts(tmp_path)
+
+    chamadas = {"n": 0}
+
+    def fake_call_gemini(**kwargs):
+        chamadas["n"] += 1
+        return SessionExtraction(data_sessao="03/08/2026", composicao=["Min. Nunes Marques"], judgments=[])
+
+    extractor._call_gemini = fake_call_gemini
+    extractor._merge_session_chunks = GeminiSessionExtractor._merge_session_chunks.__get__(
+        extractor, GeminiSessionExtractor
+    )
+
+    original_fetch = core.fetch_youtube_duration_seconds
+    original_chunker = core.chunk_video_windows
+    try:
+        core.fetch_youtube_duration_seconds = lambda youtube_url: 600
+        core.chunk_video_windows = (
+            lambda duration_seconds, window_seconds=None, overlap_seconds=None: [(0, 300), (270, 600)]
+        )
+        merged = extractor._extract_session_windows("https://www.youtube.com/watch?v=abc123")
+    finally:
+        core.fetch_youtube_duration_seconds = original_fetch
+        core.chunk_video_windows = original_chunker
+
+    assert merged.judgments == []
+    assert merged.data_sessao == "2026-08-03"
+    # so as 2 janelas do plano primary: o fallback NAO foi acionado
+    assert chamadas["n"] == 2

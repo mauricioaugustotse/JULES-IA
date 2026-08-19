@@ -4992,6 +4992,7 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
     ) -> list[SessionExtraction]:
         extracted_chunks: list[SessionExtraction] = []
         consecutive_failures_without_success = 0
+        blocos_descartados_no_plano = 0
         for chunk_index, (start_seconds, end_seconds) in enumerate(windows, start=1):
             prompt = f"""
 Analise apenas o trecho da sessão delimitado por esta janela.
@@ -5068,6 +5069,7 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                 window_end_seconds=end_seconds,
                 duration_seconds=duration_seconds,
             )
+            blocos_descartados_no_plano += sanitize_report["blocos_descartados"]
             if sanitize_report["blocos_descartados"]:
                 self.logger.warning(
                     "Scan %s/%s (%ss-%ss): descartados %s de %s blocos fora da janela%s.",
@@ -5104,6 +5106,26 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
             )
         if not extracted_chunks:
             raise RuntimeError(f"Nenhum chunk global foi extraído com sucesso no plano {plan_label}.")
+
+        # Plano que respondeu, mas cujo conteúdo INTEIRO caiu na guarda de janela, é
+        # plano fracassado — não resultado vazio. Sem isto o scan seguiria com zero
+        # janelas em silêncio, e nem o plano de janelas curtas nem o fallback por
+        # transcrição chegariam a ser tentados (eles só entram por exceção).
+        # A condição exige descarte: vídeo legitimamente sem julgamento (sessão
+        # solene, por exemplo) devolve zero blocos SEM descarte nenhum e continua
+        # sendo um resultado válido.
+        blocos_uteis = sum(
+            1
+            for chunk in extracted_chunks
+            for judgment in chunk.judgments
+            if normalize_model_text(judgment.title_hint) or judgment.mentioned_process_numbers
+        )
+        if blocos_uteis == 0 and blocos_descartados_no_plano > 0:
+            raise RuntimeError(
+                f"Plano {plan_label} não sobrou com nenhum bloco aproveitável: "
+                f"{blocos_descartados_no_plano} bloco(s) foram descartados por cair fora da "
+                "janela pedida (degeneração do modelo). Escalando para o próximo plano."
+            )
         return extracted_chunks
 
     def _merge_session_chunks(self, chunks: list[SessionExtraction]) -> SessionExtraction:
