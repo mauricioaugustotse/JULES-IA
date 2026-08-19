@@ -51,6 +51,19 @@ import vistoria_queue
 
 
 LOGGER = logging.getLogger("tse_youtube_notion_batch_gui")
+
+# Faixa "Acervo do TSE": a MESMA leitura que a GUI DJE_relatorios_semanais_gui faz, para
+# que as duas telas digam exatamente a mesma coisa sobre o acervo consolidado.
+# `tse_acervo` e stdlib-pura, entao importa sem problema aqui no .venv-win (que nao tem
+# as demais dependencias de ProjetoConversor).
+PROJETO_CONVERSOR = Path(r"C:\Users\mauri\ProjetoConversor")
+if str(PROJETO_CONVERSOR) not in sys.path:
+    sys.path.append(str(PROJETO_CONVERSOR))
+try:
+    import tse_acervo as tse_acervo_mod
+except Exception:  # noqa: BLE001 — a faixa e informativa; sem ela a GUI segue
+    tse_acervo_mod = None
+
 MAX_LINKS = 10
 BATCH_ARTIFACT_ROOT = ARTIFACT_ROOT / "batch_gui"
 TERMINAL_STATUSES = {"Concluido", "Erro"}
@@ -93,6 +106,11 @@ class BatchOptions:
     atualizar_tse: bool = True
     tse_coletor: str = r"C:\Users\mauri\ProjetoConversor\tse_coletor.py"
     tse_max_idade_horas: float = 12.0
+    # Espera curta pelo captcha: no passo 0 de um lote longo voce esta esperando o lote
+    # terminar, nao olhando a janela do Edge. E teto de duracao, para que um captcha
+    # persistente nao arraste a rodada por horas antes do primeiro video.
+    tse_espera_captcha: float = 120.0
+    tse_teto_minutos: float = 45.0
     # Relations no Notion (mesmo processo dentro do DJe + DJe <-> sessoes), rodadas
     # ao final da pos-publicacao. Incremental e idempotente: le a base, compara e
     # so grava o que falta. Vive em ProjetoConversor, como o tse_coletor acima.
@@ -653,33 +671,57 @@ def _gf_python_com_playwright() -> str:
     return cand if Path(cand).exists() else sys.executable
 
 
-def _gf_run_tse_update(coletor: str, max_idade_horas: float,
-                       output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
-    """Passo 0: baixa do portal do TSE o que foi publicado desde a ultima coleta.
+def _gf_run_streaming(cmd: list[str], prefixo: str, cwd: Path,
+                      output_queue: "queue.Queue[tuple[str, Any]]",
+                      timeout: int = 7200) -> Any:
+    """Roda um subprocesso transmitindo o stdout AO VIVO, linha a linha.
 
-    Ao contrario de _gf_run_dje_once, transmite o log AO VIVO (Popen linha a linha):
-    a coleta pode pausar esperando captcha, e o usuario precisa ver o aviso na hora,
-    nao ao final. Falha aqui nao aborta o lote."""
+    Unico jeito de rodar comando com saida ao vivo nesta GUI — antes _gf_run_tse_update
+    e _gf_run_relations repetiam este mesmo bloco. O streaming e essencial no coletor:
+    a coleta pode pausar esperando captcha, e o aviso tem de aparecer na hora, nao ao
+    final. (Os outros dois helpers _gf_* NAO foram unificados aqui de proposito: eles
+    capturam e FILTRAM a saida, e o de labels ainda orquestra o Edge oculto.)
+    """
     import subprocess
-    if not Path(coletor).exists():
-        output_queue.put(("log", f"[tse] coletor nao encontrado: {coletor}\n"))
-        return "ausente"
-    cmd = [_gf_python_com_playwright(), "-X", "utf8", coletor, "atualizar",
-           "--max-idade-horas", str(max_idade_horas)]
     try:
-        p = subprocess.Popen(cmd, cwd=str(Path(coletor).parent), stdout=subprocess.PIPE,
+        p = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1,
                              encoding="utf-8", errors="replace",
                              env={**os.environ, "PYTHONIOENCODING": "utf-8"})
         assert p.stdout is not None
         for ln in p.stdout:
             if ln.strip():
-                output_queue.put(("log", f"[tse] {ln.rstrip()}\n"))
-        p.wait(timeout=7200)
+                output_queue.put(("log", f"[{prefixo}] {ln.rstrip()}\n"))
+        p.wait(timeout=timeout)
         return p.returncode
-    except Exception as exc:
-        output_queue.put(("log", f"[tse] erro: {exc}\n"))
+    except Exception as exc:  # noqa: BLE001
+        output_queue.put(("log", f"[{prefixo}] erro: {exc}\n"))
         return str(exc)
+
+
+def _gf_run_tse_update(coletor: str, max_idade_horas: float,
+                       output_queue: "queue.Queue[tuple[str, Any]]",
+                       espera_captcha: float = 120.0,
+                       teto_minutos: float = 45.0) -> Any:
+    """Passo 0: baixa do portal do TSE o que foi publicado desde a ultima coleta.
+
+    SEM --janela-dias de proposito: a varredura longa de 120 dias, que pega decisoes
+    julgadas ha meses e publicadas agora, so acontece quando a janela nao e passada
+    explicitamente. Falha aqui nao aborta o lote.
+    """
+    if not Path(coletor).exists():
+        output_queue.put(("log", f"[tse] coletor nao encontrado: {coletor}\n"))
+        return "ausente"
+    cmd = [_gf_python_com_playwright(), "-X", "utf8", coletor, "atualizar",
+           "--max-idade-horas", str(max_idade_horas),
+           "--espera-captcha", str(espera_captcha),
+           "--teto-minutos", str(teto_minutos),
+           "--log-file", str(PROJETO_CONVERSOR / "Artefatos" / "reports" / "tse_coletor.log")]
+    codigo = _gf_run_streaming(cmd, "tse", Path(coletor).parent, output_queue)
+    if codigo == 5:
+        output_queue.put(("log", "[tse] a coleta nao trouxe nenhum CSV — veja o motivo "
+                                 "na faixa 'Acervo do TSE' (captcha, teto ou falha do portal)\n"))
+    return codigo
 
 
 def _gf_run_dje_once(dje_dir: str, apply: bool, output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
@@ -706,25 +748,13 @@ def _gf_run_relations(script: str, output_queue: "queue.Queue[tuple[str, Any]]")
     global (o .venv-win desta GUI nao tem as deps de ProjetoConversor) e mostra
     a saida ao vivo. Incremental: rodadas repetidas so gravam o delta.
     """
-    import subprocess
     if not Path(script).exists():
         output_queue.put(("log", f"[relations] script nao encontrado: {script}\n"))
         return "script ausente"
     cmd = [_gf_python_com_playwright(), "-X", "utf8", script,
            "--etapas", "interna,cross"]
-    try:
-        p = subprocess.Popen(cmd, cwd=str(Path(script).parent),
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, bufsize=1, encoding="utf-8",
-                             errors="replace",
-                             env={**os.environ, "PYTHONIOENCODING": "utf-8"})
-        for ln in p.stdout:  # type: ignore[union-attr]
-            if ln.strip():
-                output_queue.put(("log", f"[relations] {ln.rstrip()}\n"))
-        p.wait(timeout=14400)
-        return p.returncode
-    except Exception as exc:
-        output_queue.put(("log", f"[relations] erro: {exc}\n")); return str(exc)
+    return _gf_run_streaming(cmd, "relations", Path(script).parent, output_queue,
+                             timeout=14400)
 
 
 def process_video_batch(
@@ -761,7 +791,10 @@ def process_video_batch(
     if options.atualizar_tse and not stop_event.is_set():
         output_queue.put(("status", "__post__", "Atualizando o acervo do TSE...", ""))
         LOGGER.info("Atualizando o acervo do TSE a partir do portal.")
-        _gf_run_tse_update(options.tse_coletor, options.tse_max_idade_horas, output_queue)
+        _gf_run_tse_update(options.tse_coletor, options.tse_max_idade_horas, output_queue,
+                           espera_captcha=options.tse_espera_captcha,
+                           teto_minutos=options.tse_teto_minutos)
+        output_queue.put(("acervo_mudou", None))
 
     notion_client = NotionSessoesClient(
         api_key=notion_key,
@@ -933,10 +966,15 @@ class BatchGuiApp:
         self.post_publish_var = tk.BooleanVar(value=True)
         self.recolor_labels_var = tk.BooleanVar(value=True)
         self.watch_dje_var = tk.BooleanVar(value=False)  # monitor independente (Tarefa WatchDJe_Notion) assume; marque p/ rodada --once manual
-        self.atualizar_tse_var = tk.BooleanVar(value=True)  # passo 0: acervo do TSE em dia (freio de 12 h no coletor)
+        # A coleta do TSE virou comportamento fixo (passo 0, com freio de 12 h): a
+        # faixa "Acervo do TSE" no alto da janela e que mostra o estado. O que sobrou
+        # de controle e o override, no painel Avancado.
+        self.pular_tse_var = tk.BooleanVar(value=False)
+        self.show_advanced_var = tk.BooleanVar(value=False)
+        self.acervo_l1_var = tk.StringVar(value="Acervo do TSE: consultando...")
+        self.acervo_l2_var = tk.StringVar(value="")
         self.atualizar_relations_var = tk.BooleanVar(value=False)  # pos-publicacao: relations no Notion
         self.count_var = tk.StringVar(value=f"0/{MAX_LINKS} links")
-        self.target_var = tk.StringVar(value=f"Notion: {DEFAULT_NOTION_DATABASE_URL}")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.last_batch_dir, ultimo_txt = self._find_last_batch()
         self.idle_status_text = f"Pronto — {ultimo_txt}" if ultimo_txt else "Pronto"
@@ -991,6 +1029,9 @@ class BatchGuiApp:
         style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
         style.configure("Hint.TLabel", foreground="#a15c00", font=("Segoe UI", 10, "bold"))
         style.configure("Muted.TLabel", foreground="#666666", font=("Segoe UI", 9))
+        # níveis da faixa "Acervo do TSE" (os mesmos da GUI DJE Relatorios Semanais)
+        style.configure("Ok.TLabel", foreground="#0a6b22", font=("Segoe UI", 10, "bold"))
+        style.configure("Erro.TLabel", foreground="#b00020", font=("Segoe UI", 10, "bold"))
 
         main = ttk.Frame(self.root, padding=(12, 10))
         main.pack(fill=tk.BOTH, expand=True)
@@ -1009,6 +1050,29 @@ class BatchGuiApp:
         ttk.Label(main, text="Fluxo: 1 links → 2 opções → 3 processar → 4 acompanhar a saída → "
                              "5 decidir as pendências na Fila de vistoria.",
                   style="Muted.TLabel").pack(fill=tk.X, pady=(0, 6))
+
+        # ---------------------------------------------------- faixa: acervo do TSE
+        # Mesma faixa, mesmos textos e mesma posição da GUI "DJE Relatorios Semanais":
+        # fora do notebook, para continuar visível também na aba da Fila de vistoria.
+        acervo_box = ttk.LabelFrame(main, text="Acervo do TSE", padding=8)
+        acervo_box.pack(fill=tk.X, pady=(0, 8))
+        acervo_box.columnconfigure(0, weight=1)
+        self.acervo_l1 = ttk.Label(acervo_box, textvariable=self.acervo_l1_var,
+                                   font=("Segoe UI", 10, "bold"))
+        self.acervo_l1.grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(acervo_box, textvariable=self.acervo_l2_var,
+                  style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
+        self.btn_coletar = ttk.Button(acervo_box, text="Coletar do TSE agora",
+                                      command=self._coletar_tse_agora)
+        self.btn_coletar.grid(row=0, column=1, rowspan=2, sticky=tk.E)
+        Tooltip(self.btn_coletar,
+                "Baixa do portal do TSE as decisões publicadas desde a última coleta e as "
+                "acrescenta ao acervo consolidado.\n\n"
+                "Use para ADIANTAR: clique aqui e vá colando os links dos vídeos enquanto o "
+                "Edge trabalha. Quando o lote começar, esta etapa pula sozinha (freio de 12 h).\n\n"
+                "UMA JANELA DO EDGE VAI ABRIR — é o coletor. Se o portal pedir captcha, "
+                "resolva NELA.")
+        self._atualizar_faixa_acervo()
 
         # a barra de status é empacotada ANTES do notebook, com side=bottom:
         # ganha prioridade de espaço e nunca é cortada em tela baixa (é nela
@@ -1041,8 +1105,8 @@ class BatchGuiApp:
 
         # ================= ABA 1 — PROCESSAR LOTE =================
         process_tab.columnconfigure(0, weight=1)
-        process_tab.rowconfigure(2, weight=3)
-        process_tab.rowconfigure(3, weight=1)
+        process_tab.rowconfigure(3, weight=3)   # execucao
+        process_tab.rowconfigure(4, weight=1)   # log
 
         input_frame = ttk.LabelFrame(
             process_tab,
@@ -1070,81 +1134,114 @@ class BatchGuiApp:
             "Quantos vídeos já estão na lista e o limite por lote.",
         ).grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
 
-        options = ttk.LabelFrame(process_tab, text="2 · Opções do fluxo", padding=8)
+        # Regra desta tela: só fica visível o que muda de rodada a rodada. Tudo o que
+        # os próprios tooltips descreviam como "normalmente desnecessário" ou "só
+        # altere se souber o que está fazendo" virou comportamento fixo, com override
+        # no painel "Avançado" logo abaixo.
+        options = ttk.LabelFrame(process_tab, text="2 · Opções desta rodada", padding=8)
         options.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        options.columnconfigure(1, weight=1)
-        options.columnconfigure(3, weight=1)
-        tip(
-            ttk.Label(options, text="Modelo Gemini"),
-            "Modelo de IA que assiste ao vídeo e extrai os julgamentos (número, relator, resultado, análise). "
-            "O padrão preenchido é o recomendado; só altere se souber o que está fazendo.",
-        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
-        tip(
-            ttk.Entry(options, textvariable=self.model_var),
-            "Nome do modelo Gemini usado na EXTRAÇÃO dos julgamentos do vídeo.",
-        ).grid(row=0, column=1, sticky="ew", padx=(0, 14))
-        tip(
-            ttk.Label(options, text="Modelo p/ notícias"),
-            "Modelo de IA usado na etapa de busca de notícias relacionadas a cada julgamento.",
-        ).grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
-        tip(
-            ttk.Entry(options, textvariable=self.news_model_var),
-            "Nome do modelo Gemini usado na BUSCA/validação de notícias (TSE, TREs e imprensa).",
-        ).grid(row=0, column=3, sticky="ew")
-        tip(
-            ttk.Checkbutton(options, text="Buscar notícias antes de publicar", variable=self.with_news_var),
-            "Antes de gravar no Notion, procura notícias oficiais (TSE/TREs) e da imprensa sobre cada julgamento "
-            "e anexa os links aprovados à linha. Desmarque para um lote mais rápido e sem notícias.",
-        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        options.columnconfigure(2, weight=1)
         tip(
             ttk.Checkbutton(options, text="Publicar direto no Notion", variable=self.publish_var),
             "Marcado: as linhas extraídas são gravadas na base do Notion ao final. Desmarcado: o lote apenas gera "
             "os arquivos de prévia (artifacts) para conferência, sem publicar nada.",
-        ).grid(row=1, column=2, sticky=tk.W, pady=(6, 0))
+        ).grid(row=0, column=0, sticky=tk.W)
         tip(
-            ttk.Checkbutton(options, text="Continuar se um link falhar", variable=self.continue_on_error_var),
+            ttk.Checkbutton(options, text="Buscar notícias antes de publicar", variable=self.with_news_var),
+            "Antes de gravar no Notion, procura notícias oficiais (TSE/TREs) e da imprensa sobre cada julgamento "
+            "e anexa os links aprovados à linha. Desmarque para um lote mais rápido e sem notícias.",
+        ).grid(row=0, column=1, sticky=tk.W, padx=(20, 0))
+        tip(
+            ttk.Checkbutton(options, text="Avançado", variable=self.show_advanced_var),
+            "Mostra as opções que quase nunca mudam: modelos de IA, tratamentos "
+            "pós-publicação, recolorir etiquetas, relations e pular a coleta do TSE.",
+        ).grid(row=0, column=3, sticky=tk.E)
+
+        # ---------------------------------------------------------------- Avançado
+        self.adv_frame = ttk.LabelFrame(process_tab, text="Avançado", padding=8)
+        self.adv_frame.columnconfigure(1, weight=1)
+        self.adv_frame.columnconfigure(3, weight=1)
+        adv = self.adv_frame
+
+        tip(
+            ttk.Label(adv, text="Modelo Gemini"),
+            "Modelo de IA que assiste ao vídeo e extrai os julgamentos (número, relator, resultado, análise). "
+            "O padrão preenchido é o recomendado; só altere se souber o que está fazendo.",
+        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        tip(
+            ttk.Entry(adv, textvariable=self.model_var),
+            "Nome do modelo Gemini usado na EXTRAÇÃO dos julgamentos do vídeo.",
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 14))
+        tip(
+            ttk.Label(adv, text="Modelo p/ notícias"),
+            "Modelo de IA usado na etapa de busca de notícias relacionadas a cada julgamento.",
+        ).grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
+        tip(
+            ttk.Entry(adv, textvariable=self.news_model_var),
+            "Nome do modelo Gemini usado na BUSCA/validação de notícias (TSE, TREs e imprensa).",
+        ).grid(row=0, column=3, sticky="ew")
+
+        ttk.Separator(adv, orient="horizontal").grid(row=1, column=0, columnspan=4,
+                                                     sticky="ew", pady=8)
+        ttk.Label(adv, text="Comportamento fixo — desmarque só se souber por quê:",
+                  style="Muted.TLabel").grid(row=2, column=0, columnspan=4, sticky=tk.W)
+
+        tip(
+            ttk.Checkbutton(adv, text="Continuar se um link falhar", variable=self.continue_on_error_var),
             "Se um vídeo der erro (ex.: transmissão recém-encerrada ainda sem VOD), o lote registra a falha e "
             "segue para o próximo vídeo em vez de parar tudo.",
-        ).grid(row=1, column=3, sticky=tk.W, pady=(6, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         tip(
-            ttk.Checkbutton(options, text="Tratar dados após publicar (matéria semelhante, suspensos, classes, advogados)",
+            ttk.Checkbutton(adv, text="Tratar dados após publicar (matéria semelhante, suspensos, classes, advogados)",
                             variable=self.post_publish_var),
             "Depois de publicar, roda os tratamentos automáticos de qualidade: vincular matéria semelhante, "
             "reconciliar julgamentos 'Suspenso' concluídos depois, normalizar classe processual e sanear dados.",
-        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ).grid(row=3, column=2, columnspan=2, sticky=tk.W, padx=(14, 0), pady=(6, 0))
         tip(
-            ttk.Checkbutton(options, text="Recolorir etiquetas no Notion (estético — Edge automatizado)",
+            ttk.Checkbutton(adv, text="Recolorir etiquetas no Notion (estético — Edge automatizado)",
                             variable=self.recolor_labels_var),
             "Ajusta as cores das etiquetas (selects) na base do Notion usando um Edge oculto automatizado. "
             "Puramente estético; requer o Microsoft Edge instalado.",
-        ).grid(row=2, column=2, sticky=tk.W, pady=(6, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         tip(
-            ttk.Checkbutton(options, text="Processar CSVs DJE",
-                            variable=self.watch_dje_var),
-            "Roda UMA passada do confronto com os CSVs do Diário da Justiça Eletrônico ao final do lote. "
-            "Normalmente desnecessário: o monitor automático (tarefa WatchDJe_Notion) já vigia a pasta DJe "
-            "continuamente e processa qualquer CSV novo.",
-        ).grid(row=2, column=3, sticky=tk.W, pady=(6, 0))
+            ttk.Checkbutton(adv, text="Pular a coleta do TSE nesta rodada",
+                            variable=self.pular_tse_var),
+            "Normalmente o acervo do TSE é atualizado sozinho antes do primeiro vídeo — é o que a faixa "
+            "'Acervo do TSE', no alto da janela, mostra.\nMarque para NÃO abrir o Edge nesta rodada, por "
+            "exemplo quando você acabou de coletar pelo botão da faixa.",
+        ).grid(row=4, column=2, columnspan=2, sticky=tk.W, padx=(14, 0), pady=(6, 0))
+
+        ttk.Separator(adv, orient="horizontal").grid(row=5, column=0, columnspan=4,
+                                                     sticky="ew", pady=8)
+        ttk.Label(adv, text="Etapas extras (desligadas por padrão):",
+                  style="Muted.TLabel").grid(row=6, column=0, columnspan=4, sticky=tk.W)
+
         tip(
-            ttk.Checkbutton(options, text="Atualizar o acervo do TSE (baixa do portal)",
-                            variable=self.atualizar_tse_var),
-            "Antes de processar os vídeos, baixa do portal de jurisprudência as decisões publicadas desde "
-            "a última coleta e as acrescenta ao acervo consolidado, deixando o CSV novo na pasta DJe — "
-            "é o que dispensa o export manual.\nSó recoleta se a última atualização tiver mais de 12 h. "
-            "Uma janela do Edge abre durante a coleta: se o portal pedir captcha, resolva nela e o resto "
-            "segue sozinho.",
-        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
-        tip(
-            ttk.Checkbutton(options, text="Atualizar relations no Notion (pós-publicação)",
+            ttk.Checkbutton(adv, text="Atualizar relations no Notion (pós-publicação)",
                             variable=self.atualizar_relations_var),
             "Ao final da pós-publicação, religa as páginas do mesmo processo no Notion — dentro da base "
             "DJe e entre DJe ↔ sessões (inclui as sessões publicadas por este lote).\nIncremental: lê a "
             "base, compara com o que já está gravado e só escreve o que falta (~15-20 min + o delta). "
             "Requer 'Publicar direto no Notion'.",
-        ).grid(row=3, column=2, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(adv, text="Processar CSVs DJE (rodada --once)",
+                            variable=self.watch_dje_var),
+            "Roda UMA passada do confronto com os CSVs do Diário da Justiça Eletrônico ao final do lote. "
+            "Normalmente desnecessário: o monitor automático (tarefa WatchDJe_Notion) já vigia a pasta DJe "
+            "continuamente e processa qualquer CSV novo.",
+        ).grid(row=7, column=2, columnspan=2, sticky=tk.W, padx=(14, 0), pady=(6, 0))
+
+        def _toggle_advanced(*_args: Any) -> None:
+            if self.show_advanced_var.get():
+                self.adv_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+            else:
+                self.adv_frame.grid_remove()
+
+        self.show_advanced_var.trace_add("write", _toggle_advanced)
 
         exec_frame = ttk.LabelFrame(process_tab, text="3 · Execução", padding=8)
-        exec_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        exec_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
         exec_frame.columnconfigure(0, weight=1)
         exec_frame.rowconfigure(1, weight=1)
 
@@ -1177,8 +1274,10 @@ class BatchGuiApp:
         ).pack(side=tk.LEFT, padx=(8, 0))
         tip(
             ttk.Button(actions, text="Retomar artifacts", command=self._load_resume_root),
-            "Reaproveita a extração de IA de um lote anterior (pasta de artifacts) para reprocessar as etapas "
-            "seguintes sem gastar nova análise de vídeo.",
+            "Refaz um lote a partir da pasta de artifacts dele: a lista de vídeos é remontada pelos "
+            "subdiretórios NN_videoid encontrados ali, e o novo lote grava NESSA MESMA pasta, por cima. "
+            "ATENÇÃO: a análise de vídeo é REFEITA — o Gemini roda de novo e a extração antiga é "
+            "sobrescrita, então vídeo que não chegou a criar pasta NÃO volta para a lista.",
         ).pack(side=tk.LEFT, padx=(8, 0))
 
         columns = ("pos", "video_id", "sessao", "cc", "status", "result", "url")
@@ -1214,7 +1313,7 @@ class BatchGuiApp:
         self.tree.bind("<Control-a>", lambda _e: self._select_all_tree(self.tree))
 
         log_frame = ttk.LabelFrame(process_tab, text="4 · Saída (log)", padding=8)
-        log_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        log_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.output_text = tip(
@@ -1511,7 +1610,7 @@ class BatchGuiApp:
             post_publish_steps=("materia", "suspenso", "classe_nomes", "sanear") if self.post_publish_var.get() else (),
             recolor_labels=bool(self.recolor_labels_var.get()),
             watch_dje=bool(self.watch_dje_var.get()),
-            atualizar_tse=bool(self.atualizar_tse_var.get()),
+            atualizar_tse=not bool(self.pular_tse_var.get()),
             atualizar_relations=bool(self.atualizar_relations_var.get()),
         )
 
@@ -1595,6 +1694,51 @@ class BatchGuiApp:
     def _is_running(self) -> bool:
         return bool(self.worker and self.worker.is_alive())
 
+    # ------------------------------------------------------ faixa: acervo do TSE
+    def _atualizar_faixa_acervo(self) -> None:
+        """Repinta a faixa do acervo. Barato: só lê o estado.json do coletor."""
+        estilos = {"ok": "Ok.TLabel", "atencao": "Hint.TLabel", "erro": "Erro.TLabel"}
+        if tse_acervo_mod is None:
+            self.acervo_l1_var.set("Acervo do TSE: indisponível")
+            self.acervo_l2_var.set(f"não consegui importar tse_acervo de {PROJETO_CONVERSOR}")
+            self.acervo_l1.configure(style="Erro.TLabel")
+            return
+        try:
+            p = tse_acervo_mod.resumo_painel()
+        except Exception as exc:  # noqa: BLE001
+            self.acervo_l1_var.set("Acervo do TSE: indisponível")
+            self.acervo_l2_var.set(str(exc)[:120])
+            self.acervo_l1.configure(style="Erro.TLabel")
+            return
+        self.acervo_l1_var.set(p["linha1"])
+        self.acervo_l2_var.set(p["linha2"])
+        self.acervo_l1.configure(style=estilos.get(p["nivel"], "Muted.TLabel"))
+
+    def _coletar_tse_agora(self) -> None:
+        """Coleta antecipada: adianta o acervo enquanto você prepara os links.
+
+        Depois disto, o passo 0 do lote pula sozinho pelo freio de 12 h — sem coleta
+        duplicada e sem espera na hora de processar os vídeos.
+        """
+        if self._is_running():
+            messagebox.showwarning("Lote em execucao",
+                                   "Ha um lote em execucao; aguarde para coletar.")
+            return
+        opts = self._options()
+        self.btn_coletar.configure(state=tk.DISABLED)
+        self._append_output("[tse] coleta pedida a mao — uma janela do Edge vai abrir\n")
+
+        def worker() -> None:
+            try:
+                # espera longa pelo captcha: aqui VOCE esta na frente e pode resolver
+                _gf_run_tse_update(opts.tse_coletor, opts.tse_max_idade_horas,
+                                   self.output_queue, espera_captcha=1800.0,
+                                   teto_minutos=opts.tse_teto_minutos)
+            finally:
+                self.output_queue.put(("acervo_mudou", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _drain_output_queue(self) -> None:
         try:
             while True:
@@ -1602,6 +1746,11 @@ class BatchGuiApp:
                 event = item[0]
                 if event == "log":
                     self._append_output(str(item[1]))
+                elif event == "acervo_mudou":
+                    # a coleta terminou (passo 0 ou botão da faixa): repinta o estado
+                    self._atualizar_faixa_acervo()
+                    if not self._is_running():
+                        self.btn_coletar.configure(state=tk.NORMAL)
                 elif event == "status":
                     _, video_id, status, result = item
                     self._update_tree_status(str(video_id), str(status), str(result))
