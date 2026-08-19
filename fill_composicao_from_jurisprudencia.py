@@ -99,6 +99,16 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     ap.add_argument("--log-level", default="INFO")
+    # DESLIGADO POR PADRAO desde 19/08/2026. O ramo "reverter" ignora o CSV do lote e reescreve
+    # paginas a partir do historico de rodadas -- ja detonou tres vezes (10/07: 469 paginas;
+    # 30/07: 8, commit f93e6ea; 19/08: 1325, das quais 337 ficaram VAZIAS). Sob a flag, o proprio
+    # glob das rodadas antigas nem roda: sem custo e sem arma carregada.
+    ap.add_argument("--permitir-reverter", action="store_true",
+                    help="Reativa a reversao por historico. Perigoso: escreve fora do escopo do CSV.")
+    # Rede contra o proximo desconhecido-desconhecido: uma rodada que queira mudar meio mundo esta
+    # quase certamente errada. Aborta antes de gravar, deixando o changes.json para conferencia.
+    ap.add_argument("--permitir-massa", action="store_true",
+                    help="Ignora o freio que aborta quando a rodada quer mudar paginas demais.")
     args = ap.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
 
@@ -140,17 +150,23 @@ def main() -> int:
             LOGGER.warning("erro CSV %s: %s", fp, str(exc)[:100])
     LOGGER.info("CSVs: %d | (CNJ,data) com composicao oficial: %d", len(files), len(csv_comp))
 
-    # correcoes anteriores (p/ REVERTER as aplicadas com data errada na 1a passada por-CNJ)
+    # correcoes anteriores (p/ REVERTER as aplicadas com data errada na 1a passada por-CNJ).
+    # So monta o indice sob --permitir-reverter: o glob varre 200+ rodadas e, desligado, o ramo
+    # nunca dispara -- nao ha por que pagar a leitura nem manter a arma carregada.
     prior = {}
-    prev = sorted(glob.glob(str(ARTIFACT_ROOT / "*" / "changes.json")))
-    for fp in prev:
-        try:
-            for c in json.loads(Path(fp).read_text(encoding="utf-8")):
-                prior.setdefault(c["cnj"], c)  # earliest = original 'old'
-        except Exception:
-            pass
+    if args.permitir_reverter:
+        prev = sorted(glob.glob(str(ARTIFACT_ROOT / "*" / "changes.json")))
+        for fp in prev:
+            try:
+                for c in json.loads(Path(fp).read_text(encoding="utf-8")):
+                    prior.setdefault(c["cnj"], c)  # earliest = original 'old'
+            except Exception:
+                pass
+        LOGGER.warning("--permitir-reverter LIGADO: %d CNJ no indice historico. Esta rodada pode "
+                       "escrever em paginas fora do CSV.", len(prior))
 
-    changes, applied, failed, iguais, revert = [], 0, 0, 0, 0
+    # FASE 1 -- decidir. Nada e gravado aqui: o freio de massa precisa ver o total antes.
+    changes, iguais, revert, vazio_bloqueado = [], 0, 0, 0
     for p in pages:
         cnj = digits(t(p, "numero_processo"))[:20]
         if len(cnj) < 18:
@@ -160,31 +176,85 @@ def main() -> int:
         dm = csv_comp.get((cnj, iso)) if iso else None
         if dm:
             nova, acao = dm, "csv_data"
-        elif cnj in prior and cur == prior[cnj]["new"] and prior[cnj]["new"] != prior[cnj]["old"]:
+        elif prior and cnj in prior and cur == prior[cnj]["new"] and prior[cnj]["new"] != prior[cnj]["old"]:
             nova, acao = prior[cnj]["old"], "reverter"; revert += 1  # desfaz a aplicacao com data errada
         else:
             continue
         if cur == nova:
             iguais += 1; continue
-        changes.append({"cnj": cnj, "data": iso, "acao": acao, "old": cur, "new": nova})
-        if args.apply:
-            try:
-                built = client._build_property_value(schema, "composicao", nova) or client._build_empty_property_value(schema, "composicao")
-                notion_request_with_retry(client, "PATCH", f"/pages/{p['id']}", json={"properties": {"composicao": built}})
-                applied += 1; time.sleep(0.1)
-            except Exception as exc:
-                failed += 1; LOGGER.warning("falha %s: %s", cnj, str(exc)[:100])
+        # NUNCA apagar composicao. Em 19/08/2026, 337 das 1325 reversoes gravaram lista vazia --
+        # o caminho era o _build_empty_property_value abaixo. Campo vazio nao e correcao: e perda.
+        if not nova:
+            vazio_bloqueado += 1
+            LOGGER.warning("recusado (gravaria vazio) %s [%s]", cnj, acao)
+            continue
+        changes.append({"cnj": cnj, "data": iso, "acao": acao, "old": cur, "new": nova,
+                        "page_id": p["id"]})
 
     run_dir = ARTIFACT_ROOT / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "changes.json").write_text(json.dumps(changes, ensure_ascii=False, indent=1), encoding="utf-8")
-    csvd = sum(1 for c in changes if c["acao"] == "csv_data")
-    LOGGER.info("RESUMO: %s | %s", json.dumps({"mode": "apply" if args.apply else "dry-run",
-                "cnj_data_csv": len(csv_comp), "mudancas": len(changes), "por_csv_data": csvd,
-                "revertidos": revert, "ja_iguais": iguais, "applied": applied, "falhas": failed}, ensure_ascii=False), run_dir)
+
+    # FREIO DE MASSA: uma rodada que queira reescrever meio mundo esta quase certamente errada.
+    teto = max(50, int(len(pages) * 0.05))
+    if args.apply and len(changes) > teto and not args.permitir_massa:
+        LOGGER.error("ABORTADO: a rodada quer mudar %d paginas (teto %d de %d). Isso e mudanca em "
+                     "massa inesperada. Confira %s e, se estiver certo, repita com --permitir-massa.",
+                     len(changes), teto, len(pages), run_dir / "changes.json")
+        _grava_summary(run_dir, args, csv_comp, changes, 0, 0, iguais, revert, vazio_bloqueado,
+                       abortado=True, teto=teto)
+        return 3
+
+    # FASE 2 -- gravar.
+    applied, failed = 0, 0
+    if args.apply:
+        for c in changes:
+            try:
+                built = client._build_property_value(schema, "composicao", c["new"])
+                if not built:  # cinto e suspensorio: a fase 1 ja recusou lista vazia
+                    vazio_bloqueado += 1
+                    continue
+                notion_request_with_retry(client, "PATCH", f"/pages/{c['page_id']}",
+                                          json={"properties": {"composicao": built}})
+                applied += 1; time.sleep(0.1)
+            except Exception as exc:
+                failed += 1; LOGGER.warning("falha %s: %s", c["cnj"], str(exc)[:100])
+
+    resumo = _grava_summary(run_dir, args, csv_comp, changes, applied, failed, iguais, revert,
+                            vazio_bloqueado)
+    LOGGER.info("RESUMO: %s | %s", json.dumps(resumo, ensure_ascii=False), run_dir)
     for c in changes[:6]:
         LOGGER.info("  [%s] %s: %s", c["acao"], c["cnj"], ", ".join(c["new"]))
     return 0
+
+
+def _grava_summary(run_dir: Path, args, csv_comp: dict, changes: list, applied: int, failed: int,
+                   iguais: int, revert: int, vazio_bloqueado: int, *, abortado: bool = False,
+                   teto: int = 0) -> dict:
+    """Grava summary.json ao lado do changes.json.
+
+    Os outros 6 pipelines do watcher gravam um; este era a excecao, e por isso a rodada de
+    19/08/2026 nao deixou registro de quantos dos 1326 PATCH deram certo (o LOGGER.info era
+    engolido pelo capture_output do watch_jurisprudencia_csv._run_one).
+    """
+    resumo = {
+        "mode": "apply" if args.apply else "dry-run",
+        "cnj_data_csv": len(csv_comp),
+        "mudancas": len(changes),
+        "por_csv_data": sum(1 for c in changes if c["acao"] == "csv_data"),
+        "revertidos": revert,
+        "ja_iguais": iguais,
+        "vazio_bloqueado": vazio_bloqueado,
+        "applied": applied,
+        "falhas": failed,
+        "permitir_reverter": bool(args.permitir_reverter),
+    }
+    if abortado:
+        resumo["abortado_por_massa"] = True
+        resumo["teto"] = teto
+    (run_dir / "summary.json").write_text(json.dumps(resumo, ensure_ascii=False, indent=1),
+                                          encoding="utf-8")
+    return resumo
 
 
 if __name__ == "__main__":
