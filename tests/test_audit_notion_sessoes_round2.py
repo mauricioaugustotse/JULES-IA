@@ -87,9 +87,14 @@ def test_partes_split_encavaladas_por_x() -> None:
         ["Ronaldo Barroso Tabosa dos Reis (recorrente) x Jeferson Anjos da Silva e outro (Recorrido)"]
     )
 
+    # O que este teste guarda e a SEPARACAO pelo " x ", nao a preservacao do papel:
+    # desde `strip_partes_roles` (04/06/2026) a parte e gravada como NOME PURO, sem
+    # "(Recorrente)"/"(Recorrido)" nem " e outro". Conferido contra a base em
+    # 19/08/2026: das 96 paginas amostradas com `partes` preenchida, ZERO trazem
+    # papel entre parenteses — se voltarem a aparecer, o bug esta no codigo, nao aqui.
     assert partes == [
-        "Ronaldo Barroso Tabosa dos Reis (Recorrente)",
-        "Jeferson Anjos da Silva e outro (Recorrido)",
+        "Ronaldo Barroso Tabosa dos Reis",
+        "Jeferson Anjos da Silva",
     ]
 
 

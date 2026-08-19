@@ -26,6 +26,7 @@ from tse_normalization import (
     canonicalize_numero_processo,
     dedupe_preserve_order,
     normalize_origem_value,
+    origem_is_generic_tre_or_state,
     parse_multi_value_text,
 )
 from tse_youtube_notion_core import (
@@ -287,8 +288,16 @@ def punchline_looks_weak_for_super_audit(row: PublishPreviewRow) -> bool:
 
 
 def origin_can_be_upgraded_from_local_text(row: PublishPreviewRow) -> str:
+    """Município lido do texto local quando a origem gravada é apenas genérica.
+
+    ATENCAO ao valor testado: a genericidade se enxerga no valor CRU, nunca no
+    normalizado. `normalize_origem_value` faz capital-fallback ("TRE/CE" ->
+    "Fortaleza/CE"), de modo que testar `normalizado.startswith("TRE/")` — como
+    esta funcao fazia — e uma condicao que NUNCA e verdadeira: o upgrade ficou
+    desligado calado desde 04/05/2026, e a base guardou a capital do estado no
+    lugar do municipio do caso (Fortaleza/CE onde era Granjeiro/CE).
+    """
     current = str(row.origem or "").strip()
-    current_normalized = normalize_origem_value(current)
     inferred = str(infer_origin_from_row_text(row) or "").strip()
     if not inferred or inferred.startswith("TRE/") or inferred == "TSE":
         return ""
@@ -296,9 +305,7 @@ def origin_can_be_upgraded_from_local_text(row: PublishPreviewRow) -> str:
         return ""
     if not current:
         return inferred
-    if current_normalized.startswith("TRE/"):
-        return inferred
-    if current_normalized != current and current_normalized and current_normalized.startswith("TRE/"):
+    if origem_is_generic_tre_or_state(current):
         return inferred
     return ""
 

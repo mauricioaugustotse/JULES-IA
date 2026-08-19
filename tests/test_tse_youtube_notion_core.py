@@ -3814,8 +3814,8 @@ def test_extract_session_windows_skips_failed_chunk_and_keeps_successful_ones(tm
             judgments=[
                 SessionWindow(
                     title_hint="AgR no REspe 0600433-71",
-                    start_seconds=1420,
-                    end_seconds=1650,
+                    start_seconds=420,
+                    end_seconds=560,
                     mentioned_process_numbers=["0600433-71"],
                 )
             ],
@@ -3900,8 +3900,8 @@ def test_extract_session_windows_uses_fallback_plan_after_primary_fail_fast(tmp_
             judgments=[
                 SessionWindow(
                     title_hint="AgR no REspe 0600433-71",
-                    start_seconds=1420,
-                    end_seconds=1650,
+                    start_seconds=660,
+                    end_seconds=715,
                     mentioned_process_numbers=["0600433-71"],
                 )
             ],
@@ -4322,7 +4322,9 @@ def test_merge_session_chunks_ignores_ceremonial_windows_and_coalesces_duplicate
     )
 
     assert merged.data_sessao == "2026-02-02"
-    assert merged.composicao == ["Ministra Cármen Lúcia", "Ministro André Mendonça"]
+    # com 2 leituras nao ha maioria a apurar: preserva as duas, ja canonizadas por
+    # normalize_ministro_name (a publicacao normalizava do mesmo jeito adiante)
+    assert merged.composicao == ["Min. Cármen Lúcia", "Min. André Mendonça"]
     assert merged.judgments[0].should_ignore is True
     assert merged.judgments[1].mentioned_process_numbers == ["0600368-79"]
     assert merged.judgments[1].start_seconds == 3082
@@ -4773,3 +4775,194 @@ def test_coerce_nongrounded_invalid_json_raises_not_masked():
     parsed = core._coerce_gemini_response_model(
         core.ProcessMetadataResult, '```json\n{"origem": "Macapá/AP"}\n```')
     assert parsed.origem == "Macapá/AP"
+
+
+# ---------------------------------------------------------------------------
+# Guardas contra DEGENERAÇÃO do modelo no scan global.
+#
+# Rodada real de 19/08/2026 (vídeo wZQ9xLxzs9E, 3694s): o gemini-3.1-flash-lite
+# entrou em loop de repetição. Para a janela 0s-300s devolveu 277 blocos vazios
+# indo até 29900s; para a janela 540s-840s, 64 blocos em passos exatos de 100s
+# até 8315s, com números CNJ FABRICADOS (63 de 64 reprovados no dígito
+# verificador). Como esses blocos traziam title_hint e número, passavam pelo
+# filtro de _merge_session_chunks e virariam 51 linhas falsas no Notion.
+# ---------------------------------------------------------------------------
+
+
+def test_cnj_check_digit_reprova_numero_fabricado():
+    from tse_normalization import cnj_check_digit_is_valid, cnj_expected_check_digit
+
+    # números reais fecham no módulo 97
+    assert cnj_check_digit_is_valid("0600504-40.2026.6.00.0000") is True
+    # série fabricada pelo modelo na rodada de 19/08/2026
+    for fabricado in (
+        "0600713-13.2026.6.00.0000",
+        "0601751-92.2026.6.00.0000",
+        "0601760-54.2026.6.00.0000",
+        "0602580-84.2026.6.00.0000",
+    ):
+        assert cnj_check_digit_is_valid(fabricado) is False
+    # número curto/parcial é INDETERMINADO, nunca "inválido": o pipeline convive
+    # com número curto legítimo, corrigido depois por SADP/DJE
+    assert cnj_check_digit_is_valid("0600504-40") is None
+    assert cnj_check_digit_is_valid("") is None
+    assert cnj_expected_check_digit("0600713-13.2026.6.00.0000") == "09"
+
+
+def test_sanitize_scan_chunk_descarta_blocos_fora_da_janela_e_do_video():
+    judgments = [
+        SessionWindow(title_hint="dentro", start_seconds=600, mentioned_process_numbers=["0600504-40"]),
+        SessionWindow(title_hint="na tolerancia", start_seconds=900),
+        SessionWindow(title_hint="longe da janela", start_seconds=2040, mentioned_process_numbers=["0600713-13"]),
+        SessionWindow(title_hint="depois do fim do video", start_seconds=8315),
+    ]
+    kept, report = core.sanitize_scan_chunk_windows(
+        judgments, window_start_seconds=540, window_end_seconds=840, duration_seconds=3694
+    )
+    assert [item.title_hint for item in kept] == ["dentro", "na tolerancia"]
+    assert report["blocos_recebidos"] == 4
+    assert report["blocos_descartados"] == 2
+    assert any("duração do vídeo" in d["motivo"] for d in report["descartados"])
+
+
+def test_sanitize_scan_chunk_preserva_bloco_que_atravessa_a_fronteira():
+    # o prompt manda devolver o timestamp absoluto mesmo quando o bloco atravessa
+    # a janela: a tolerância existe para não punir esse caso legítimo
+    judgments = [SessionWindow(title_hint="atravessa", start_seconds=430)]
+    kept, report = core.sanitize_scan_chunk_windows(
+        judgments, window_start_seconds=540, window_end_seconds=840, duration_seconds=3694
+    )
+    assert len(kept) == 1
+    assert report["blocos_descartados"] == 0
+
+
+def test_degeneration_report_reconhece_a_assinatura_do_loop():
+    degenerado = [
+        SessionWindow(
+            title_hint=f"0601{751 + i * 9}-92.2026.6.00.0000",
+            start_seconds=3510 + i * 100,
+            end_seconds=3610 + i * 100,
+            mentioned_process_numbers=[f"0601{751 + i * 9}-92.2026.6.00.0000"],
+        )
+        for i in range(20)
+    ]
+    report = core.scan_chunk_degeneration_report(
+        degenerado, window_start_seconds=540, window_end_seconds=840
+    )
+    assert report["suspeito"] is True
+    assert report["passo_constante_segundos"] == 100
+    assert report["cnj_dv_invalidos"] > report["cnj_dv_validos"]
+
+    saudavel = [
+        SessionWindow(title_hint="AgR", start_seconds=560, mentioned_process_numbers=["0600504-40.2026.6.00.0000"]),
+        SessionWindow(title_hint="REspe", start_seconds=712, mentioned_process_numbers=["0600504-40"]),
+    ]
+    assert core.scan_chunk_degeneration_report(
+        saudavel, window_start_seconds=540, window_end_seconds=840
+    )["suspeito"] is False
+
+
+def test_scan_chunk_degenerado_nao_contamina_as_janelas_da_sessao(tmp_path):
+    extractor = GeminiSessionExtractor.__new__(GeminiSessionExtractor)
+    extractor.logger = logging.getLogger("test_scan_degenerado")
+    extractor.artifact_store = RunArtifacts(tmp_path)
+
+    def fake_call_gemini(**kwargs):
+        if kwargs["start_seconds"] == 540:
+            # o loop de repetição: blocos de 100 em 100 muito além da janela
+            return SessionExtraction(
+                data_sessao="03/08/2026",
+                composicao=[],
+                judgments=[
+                    SessionWindow(
+                        title_hint=f"06017{51 + i}-92.2026.6.00.0000",
+                        start_seconds=2040 + i * 100,
+                        mentioned_process_numbers=[f"06017{51 + i}-92.2026.6.00.0000"],
+                    )
+                    for i in range(40)
+                ],
+            )
+        return SessionExtraction(
+            data_sessao="03/08/2026",
+            composicao=["Min. Nunes Marques"],
+            judgments=[
+                SessionWindow(
+                    title_hint="AgR no REspe 0600504-40",
+                    start_seconds=300,
+                    end_seconds=560,
+                    mentioned_process_numbers=["0600504-40"],
+                )
+            ],
+        )
+
+    extractor._call_gemini = fake_call_gemini
+    extractor._merge_session_chunks = GeminiSessionExtractor._merge_session_chunks.__get__(
+        extractor, GeminiSessionExtractor
+    )
+
+    original_fetch = core.fetch_youtube_duration_seconds
+    original_chunker = core.chunk_video_windows
+    try:
+        core.fetch_youtube_duration_seconds = lambda youtube_url: 900
+        core.chunk_video_windows = (
+            lambda duration_seconds, window_seconds=None, overlap_seconds=None: [(0, 300), (270, 570), (540, 840)]
+        )
+        merged = extractor._extract_session_windows("https://www.youtube.com/watch?v=abc123")
+    finally:
+        core.fetch_youtube_duration_seconds = original_fetch
+        core.chunk_video_windows = original_chunker
+
+    numeros = [n for item in merged.judgments for n in item.mentioned_process_numbers]
+    assert numeros == ["0600504-40"], f"numero fabricado vazou para as janelas: {numeros}"
+    assert (tmp_path / "raw_global_response_chunk_03.descartes.json").exists()
+    descartes = json.loads((tmp_path / "raw_global_response_chunk_03.descartes.json").read_text(encoding="utf-8"))
+    assert descartes["blocos_descartados"] == 40
+    assert descartes["degeneracao"]["suspeito"] is True
+
+
+def test_vote_composicao_descarta_ministro_citado_por_um_unico_chunk():
+    # cenário real de 19/08/2026: a UNIÃO das leituras devolveu 18 nomes para um
+    # colegiado de 7, porque cada chunk preenche o campo de memória e às vezes
+    # inventa. O elenco verdadeiro aparece em quase todas as janelas.
+    leituras = [
+        ["Min. Cássio Nunes Marques", "Min. André Mendonça", "Min. Estela Aranha"],
+        ["Min. Kássio Nunes Marques", "Min. André Mendonça", "Min. Estela Aranha"],
+        ["Min. Kassio Nunes Marques", "Min. André Mendonça", "Min. Alexandre de Moraes"],
+        ["Min. Nunes Marques", "Min. André Mendonça", "Min. Estela Aranha"],
+    ]
+    eleitos = GeminiSessionExtractor._vote_composicao(leituras)
+    # ordenado por votos e, no empate, pela primeira aparicao
+    assert eleitos == ["Min. Nunes Marques", "Min. André Mendonça", "Min. Estela Aranha"]
+    # as três grafias de ASR contam como UM ministro, e o citado uma única vez cai
+    assert "Min. Alexandre de Moraes" not in eleitos
+
+
+def test_vote_composicao_preserva_tudo_quando_ha_poucas_leituras():
+    # com 1 ou 2 leituras não há maioria a apurar (caso do fallback por transcrição)
+    assert GeminiSessionExtractor._vote_composicao(
+        [["Min. Cármen Lúcia"], ["Min. André Mendonça"]]
+    ) == ["Min. Cármen Lúcia", "Min. André Mendonça"]
+    assert GeminiSessionExtractor._vote_composicao([]) == []
+
+
+def test_resposta_truncada_do_gemini_falha_com_diagnostico_e_nao_como_erro_de_json():
+    # antes, MAX_TOKENS chegava ao log como "Invalid JSON: EOF while parsing an
+    # object at line 5188" — mandando quem lê caçar bug de formato onde houve corte
+    payload = {
+        "candidates": [
+            {"finishReason": "MAX_TOKENS", "content": {"parts": [{"text": "[{\"data_sessao\": \"3.8"}]}}
+        ]
+    }
+    with pytest.raises(RuntimeError, match="finishReason=MAX_TOKENS"):
+        core._raise_on_truncated_gemini_response(payload, model_name="gemini-3.1-flash-lite")
+    core._raise_on_truncated_gemini_response({"candidates": [{"finishReason": "STOP"}]}, model_name="x")
+
+
+def test_coerce_aceita_as_chaves_de_composicao_que_o_modelo_inventa():
+    # o GLOBAL_SYSTEM_PROMPT não nomeia a chave, então o modelo escolhe. Na rodada
+    # de 19/08/2026, 6 dos 14 chunks usaram "comissao_presente"/"ministros_presentes"
+    # e tiveram a composição inteira descartada por não constarem do mapa.
+    for chave in ("composicao", "comissao_presente", "ministros_presentes", "composicao_do_colegiado"):
+        texto = json.dumps({"data_sessao": "03/08/2026", chave: ["Min. Nunes Marques"], "julgamentos": []})
+        parsed = core._coerce_gemini_response_model(SessionExtraction, texto)
+        assert parsed.composicao == ["Min. Nunes Marques"], f"chave {chave} perdeu a composicao"

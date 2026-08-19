@@ -38,6 +38,7 @@ from tse_normalization import (
     normalize_ministro_name,
     normalize_numero_processo_display,
     normalize_origem_value,
+    origem_is_generic_tre_or_state,
     normalize_pedido_vista_value,
     normalize_resultado_final,
     normalize_session_date_to_iso,
@@ -3264,7 +3265,15 @@ def audit_existing_year(
                     {"video_id": video_id, "numero_processo": row.numero_processo, "page_id": record.page_id, "origem": row.origem}
                 )
             inferred_origin = infer_origin_from_row_text(row)
-            if origem.startswith("TRE/") and inferred_origin and _origin_specificity(inferred_origin) > _origin_specificity(origem):
+            # `origem` aqui ja passou por normalize_origem_value, que troca o rotulo
+            # do tribunal pela CAPITAL ("TRE/CE" -> "Fortaleza/CE"); testar
+            # origem.startswith("TRE/") nunca era verdadeiro e esta estatistica
+            # marcava 0 desde sempre. A genericidade se le no valor CRU.
+            if (
+                origem_is_generic_tre_or_state(row.origem)
+                and inferred_origin
+                and _origin_specificity(inferred_origin) > _origin_specificity(origem)
+            ):
                 stats["origem_downgraded_tre"] += 1
                 offenders["origem_downgraded_tre"].append(
                     {

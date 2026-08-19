@@ -1465,6 +1465,43 @@ def normalize_advogados_list(value: str | list[str], label_hint: str = "") -> st
     return ", ".join(dedupe_preserve_order(normalized))
 
 
+# ---------------------------------------------------------------------------
+# Dígito verificador do CNJ (Resolução CNJ 65/2008): NNNNNNN-DD.AAAA.J.TR.OOOO,
+# com DD = 98 - ((NNNNNNN AAAA J TR OOOO) * 100 mod 97).
+#
+# Serve de ANTIDOTO contra número FABRICADO pelo modelo: quando o Gemini
+# degenera em loop de repetição, ele emite séries de CNJ plausíveis à vista
+# ("0601751-92", "0601760-54", "0601774-38"...) que NÃO fecham no módulo 97.
+# Número real sempre fecha. Atenção: ASR corrompe dígito de número real, então
+# DV inválido isolado NÃO prova fabricação — é um sinal, ponderado junto com os
+# demais em `scan_chunk_degeneration_report`.
+# ---------------------------------------------------------------------------
+CNJ_FULL_PARTS_REGEX = re.compile(
+    r"^(?P<seq>\d{7})-(?P<dv>\d{2})\.(?P<ano>\d{4})\.(?P<seg>\d)\.(?P<tr>\d{2})\.(?P<origem>\d{4})$"
+)
+
+
+def cnj_expected_check_digit(numero: str) -> str:
+    """DV esperado para um CNJ completo, ou "" se o valor não for um CNJ completo."""
+    match = CNJ_FULL_PARTS_REGEX.match((numero or "").strip())
+    if not match:
+        return ""
+    corpo = int(
+        f"{match.group('seq')}{match.group('ano')}{match.group('seg')}"
+        f"{match.group('tr')}{match.group('origem')}"
+    )
+    return f"{98 - (corpo * 100) % 97:02d}"
+
+
+def cnj_check_digit_is_valid(numero: str) -> bool | None:
+    """True/False para CNJ completo; None quando o número é curto/parcial (indeterminado)."""
+    esperado = cnj_expected_check_digit(numero)
+    if not esperado:
+        return None
+    match = CNJ_FULL_PARTS_REGEX.match((numero or "").strip())
+    return match is not None and match.group("dv") == esperado
+
+
 def extract_full_cnj(text: str) -> str:
     match = re.search(CNJ_REGEX, normalize_text(text))
     return match.group(0) if match else ""
@@ -1604,6 +1641,42 @@ def extract_uf_from_text(text: str) -> str:
         if re.search(rf"\b{re.escape(state_name)}\b", lower):
             return STATE_UF[state_name]
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Origem GENÉRICA (rótulo de tribunal ou estado) x origem CONCRETA (município).
+#
+# Pegadinha que já custou dado errado na base: `normalize_origem_value` faz
+# capital-fallback — "TRE/CE" vira "Fortaleza/CE", "Tribunal Regional Eleitoral
+# de Sergipe" vira "Aracaju/SE". Depois disso é IMPOSSÍVEL saber, olhando só o
+# valor normalizado, se aquele município foi lido do caso ou foi chutado a
+# partir da UF: quem testar `normalizado.startswith("TRE/")` escreve uma
+# condição que nunca é verdadeira (aconteceu em super_auditor e no backfill,
+# desligando calado o upgrade de origem). A genericidade só se enxerga no valor
+# CRU — é o que esta função responde.
+# ---------------------------------------------------------------------------
+def origem_is_generic_tre_or_state(value: str) -> bool:
+    """True quando a origem crua é só rótulo de TRE ou nome/sigla de estado.
+
+    Nesses casos o município que sai de `normalize_origem_value` é a capital por
+    fallback, não o município do caso — então um município inferido do texto
+    local é MAIS específico e pode substituí-lo. Origem já concreta
+    ("Granjeiro/CE", e mesmo "Fortaleza/CE" gravada como tal) devolve False:
+    aí o valor gravado é uma leitura, e não se sobrescreve leitura por inferência.
+    """
+    raw = normalize_text(value or "").strip().rstrip(".")
+    if not raw:
+        return False
+    key = normalize_class_text(raw)
+    if key in STATE_NAME_KEYS or key in {"tribunais regionais eleitorais"}:
+        return True
+    if re.fullmatch(r"[A-Za-z]{2}", raw) and raw.upper() in UF_CAPITALS:
+        return True
+    if re.fullmatch(r"(?i)tre[-/\s]?[a-z]{2}", raw):
+        return True
+    if re.match(r"(?i)^tribunal regional eleitoral\b", raw):
+        return True
+    return False
 
 
 def normalize_origem_value(value: str) -> str:

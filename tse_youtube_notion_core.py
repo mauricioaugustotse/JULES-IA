@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -26,6 +27,7 @@ from tse_normalization import (
     build_timestamped_youtube_link,
     canonicalize_party_option_label,
     canonicalize_numero_processo,
+    cnj_check_digit_is_valid,
     resultado_allowed_for_classe,
     dedupe_preserve_order,
     extract_chunk_judgment_process_values,
@@ -279,6 +281,33 @@ def _extract_generate_content_grounding_urls(payload: dict[str, Any]) -> list[st
     return dedupe_preserve_order(urls)
 
 
+# Teto de saída por chamada. As respostas legítimas deste pipeline não passam de
+# poucos milhares de tokens (o maior raw_detail observado tem ~8 KB); o teto existe
+# para cortar CEDO a resposta degenerada em loop, que de outro modo só para no
+# limite do modelo e volta truncada — chegando ao pydantic como o críptico
+# "Invalid JSON: EOF while parsing an object at line 5188". 0 desliga o teto.
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS") or "32768")
+
+_GEMINI_TRUNCATION_REASONS = {"MAX_TOKENS", "RECITATION", "SAFETY", "PROHIBITED_CONTENT", "SPII"}
+
+
+def _raise_on_truncated_gemini_response(payload: dict[str, Any], *, model_name: str) -> None:
+    """Falha com diagnóstico quando a resposta foi CORTADA pelo servidor.
+
+    Sem isto, uma resposta truncada por maxOutputTokens só aparece como erro de
+    parsing do JSON, mandando quem lê o log caçar bug de formatação onde o que
+    houve foi corte por tamanho (tipicamente: modelo em loop de repetição).
+    """
+    for candidate in payload.get("candidates") or []:
+        reason = str(candidate.get("finishReason") or "").upper()
+        if reason and reason in _GEMINI_TRUNCATION_REASONS:
+            raise RuntimeError(
+                f"Resposta do Gemini interrompida pelo servidor (finishReason={reason}, "
+                f"modelo={model_name}). Saída truncada — não é erro de formato do JSON. "
+                "MAX_TOKENS aqui costuma indicar o modelo em loop de repetição."
+            )
+
+
 def call_gemini_generate_content_rest(
     *,
     api_key: str,
@@ -305,12 +334,16 @@ def call_gemini_generate_content_rest(
     if use_google_search:
         payload["tools"] = [{"googleSearch": {}}]
 
+    if GEMINI_MAX_OUTPUT_TOKENS > 0:
+        generation_config["maxOutputTokens"] = GEMINI_MAX_OUTPUT_TOKENS
+
     url = f"{GEMINI_REST_BASE_URL}/models/{model_name}:generateContent?key={api_key}"
     response = requests.post(url, json=payload, timeout=(10, timeout_seconds))
     if response.status_code >= 400:
         raise RuntimeError(f"Gemini REST error {response.status_code}: {response.text[:2000]}")
     response_payload = response.json()
     response_text = _extract_generate_content_text(response_payload)
+    _raise_on_truncated_gemini_response(response_payload, model_name=model_name)
     return _coerce_gemini_response_model(response_model, response_text), response_text, response_payload
 
 
@@ -319,6 +352,14 @@ GLOBAL_SCAN_OVERLAP_SECONDS = int(os.getenv("GLOBAL_SCAN_OVERLAP_SECONDS") or "3
 GLOBAL_SCAN_FAIL_FAST_CONSECUTIVE_ERRORS = int(os.getenv("GLOBAL_SCAN_FAIL_FAST_CONSECUTIVE_ERRORS") or "3")
 GLOBAL_SCAN_FALLBACK_WINDOW_SECONDS = int(os.getenv("GLOBAL_SCAN_FALLBACK_WINDOW_SECONDS") or "120")
 GLOBAL_SCAN_FALLBACK_OVERLAP_SECONDS = int(os.getenv("GLOBAL_SCAN_FALLBACK_OVERLAP_SECONDS") or "15")
+# Guardas contra DEGENERAÇÃO do modelo no scan global (loop de repetição). Em
+# 19/08/2026 o gemini-3.1-flash-lite devolveu, para a janela 540s-840s de um
+# vídeo de 3694s, 64 blocos em passos exatos de 100s indo até 8315s, com 63 de
+# 64 números CNJ reprovados no dígito verificador — série fabricada por contador.
+# A janela pedida é o contrato: bloco que cai muito fora dela é descartado.
+SCAN_WINDOW_TOLERANCE_SECONDS = int(os.getenv("SCAN_WINDOW_TOLERANCE_SECONDS") or "300")
+SCAN_VIDEO_END_TOLERANCE_SECONDS = int(os.getenv("SCAN_VIDEO_END_TOLERANCE_SECONDS") or "120")
+SCAN_DEGENERATION_MIN_BLOCKS = int(os.getenv("SCAN_DEGENERATION_MIN_BLOCKS") or "10")
 TRANSCRIPT_SCAN_MAX_CHARS = int(os.getenv("TRANSCRIPT_SCAN_MAX_CHARS") or "4000")
 TRANSCRIPT_SCAN_OVERLAP_SNIPPETS = int(os.getenv("TRANSCRIPT_SCAN_OVERLAP_SNIPPETS") or "1")
 TRANSCRIPT_SCAN_FAIL_FAST_CONSECUTIVE_ERRORS = int(os.getenv("TRANSCRIPT_SCAN_FAIL_FAST_CONSECUTIVE_ERRORS") or "2")
@@ -4163,6 +4204,15 @@ def _normalize_session_extraction_payload(payload: dict[str, Any]) -> dict[str, 
             "composição_do_colegiado": "composicao",
             "composicao_colegiado": "composicao",
             "comissao_colegiado": "composicao",
+            # o modelo escolhe livremente a chave (o GLOBAL_SYSTEM_PROMPT não a
+            # nomeia); "comissao_presente" já custou a composição inteira de um
+            # chunk, lida certa e descartada por não constar deste mapa.
+            "comissao_presente": "composicao",
+            "comissão_presente": "composicao",
+            "composicao_presente": "composicao",
+            "composição_presente": "composicao",
+            "ministros_presentes": "composicao",
+            "colegiado": "composicao",
             "julgamentos": "judgments",
             "blocos": "judgments",
         },
@@ -4178,6 +4228,102 @@ def _normalize_session_extraction_payload(payload: dict[str, Any]) -> dict[str, 
     else:
         normalized["judgments"] = []
     return normalized
+
+
+def sanitize_scan_chunk_windows(
+    judgments: list["SessionWindow"],
+    *,
+    window_start_seconds: int,
+    window_end_seconds: int,
+    duration_seconds: int | None = None,
+) -> tuple[list["SessionWindow"], dict[str, Any]]:
+    """Descarta blocos que o modelo situou FORA da janela pedida (ou do vídeo).
+
+    A janela é o contrato da chamada: o prompt manda devolver timestamps
+    ABSOLUTOS dos blocos "iniciados ou claramente identificáveis DENTRO dessa
+    janela", tolerando apenas o bloco que atravessa a fronteira. Um bloco a
+    milhares de segundos dali — ou depois do fim do vídeo — não é leitura, é
+    degeneração. Sem esta guarda o lixo passa: tem `title_hint` e número, então
+    sobrevive ao filtro de `_merge_session_chunks` e vira linha no Notion.
+
+    Devolve (blocos_mantidos, relatorio).
+    """
+    lower_bound = window_start_seconds - SCAN_WINDOW_TOLERANCE_SECONDS
+    upper_bound = window_end_seconds + SCAN_WINDOW_TOLERANCE_SECONDS
+    if duration_seconds and duration_seconds > 0:
+        upper_bound = min(upper_bound, duration_seconds + SCAN_VIDEO_END_TOLERANCE_SECONDS)
+
+    kept: list[SessionWindow] = []
+    dropped: list[dict[str, Any]] = []
+    for judgment in judgments:
+        start = coerce_seconds(judgment.start_seconds)
+        if lower_bound <= start <= upper_bound:
+            kept.append(judgment)
+            continue
+        dropped.append(
+            {
+                "start_seconds": start,
+                "end_seconds": judgment.end_seconds,
+                "title_hint": judgment.title_hint,
+                "mentioned_process_numbers": list(judgment.mentioned_process_numbers),
+                "motivo": "start_seconds fora da janela pedida"
+                if not (duration_seconds and start > duration_seconds + SCAN_VIDEO_END_TOLERANCE_SECONDS)
+                else "start_seconds além da duração do vídeo",
+            }
+        )
+
+    report = {
+        "window": [window_start_seconds, window_end_seconds],
+        "bounds_aceitos": [lower_bound, upper_bound],
+        "duration_seconds": duration_seconds,
+        "blocos_recebidos": len(judgments),
+        "blocos_mantidos": len(kept),
+        "blocos_descartados": len(dropped),
+        "descartados": dropped[:200],
+    }
+    return kept, report
+
+
+def scan_chunk_degeneration_report(
+    judgments: list["SessionWindow"],
+    *,
+    window_start_seconds: int,
+    window_end_seconds: int,
+) -> dict[str, Any]:
+    """Assinatura de loop de repetição num chunk do scan, para diagnóstico no log.
+
+    Três sinais independentes, nenhum deles conclusivo sozinho:
+    - passo constante entre blocos consecutivos (o modelo virou contador);
+    - densidade de blocos incompatível com a janela pedida;
+    - números CNJ completos reprovados no dígito verificador (módulo 97).
+    """
+    starts = [coerce_seconds(item.start_seconds) for item in judgments]
+    steps = [b - a for a, b in zip(starts, starts[1:])]
+    passo_constante = bool(steps) and len(set(steps)) == 1 and steps[0] > 0
+
+    janela = max(1, window_end_seconds - window_start_seconds)
+    densidade = len(judgments) / (janela / 60.0)
+
+    dv_validos = dv_invalidos = 0
+    for judgment in judgments:
+        for numero in judgment.mentioned_process_numbers:
+            veredito = cnj_check_digit_is_valid(numero)
+            if veredito is True:
+                dv_validos += 1
+            elif veredito is False:
+                dv_invalidos += 1
+
+    suspeito = len(judgments) >= SCAN_DEGENERATION_MIN_BLOCKS and (
+        passo_constante or densidade > 4 or dv_invalidos > max(3, dv_validos)
+    )
+    return {
+        "suspeito": suspeito,
+        "blocos": len(judgments),
+        "passo_constante_segundos": steps[0] if passo_constante else None,
+        "blocos_por_minuto_da_janela": round(densidade, 2),
+        "cnj_dv_validos": dv_validos,
+        "cnj_dv_invalidos": dv_invalidos,
+    }
 
 
 def _normalize_start_refinement_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4681,6 +4827,32 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                     ) from exc
                 continue
             consecutive_failures_without_success = 0
+
+            # Mesma guarda anti-degeneração do scan por vídeo: a janela da
+            # transcrição é o contrato da chamada, e o texto do trecho está no
+            # próprio prompt — bloco situado longe dali não é leitura.
+            kept, sanitize_report = sanitize_scan_chunk_windows(
+                chunk_result.judgments,
+                window_start_seconds=chunk.start_seconds,
+                window_end_seconds=chunk.end_seconds,
+                duration_seconds=snippets[-1].end_seconds if snippets else None,
+            )
+            if sanitize_report["blocos_descartados"]:
+                self.logger.warning(
+                    "Transcrição %s/%s (%ss-%ss): descartados %s de %s blocos fora da janela.",
+                    chunk_index,
+                    len(transcript_chunks),
+                    chunk.start_seconds,
+                    chunk.end_seconds,
+                    sanitize_report["blocos_descartados"],
+                    sanitize_report["blocos_recebidos"],
+                )
+                self.artifact_store.write_json(
+                    f"raw_transcript_response_chunk_{chunk_index:02d}.descartes.json",
+                    sanitize_report,
+                )
+            chunk_result.judgments = kept
+
             extracted_chunks.append(chunk_result)
             self.artifact_store.write_json(
                 f"raw_transcript_response_chunk_{chunk_index:02d}.json",
@@ -4772,6 +4944,7 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                     windows=windows,
                     artifact_prefix=artifact_prefix,
                     plan_label=plan_label,
+                    duration_seconds=duration_seconds,
                 )
             except Exception as exc:
                 last_error = exc
@@ -4815,6 +4988,7 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
         windows: list[tuple[int, int]],
         artifact_prefix: str,
         plan_label: str,
+        duration_seconds: int | None = None,
     ) -> list[SessionExtraction]:
         extracted_chunks: list[SessionExtraction] = []
         consecutive_failures_without_success = 0
@@ -4877,6 +5051,52 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                     ) from exc
                 continue
             consecutive_failures_without_success = 0
+
+            # GUARDA ANTI-DEGENERAÇÃO: o modelo pode responder em loop, situando
+            # blocos fora da janela pedida e até depois do fim do vídeo, com
+            # números CNJ fabricados. Esse lixo tem title_hint e número, logo
+            # sobreviveria ao filtro de _merge_session_chunks e viraria linha no
+            # Notion. Corta aqui, onde a janela pedida ainda é conhecida.
+            degeneration = scan_chunk_degeneration_report(
+                chunk_result.judgments,
+                window_start_seconds=start_seconds,
+                window_end_seconds=end_seconds,
+            )
+            kept, sanitize_report = sanitize_scan_chunk_windows(
+                chunk_result.judgments,
+                window_start_seconds=start_seconds,
+                window_end_seconds=end_seconds,
+                duration_seconds=duration_seconds,
+            )
+            if sanitize_report["blocos_descartados"]:
+                self.logger.warning(
+                    "Scan %s/%s (%ss-%ss): descartados %s de %s blocos fora da janela%s.",
+                    plan_label,
+                    chunk_index,
+                    start_seconds,
+                    end_seconds,
+                    sanitize_report["blocos_descartados"],
+                    sanitize_report["blocos_recebidos"],
+                    " (assinatura de degeneração do modelo)" if degeneration["suspeito"] else "",
+                )
+                self.artifact_store.write_json(
+                    f"{artifact_prefix}_chunk_{chunk_index:02d}.descartes.json",
+                    {"plan": plan_label, "degeneracao": degeneration, **sanitize_report},
+                )
+            elif degeneration["suspeito"]:
+                self.logger.warning(
+                    "Scan %s/%s (%ss-%ss): %s blocos dentro da janela, mas com assinatura de "
+                    "degeneração (passo=%s, CNJ com DV inválido=%s). Conferir os artifacts.",
+                    plan_label,
+                    chunk_index,
+                    start_seconds,
+                    end_seconds,
+                    degeneration["blocos"],
+                    degeneration["passo_constante_segundos"],
+                    degeneration["cnj_dv_invalidos"],
+                )
+            chunk_result.judgments = kept
+
             extracted_chunks.append(chunk_result)
             self.artifact_store.write_json(
                 f"{artifact_prefix}_chunk_{chunk_index:02d}.json",
@@ -4888,20 +5108,16 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
 
     def _merge_session_chunks(self, chunks: list[SessionExtraction]) -> SessionExtraction:
         merged = SessionExtraction(data_sessao="", composicao=[], judgments=[])
-        seen_composicao: set[str] = set()
         preferred_dates: list[str] = []
         fallback_dates: list[str] = []
         collected_windows: list[SessionWindow] = []
+        composicao_por_chunk: list[list[str]] = []
 
         for chunk in chunks:
             chunk_date = normalize_session_date_to_iso(normalize_model_text(chunk.data_sessao))
-            for ministro in chunk.composicao:
-                ministro = normalize_model_text(ministro)
-                if not ministro:
-                    continue
-                if ministro not in seen_composicao:
-                    seen_composicao.add(ministro)
-                    merged.composicao.append(ministro)
+            composicao_por_chunk.append(
+                [normalize_model_text(ministro) for ministro in chunk.composicao if normalize_model_text(ministro)]
+            )
             cleaned_chunk_windows: list[SessionWindow] = []
             for judgment in chunk.judgments:
                 judgment.title_hint = normalize_model_text(judgment.title_hint)
@@ -4930,9 +5146,46 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
             merged.data_sessao = self._pick_session_date(preferred_dates)
         elif fallback_dates:
             merged.data_sessao = self._pick_session_date(fallback_dates)
+        merged.composicao = self._vote_composicao(composicao_por_chunk)
         merged.judgments = self._coalesce_windows(collected_windows)
         merged.judgments.sort(key=lambda item: (item.start_seconds, item.title_hint))
         return merged
+
+    @staticmethod
+    def _vote_composicao(composicao_por_chunk: list[list[str]]) -> list[str]:
+        """Composição por MAIORIA entre os chunks, não por união.
+
+        A composição é lida uma vez na abertura e vale para a sessão inteira, mas
+        cada chunk responde à sua janela e o modelo preenche o campo de memória —
+        às vezes com ministro que não está ali (numa execução real de 19/08/2026
+        a união devolveu 18 nomes para um colegiado de 7, incluindo Alexandre de
+        Moraes e Isabel Gallotti, cada um citado por UM único chunk). O elenco
+        verdadeiro aparece em quase todas as leituras; o alucinado, em uma.
+        `normalize_ministro_name` unifica antes da contagem as grafias que o ASR
+        produz para o mesmo ministro (Cássio/Kássio/Kassio Nunes Marques).
+        """
+        leituras = [nomes for nomes in composicao_por_chunk if nomes]
+        if not leituras:
+            return []
+
+        votos: dict[str, int] = {}
+        primeira_aparicao: dict[str, int] = {}
+        for indice, nomes in enumerate(leituras):
+            for ministro in dedupe_preserve_order(normalize_ministro_name(nome) for nome in nomes):
+                if not ministro:
+                    continue
+                votos[ministro] = votos.get(ministro, 0) + 1
+                primeira_aparicao.setdefault(ministro, indice)
+
+        ordenados = sorted(votos, key=lambda nome: (-votos[nome], primeira_aparicao[nome]))
+        # Com 1 ou 2 leituras não há maioria a apurar: preserva tudo (é o caso do
+        # fallback por transcrição, que devolve poucos chunks).
+        if len(leituras) < 3:
+            return ordenados
+
+        corte = max(2, math.ceil(0.25 * len(leituras)))
+        eleitos = [nome for nome in ordenados if votos[nome] >= corte]
+        return eleitos or ordenados
 
     @staticmethod
     def _pick_session_date(candidates: list[str]) -> str:
