@@ -30,7 +30,10 @@ from tse_youtube_notion_core import (
 
 LOGGER = logging.getLogger("cleanup_notion_label_colors")
 ARTIFACT_ROOT = Path("artifacts") / "notion_label_colors"
-DEFAULT_PROPERTIES = ["origem", "partes"]
+# `origem` e `partes` viraram rich_text na conversao dos selects gigantes em texto:
+# nao tem mais opcao nenhuma, e auditar cor delas devolvia relatorio vazio como se
+# estivesse tudo certo. O default aponta para os selects que ainda EXISTEM.
+DEFAULT_PROPERTIES = ["tribunal", "classe_processo", "resultado", "composicao"]
 
 
 def parse_args() -> argparse.Namespace:
