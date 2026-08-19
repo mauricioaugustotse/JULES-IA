@@ -321,6 +321,7 @@ def process_single_video(
     options: BatchOptions,
     progress: Callable[[str], None],
     analysis: Any | None = None,
+    stop_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     # ``analysis`` pre-extraido (IA bruta vinda dos artefatos) pula a extracao pelo
     # Gemini e segue por TODAS as demais etapas de padronizacao iguais ao fluxo normal
@@ -416,7 +417,32 @@ def process_single_video(
         )
 
     publish_results: list[dict[str, Any]] = []
-    if options.publish:
+    # GATE DE PARADA — o pedido de parada tem de valer para o video EM CURSO, nao so
+    # para os seguintes: e no video em curso que o usuario acaba de ver o defeito no
+    # log (degeneracao do modelo, numero fabricado) e quer impedir que aquilo entre
+    # na base. A analise ja foi paga e fica inteira nos artifacts, para conferencia e
+    # reprocessamento; o que nao acontece e a ESCRITA no Notion.
+    parou_antes_de_publicar = bool(
+        options.publish and stop_event is not None and stop_event.is_set()
+    )
+    if parou_antes_de_publicar:
+        progress("parada solicitada — NADA foi publicado no Notion")
+        LOGGER.warning(
+            "[%s] Parada solicitada: %s linha(s) extraidas ficam nos artifacts e NADA foi "
+            "escrito no Notion. Para publicar depois, reprocessar o video.",
+            video.video_id,
+            len(rows),
+        )
+        artifact_store.write_json(
+            "05_publish_skipped_by_stop.json",
+            {
+                "motivo": "parada solicitada na GUI antes da publicacao",
+                "video_id": video.video_id,
+                "url": video.url,
+                "rows_extracted": len(rows),
+            },
+        )
+    elif options.publish:
         progress("publicando no Notion")
         publish_results = publish_preview_rows(rows, notion_client, notion_schema)
         artifact_store.write_json("05_publish_results.json", publish_results)
@@ -432,7 +458,7 @@ def process_single_video(
         youtube_url=video.url,
         artifact_dir=str(artifact_store.root_dir),
         rito_check=rito_count_check,
-        published=bool(options.publish),
+        published=bool(options.publish) and not parou_antes_de_publicar,
     )
     if vistoria_items:
         artifact_store.write_json("04d_vistoria_items.json", vistoria_items)
@@ -452,6 +478,7 @@ def process_single_video(
     if rito_count_check is not None:
         summary["rito_count_check"] = rito_count_check
     summary["vistoria_items"] = len(vistoria_items)
+    summary["publish_skipped_by_stop"] = parou_antes_de_publicar
     artifact_store.write_json("06_batch_video_summary.json", summary)
     return summary
 
@@ -830,15 +857,28 @@ def process_video_batch(
                 options=options,
                 progress=_progress,
                 analysis=injected_analysis,
+                stop_event=stop_event,
             )
-            summaries.append({"status": "done", **summary})
-            final_status = (
-                f"OK: {summary['created']} criadas, {summary['updated']} atualizadas, "
-                f"{summary['blocked']} bloqueadas, {summary['skipped']} ignoradas"
-            )
-            output_queue.put(("status", video.video_id, "Concluido", final_status))
-            output_queue.put(("video_finished", video.video_id, "done"))
-            LOGGER.info("[%s] %s", video.video_id, final_status)
+            if summary.get("publish_skipped_by_stop"):
+                # Nao e "done": nada foi para o Notion. Marcar como done faria o
+                # bloco de pos-publicacao considerar que houve publicacao.
+                summaries.append({"status": "stopped", **summary})
+                final_status = (
+                    f"Interrompido antes de publicar: {summary['rows_extracted']} linha(s) "
+                    "ficaram nos artifacts, NADA foi escrito no Notion"
+                )
+                output_queue.put(("status", video.video_id, "Interrompido", final_status))
+                output_queue.put(("video_finished", video.video_id, "stopped"))
+                LOGGER.warning("[%s] %s", video.video_id, final_status)
+            else:
+                summaries.append({"status": "done", **summary})
+                final_status = (
+                    f"OK: {summary['created']} criadas, {summary['updated']} atualizadas, "
+                    f"{summary['blocked']} bloqueadas, {summary['skipped']} ignoradas"
+                )
+                output_queue.put(("status", video.video_id, "Concluido", final_status))
+                output_queue.put(("video_finished", video.video_id, "done"))
+                LOGGER.info("[%s] %s", video.video_id, final_status)
         except Exception as exc:
             error_text = str(exc)
             summaries.append(
@@ -1254,8 +1294,11 @@ class BatchGuiApp:
         )
         self.start_button.pack(side=tk.LEFT)
         self.stop_button = tip(
-            ttk.Button(actions, text="Parar após vídeo atual", command=self._request_stop, state=tk.DISABLED),
-            "Pede a parada do lote: o vídeo em andamento é concluído normalmente e os seguintes não são iniciados.",
+            ttk.Button(actions, text="Parar antes de publicar", command=self._request_stop, state=tk.DISABLED),
+            "Pede a parada do lote e PROTEGE O NOTION: o vídeo em andamento termina a análise (que já foi "
+            "paga) e grava tudo nos artifacts, mas NÃO publica; os vídeos seguintes não são iniciados e os "
+            "tratamentos pós-publicação não rodam. Use ao ver defeito no log — para publicar depois, "
+            "reprocesse o vídeo.",
         )
         self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
         tip(
@@ -1675,9 +1718,10 @@ class BatchGuiApp:
 
     def _request_stop(self) -> None:
         self.stop_event.set()
-        self._append_output("\nParada solicitada — o lote encerra após o vídeo atual; "
-                            "os tratamentos pós-publicação NÃO rodarão.\n")
-        self.progress_text_var.set("Parada solicitada — encerrando após o vídeo atual "
+        self._append_output("\nParada solicitada — o vídeo em andamento termina a análise e grava os "
+                            "artifacts, mas NÃO publica no Notion; os seguintes não começam e os "
+                            "tratamentos pós-publicação NÃO rodarão.\n")
+        self.progress_text_var.set("Parada solicitada — o vídeo atual não será publicado "
                                    "(sem tratamentos pós-publicação)")
         self.stop_button.configure(state=tk.DISABLED)
 
