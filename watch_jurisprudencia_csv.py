@@ -43,6 +43,62 @@ PERM_DIR = SCRIPT_DIR / "artifacts" / "jurisprudencia_csv"   # acervo permanente
 STATE_FILE = PERM_DIR / "_watch_state.json"
 LOCK_FILE = PERM_DIR / "_watch.lock"   # guarda de instancia unica (so no modo continuo)
 DEFAULT_WATCH_DIR = r"C:\Users\mauri\OneDrive\Documentos\12 - Consultoria Legislativa\DJe"
+# Quantas vezes retentar um CSV cujo pipeline falhou antes de desistir. Sem teto, um arquivo
+# permanentemente quebrado viraria loop infinito a cada poll de 5 s.
+MAX_TENTATIVAS = 3
+# Ledger compartilhado com o ProjetoConversor (stdlib puro, importavel deste venv). Opcional:
+# se sumir, o watcher segue funcionando exatamente como antes dele existir.
+PROJETO_CONVERSOR = Path(r"C:\Users\mauri\ProjetoConversor")
+try:
+    if str(PROJETO_CONVERSOR) not in sys.path:
+        sys.path.append(str(PROJETO_CONVERSOR))
+    import dje_etapas  # type: ignore
+except Exception:  # noqa: BLE001
+    dje_etapas = None  # type: ignore
+
+
+def _geracao_agora() -> str | None:
+    """Watermark de paginas no instante da chamada (None se o ledger nao estiver disponivel)."""
+    if not dje_etapas:
+        return None
+    try:
+        return dje_etapas.geracao_paginas()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _marcar_no_ledger(hashes: list[str], geracao: str | None = None) -> None:
+    """Registra no ledger que estes CSVs foram confrontados COM a geracao de paginas vigente.
+
+    E este carimbo que permite responder depois: "nasceram paginas de sessao desde o ultimo
+    confronto?". Sem ele, o hash em `applied` dizia apenas "ja passou por aqui um dia" -- e foi
+    por isso que as 6 paginas de 19/08/2026 ficaram sem partes: o delta constava aplicado desde
+    as 09:57, e elas nasceram as 11:23.
+    """
+    if not dje_etapas or not hashes:
+        return
+    try:
+        dje_etapas.marcar("sessoes_enrich", hashes=hashes, por="watcher", geracao=geracao)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  (aviso: nao consegui registrar no ledger: {exc})")
+
+
+def _hashes_desatualizados(watch_dir: Path) -> set[str]:
+    """Hashes de CSVs ja aplicados que precisam de nova passada porque nasceram paginas depois."""
+    if not dje_etapas:
+        return set()
+    try:
+        pend = dje_etapas.pendencias(watch_dir)
+        aplicados = dje_etapas.hashes_enriquecidos()
+        alvo = set()
+        for p in pend["sessoes_enrich"]:
+            h = dje_etapas.sha256(p)
+            if h in aplicados:      # so os JA aplicados; os ineditos o fluxo normal pega
+                alvo.add(h)
+        return alvo
+    except Exception as exc:  # noqa: BLE001
+        log(f"  (aviso: nao consegui consultar o ledger: {exc})")
+        return set()
 REPORTS_DIR = SCRIPT_DIR / "artifacts" / "jurisprudencia_partes_advogados"
 PIPELINE = SCRIPT_DIR / "fill_partes_advogados_from_jurisprudencia.py"
 PIPELINE_COMP = SCRIPT_DIR / "fill_composicao_from_jurisprudencia.py"  # composicao oficial do acordao
@@ -128,6 +184,8 @@ def load_state() -> dict:
     data.setdefault("dry_run", [])    # hashes processados em dry-run
     data.setdefault("skip", [])       # hashes de arquivos que NAO sao jurisprudencia do TSE
     data.setdefault("files", {})      # hash -> nome original (para log)
+    data.setdefault("falhou", {})     # hash -> {tentativas, quando, etapas} (retentar)
+    data.setdefault("guarda", {})     # hash -> {quando, etapas} (recusado por guarda; nao retenta)
     return data
 
 
@@ -272,8 +330,14 @@ def newest_report_summary() -> dict:
         return {}
 
 
-def _run_one(path: Path, label: str, staging: Path, apply: bool, data_source_id: str | None, env: dict) -> None:
-    """Roda um pipeline (fill_*/classe/complete_cnj) sobre o staging; loga se retornar erro."""
+def _run_one(path: Path, label: str, staging: Path, apply: bool, data_source_id: str | None,
+             env: dict) -> int:
+    """Roda um pipeline (fill_*/classe/complete_cnj) sobre o staging.
+
+    Devolve o returncode. Antes esta funcao engolia a falha (so logava), e process_batch marcava
+    o CSV como `applied` de qualquer jeito -- uma etapa quebrada QUEIMAVA o arquivo, que nunca
+    mais seria reprocessado. Agora quem chama decide.
+    """
     cmd = [sys.executable, str(path), "--input-dir", str(staging), "--log-level", "WARNING"]
     if apply:
         cmd.append("--apply")
@@ -282,6 +346,7 @@ def _run_one(path: Path, label: str, staging: Path, apply: bool, data_source_id:
     proc = subprocess.run(cmd, cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True)
     if proc.returncode != 0:
         log(f"  ! {label} retornou {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-400:]}")
+    return proc.returncode
 
 
 # Todo CSV novo passa também pela detecção de FALTANTES (prefilter
@@ -325,17 +390,39 @@ def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict
     definiu qual pagina e a do julgamento conclusivo -- senao o texto vai para a pagina
     da sessao em que o julgamento foi SUSPENSO."""
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
-    _run_one(PIPELINE_CNJ, "cnj", staging, apply, data_source_id, env)
-    _run_one(PIPELINE, "partes/advogados", staging, apply, data_source_id, env)
-    _run_one(PIPELINE_COMP, "composicao", staging, apply, data_source_id, env)
-    _run_one(PIPELINE_CLASSE, "classe", staging, apply, data_source_id, env)
-    _run_one(PIPELINE_META, "metadata", staging, apply, data_source_id, env)
-    _run_one(PIPELINE_VISTA, "pedido de vista", staging, apply, data_source_id, env)
-    _run_one(PIPELINE_TEOR, "inteiro teor", staging, apply, data_source_id, env)
+    etapas = [
+        (PIPELINE_CNJ, "cnj"),
+        (PIPELINE, "partes/advogados"),
+        (PIPELINE_COMP, "composicao"),
+        (PIPELINE_CLASSE, "classe"),
+        (PIPELINE_META, "metadata"),
+        (PIPELINE_VISTA, "pedido de vista"),
+        (PIPELINE_TEOR, "inteiro teor"),
+    ]
+    falhas: list[str] = []
+    guardas: list[str] = []
+    for script, label in etapas:
+        rc = _run_one(script, label, staging, apply, data_source_id, env)
+        # rc 3 = o proprio pipeline recusou a rodada por guarda de seguranca (o freio de massa do
+        # fill_composicao). Nao e crash e nao adianta retentar -- mas TAMBEM nao pode ser tratado
+        # como sucesso: se o hash entrar em `applied`, o trabalho recusado vira invisivel e a
+        # faixa das GUIs passa a dizer "em dia" sobre uma etapa que nao rodou.
+        if rc == 3:
+            log(f"  ! {label} RECUSOU a rodada (guarda de seguranca). O CSV nao sera marcado como "
+                f"processado. Confira o changes.json e, se estiver certo, rode a mao com "
+                f"--permitir-massa.")
+            guardas.append(label)
+        elif rc != 0:
+            falhas.append(label)
     if apply:
         for csv_path in sorted(staging.glob("*.csv")):
             _run_missing_scan(csv_path, data_source_id, env)
-    return newest_report_summary()
+    resumo = dict(newest_report_summary() or {})   # copia: nao mutar o dict que veio do disco
+    if falhas:
+        resumo["_falhas"] = falhas
+    if guardas:
+        resumo["_guardas"] = guardas
+    return resumo
 
 
 def process_batch(files: list[Path], state: dict, args) -> None:
@@ -343,6 +430,11 @@ def process_batch(files: list[Path], state: dict, args) -> None:
     full-scan do Notion). Marca todos como processados no modo atual."""
     staging = Path(tempfile.mkdtemp(prefix="tse_stage_"))
     staged_hashes: list[tuple[str, str]] = []
+    # Watermark capturado ANTES do trabalho. Se fosse lido no fim, uma pagina nascida DURANTE a
+    # passada (a GUI do YouTube publicando em paralelo) entraria no carimbo sem ter sido
+    # processada -- e, como so ha reprocessamento quando a geracao avanca, ela nunca mais seria
+    # alcancada. Seria reproduzir o buraco de 19/08/2026 por outro caminho.
+    ger_inicial = _geracao_agora()
     try:
         for p in files:
             h = sha256_of(p)
@@ -361,17 +453,66 @@ def process_batch(files: list[Path], state: dict, args) -> None:
                     muda_advogados=summary.get("muda_advogados"),
                     paginas_com_mudanca=summary.get("paginas_com_mudanca"),
                     applied=summary.get("applied"), failed=summary.get("failed")))
+        falhas = (summary or {}).get("_falhas") or []
+        guardas = (summary or {}).get("_guardas") or []
         bucket = state["applied"] if args.apply else state["dry_run"]
         for h, n in staged_hashes:
+            state["files"][h] = n
+            if guardas:
+                # Recusa por guarda de seguranca: nao e falha (retentar nao adianta) nem sucesso
+                # (o trabalho nao foi feito). Bucket proprio, sem contar tentativa e sem entrar
+                # em `applied` -- o CSV continua listado como pendente ate alguem decidir.
+                state["guarda"][h] = {
+                    "quando": datetime.now().isoformat(timespec="seconds"),
+                    "etapas": guardas,
+                }
+                log(f"  ! {n}: recusado por guarda em {guardas}; NAO marcado como processado.")
+                continue
+            state["guarda"].pop(h, None)
+            if falhas:
+                # NAO marca como feito: uma etapa quebrada nao pode queimar o CSV para sempre.
+                # Retenta no proximo poll; depois de MAX_TENTATIVAS desiste com log explicito,
+                # senao um arquivo permanentemente quebrado viraria loop infinito.
+                reg = state["falhou"].setdefault(h, {"tentativas": 0})
+                reg["tentativas"] = int(reg.get("tentativas", 0)) + 1
+                reg["quando"] = datetime.now().isoformat(timespec="seconds")
+                reg["etapas"] = falhas
+                if reg["tentativas"] >= MAX_TENTATIVAS:
+                    log(f"  ! {n}: {reg['tentativas']} tentativas com falha em {falhas}. "
+                        f"Desistindo (vai para skip). Corrija e remova o hash de 'skip'.")
+                    if h not in state["skip"]:
+                        state["skip"].append(h)
+                else:
+                    log(f"  ! {n}: etapas com falha {falhas}; NAO marcado como processado "
+                        f"(tentativa {reg['tentativas']}/{MAX_TENTATIVAS}).")
+                continue
+            state["falhou"].pop(h, None)
             if h not in bucket:
                 bucket.append(h)
-            state["files"][h] = n
+        # Carimba a geracao de paginas vigente: e o que permite detectar depois que nasceram
+        # paginas novas e o confronto precisa ser refeito (o buraco de 19/08/2026).
+        if args.apply and not falhas and not guardas:
+            _marcar_no_ledger([h for h, _ in staged_hashes], geracao=ger_inicial)
         save_state(state)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def already_done(h: str, state: dict, apply: bool) -> bool:
+def already_done(h: str, state: dict, apply: bool, forcados: set[str] | None = None) -> bool:
+    """`forcados` fura o bloqueio para reprocessar um CSV ja aplicado.
+
+    Existe porque "aplicado" nao significa "terminado": os 7 pipelines refazem a consulta ao
+    Notion do zero e se auto-escopam pelos CNJ do CSV, entao reprocessar ALCANCA paginas criadas
+    depois. Sem esta valvula, uma pagina que nasce depois do confronto fica vazia para sempre.
+
+    `forcados` vem ANTES de `skip` de proposito. `skip` guarda duas coisas muito diferentes: os
+    arquivos que nem sao jurisprudencia do TSE (permanente, correto) e os que desistimos apos
+    MAX_TENTATIVAS de falha -- e essas falhas costumam ser transitorias (429/502 do Notion). Se
+    `skip` vencesse, 3 erros de rede em minutos queimariam o CSV para sempre, sem nenhum comando
+    capaz de resgata-lo a nao ser editar o _watch_state.json a mao.
+    """
+    if forcados and h in forcados:
+        return False
     if h in state["skip"]:
         return True
     if apply:
@@ -379,7 +520,7 @@ def already_done(h: str, state: dict, apply: bool) -> bool:
     return h in state["dry_run"] or h in state["applied"]
 
 
-def scan_once(watch_dir: Path, sizes: dict, state: dict, args) -> int:
+def scan_once(watch_dir: Path, sizes: dict, state: dict, args, forcados: set[str] | None = None) -> int:
     ready = stable_csvs(watch_dir, sizes)
     batch: list[Path] = []
     dirty = False
@@ -390,7 +531,7 @@ def scan_once(watch_dir: Path, sizes: dict, state: dict, args) -> int:
             dirty = dirty or len(state.get("hash_cache", {})) != antes
         except OSError:
             continue
-        if already_done(h, state, args.apply):
+        if already_done(h, state, args.apply, forcados):
             continue
         ok, why = sniff_is_tse_csv(p)
         if not ok:
@@ -419,8 +560,22 @@ def main() -> int:
     ap.add_argument("--data-source-id", default=None)
     ap.add_argument("--log-file", default="",
                     help="Redireciona a saida para este arquivo (uso da Tarefa Agendada oculta com pythonw).")
+    # --- reprocessamento: alcancar paginas criadas DEPOIS do confronto ------------------------
+    ap.add_argument("--force", action="store_true",
+                    help="Reprocessa os CSVs mesmo ja aplicados. Exige --once.")
+    ap.add_argument("--force-hash", action="append", default=None, metavar="SHA256",
+                    help="Reprocessa apenas este(s) hash(es), mesmo ja aplicado(s). Exige --once.")
+    ap.add_argument("--alcancar-novas", action="store_true",
+                    help="Reprocessa os CSVs cujo confronto ficou para tras de paginas novas "
+                         "(consulta o ledger dje_etapas). E o modo que as GUIs usam. Exige --once.")
     args = ap.parse_args()
     _setup_logging(args.log_file)
+
+    # Reprocessar em modo CONTINUO seria um loop: a cada poll de 5 s o mesmo CSV voltaria a ser
+    # aplicado, para sempre. Estas flags so fazem sentido numa passada unica.
+    if (args.force or args.force_hash or args.alcancar_novas) and not args.once:
+        ap.error("--force / --force-hash / --alcancar-novas exigem --once "
+                 "(em modo continuo virariam reprocessamento em loop a cada poll).")
 
     watch_dir = Path(args.watch_dir).resolve()
     PERM_DIR.mkdir(parents=True, exist_ok=True)
@@ -452,7 +607,43 @@ def main() -> int:
                 sizes[str(p)] = p.stat().st_size
             except OSError:
                 pass
-        n = scan_once(watch_dir, sizes, state, args)
+
+        forcados: set[str] = set()
+        if args.force:
+            for p in watch_dir.glob("*.csv"):
+                try:
+                    forcados.add(sha256_cached(p, state))
+                except OSError:
+                    pass
+            log(f"--force: {len(forcados)} CSV(s) serao reprocessados mesmo ja aplicados.")
+        if args.force_hash:
+            forcados.update(args.force_hash)
+            log(f"--force-hash: {len(args.force_hash)} hash(es) forcado(s).")
+        if args.alcancar_novas:
+            novos = _hashes_desatualizados(watch_dir)
+            forcados.update(novos)
+            log(f"--alcancar-novas: {len(novos)} CSV(s) com confronto atrasado em relacao as "
+                f"paginas ja criadas.")
+            # SEM early-return aqui. `forcados` e apenas a valvula que fura o `applied`; os CSVs
+            # INEDITOS sao pegos pelo fluxo normal do scan_once. Sair cedo por "nenhum atrasado"
+            # abandonaria um delta recem-coletado sem sequer sniffa-lo -- e o dje_ingerir logo em
+            # seguida o levaria para a base DJe, deixando as sessoes sem partes: exatamente a
+            # assimetria que este modo existe para evitar.
+
+        # O --once tambem toma o lock: a Tarefa Agendada continua vigiando a pasta e, sem isto,
+        # as duas passadas disputariam o mesmo _watch_state.json (lost update) e o mesmo rate
+        # limit do Notion.
+        if not acquire_lock():
+            # rc 4, nao 0: o contínuo NUNCA faz catch-up (scan_once sem `forcados`), entao esta
+            # passada era a unica capaz de alcancar paginas nascidas depois do confronto. Sair 0
+            # faria a GUI registrar sucesso sobre trabalho que nao aconteceu.
+            log("Ha outro watcher ativo nesta pasta; --once nao vai concorrer com ele. "
+                "O confronto NAO foi feito -- pare a Tarefa Agendada e repita, se precisar dele.")
+            return 4
+        try:
+            n = scan_once(watch_dir, sizes, state, args, forcados)
+        finally:
+            release_lock()
         log(f"--once: {n} arquivo(s) processado(s). Saindo.")
         return 0
 

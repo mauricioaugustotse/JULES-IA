@@ -62,6 +62,12 @@ try:
     import tse_acervo as tse_acervo_mod
 except Exception:  # noqa: BLE001 — a faixa e informativa; sem ela a GUI segue
     tse_acervo_mod = None
+# Ledger das etapas do DJe: diz o que JA foi feito pela outra GUI, para esta nao refazer nem
+# deixar buraco. Tambem stdlib-pura, pelo mesmo motivo acima.
+try:
+    import dje_etapas as dje_etapas_mod
+except Exception:  # noqa: BLE001
+    dje_etapas_mod = None
 
 MAX_LINKS = 10
 BATCH_ARTIFACT_ROOT = ARTIFACT_ROOT / "batch_gui"
@@ -111,8 +117,23 @@ class BatchOptions:
     # Relations no Notion (mesmo processo dentro do DJe + DJe <-> sessoes), rodadas
     # ao final da pos-publicacao. Incremental e idempotente: le a base, compara e
     # so grava o que falta. Vive em ProjetoConversor, como o tse_coletor acima.
-    atualizar_relations: bool = False
+    atualizar_relations: bool = True
     relations_script: str = r"C:\Users\mauri\ProjetoConversor\relations_manutencao.py"
+    # Etapas do freio: com --se-sujo, "ligado por padrao" nao significa 50 min por lote.
+    relations_etapas: str = "interna,cross,temas"
+    relations_max_idade_horas: float = 20.0
+    # Popular a base DJe do Notion com os CSVs pendentes, ao final do lote. Ate 19/08/2026 so a
+    # GUI "DJE Relatorios Semanais" fazia isto, e um delta coletado por aqui ficava no limbo.
+    # Roda DEPOIS de publicar (o SJUR chama OpenAI e e caro -- adiaria o primeiro video) e ANTES
+    # das relations (o cross liga DJe <-> sessoes: sem as paginas do DJe nao ha o que ligar).
+    ingerir_dje: bool = True
+    ingerir_script: str = r"C:\Users\mauri\ProjetoConversor\dje_ingerir.py"
+    # create-only: a automacao nunca sobrescreve curadoria manual. A GUI semanal, onde voce esta
+    # na frente decidindo, mantem upsert.
+    ingerir_modo: str = "create-only"
+    # Confronto dos CSVs com a base de sessoes: "pendente" (alcanca as paginas novas),
+    # "forcar" (tudo), "nao".
+    enriquecer_sessoes: str = "pendente"
 
 
 @dataclass(frozen=True)
@@ -570,35 +591,82 @@ def _gf_run_tse_update(coletor: str, max_idade_horas: float,
     return codigo
 
 
-def _gf_run_dje_once(dje_dir: str, apply: bool, output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
-    """Processa os CSVs de jurisprudencia ja presentes em DJE (modo --once) -> fill partes/advogados."""
-    import subprocess
-    cmd = [sys.executable, str(_gf_dir() / "watch_jurisprudencia_csv.py"), "--watch-dir", dje_dir, "--once"]
+def _gf_run_dje_enrich(dje_dir: str, apply: bool, modo: str,
+                       output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
+    """Confronta os CSVs do DJe com a base de SESSOES (watch_jurisprudencia_csv --once).
+
+    `modo`:
+      "pendente"  --alcancar-novas: reprocessa os CSVs cujo confronto ficou para tras das
+                  paginas ja criadas. E o padrao, e existe por causa de 19/08/2026: o watcher
+                  consumiu o delta as 09:57 e as paginas do lote nasceram as 11:23, tarde demais.
+      "forcar"    --force: reprocessa tudo o que esta na pasta, aplicado ou nao.
+      "simples"   comportamento antigo (so o que nunca passou).
+
+    Roda com sys.executable (o .venv-win) porque o watcher e deste repo -- ao contrario dos
+    outros _gf_*, que chamam scripts do ProjetoConversor. Streaming ao vivo: esta etapa leva de
+    minutos a dezenas de minutos, e antes aparecia como janela congelada (era o que escondia os
+    24 min que o fill_composicao gastava revertendo paginas).
+    """
+    cmd = [sys.executable, str(_gf_dir() / "watch_jurisprudencia_csv.py"),
+           "--watch-dir", dje_dir, "--once"]
     if apply:
         cmd.append("--apply")
-    try:
-        p = subprocess.run(cmd, cwd=str(_gf_dir()), capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=3600)
-        for ln in (p.stdout or "").splitlines()[-10:]:
-            if ln.strip():
-                output_queue.put(("log", f"[dje] {ln}\n"))
-        return p.returncode
-    except Exception as exc:
-        output_queue.put(("log", f"[dje] erro: {exc}\n")); return str(exc)
+    if modo == "pendente":
+        cmd.append("--alcancar-novas")
+    elif modo == "forcar":
+        cmd.append("--force")
+    codigo = _gf_run_streaming(cmd, "dje-sessoes", _gf_dir(), output_queue, timeout=14400)
+    if codigo == 4:
+        # Nao e sucesso: outro watcher segurava o lock e o confronto NAO rodou. Como o watcher
+        # continuo nunca alcanca paginas nascidas depois, isso deixa trabalho por fazer.
+        output_queue.put(("log", "[dje-sessoes] ATENCAO: o confronto nao rodou (ha um watcher "
+                                 "ativo). As paginas publicadas neste lote podem ficar sem "
+                                 "partes/advogados ate a proxima passada.\n"))
+    return codigo
 
 
-def _gf_run_relations(script: str, output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
+def _gf_run_dje_ingest(script: str, modo: str,
+                       output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
+    """Popula a base DJe do Notion com os CSVs pendentes (dje_ingerir.py, ProjetoConversor).
+
+    A etapa que faltava nesta GUI: ate 19/08/2026 o botao de coleta daqui depositava o delta na
+    pasta e parava, e so a GUI "DJE Relatorios Semanais" sabia ingerir. Quem grava o estado
+    continua sendo o manifesto daquela GUI -- ingerir por aqui faz o CSV aparecer como processado
+    la, sem estado paralelo.
+
+    Codigos: 0 ok · 1 falha · 2 outro processo ingerindo · 3 nada a fazer (os dois ultimos sao
+    informativos, nao erro).
+    """
+    if not Path(script).exists():
+        output_queue.put(("log", f"[dje-base] script nao encontrado: {script}\n"))
+        return "script ausente"
+    cmd = [_gf_python_com_playwright(), "-X", "utf8", script, "--modo", modo]
+    codigo = _gf_run_streaming(cmd, "dje-base", Path(script).parent, output_queue, timeout=14400)
+    if codigo == 3:
+        output_queue.put(("log", "[dje-base] base DJe ja estava em dia; nada a ingerir.\n"))
+    elif codigo == 2:
+        output_queue.put(("log", "[dje-base] outro processo esta ingerindo agora; nada feito.\n"))
+    return codigo
+
+
+def _gf_run_relations(script: str, output_queue: "queue.Queue[tuple[str, Any]]",
+                      etapas: str = "interna,cross,temas",
+                      max_idade_horas: float = 20.0) -> Any:
     """Relations no Notion via relations_manutencao.py (ProjetoConversor).
 
     Mesmo padrao de streaming do _gf_run_tse_update: roda com o Python 3.13
     global (o .venv-win desta GUI nao tem as deps de ProjetoConversor) e mostra
     a saida ao vivo. Incremental: rodadas repetidas so gravam o delta.
+
+    Com --se-sujo, roda so quando nasceram paginas ou entraram decisoes desde o ultimo sucesso.
+    E o que permite deixar relations LIGADO por padrao: o primeiro lote do dia paga os ~50 min,
+    o segundo custa 2 segundos.
     """
     if not Path(script).exists():
         output_queue.put(("log", f"[relations] script nao encontrado: {script}\n"))
         return "script ausente"
     cmd = [_gf_python_com_playwright(), "-X", "utf8", script,
-           "--etapas", "interna,cross"]
+           "--etapas", etapas, "--se-sujo", "--max-idade-horas", str(max_idade_horas)]
     return _gf_run_streaming(cmd, "relations", Path(script).parent, output_queue,
                              timeout=14400)
 
@@ -718,29 +786,63 @@ def process_video_batch(
             if not options.continue_on_error:
                 break
 
-    # ===== POS-PUBLICACAO GOING-FORWARD (so se publicou algo e nao interrompido) =====
+    # ===== POS-PUBLICACAO GOING-FORWARD =====
+    # A ORDEM AQUI E A LICAO DE 19/08/2026:
+    #   publicar -> confrontar sessoes -> popular base DJe -> relations
+    # Confrontar ANTES de publicar (que era o efeito de deixar isso com o watcher continuo)
+    # enriquece paginas que ainda nao existem: as 6 daquele dia sairam com partes vazias.
+    #
+    # Os tratamentos de dados dependem do que foi publicado e ficam sob `publicou`. As tres
+    # etapas seguintes tratam dos CSVs, nao dos videos: se o lote inteiro falhou, o delta do DJe
+    # continua precisando entrar nas bases. `stop_event` barra tudo -- e o que o botao
+    # "Parar antes de publicar" promete.
     post_publish: dict[str, Any] = {}
     publicou = any(item.get("status") == "done" for item in summaries)
-    if options.publish and publicou and not stop_event.is_set():
+    if options.publish and publicou and not stop_event.is_set() and options.post_publish_steps:
         dsid = runtime["notion_data_source_id"]
-        if options.post_publish_steps:
-            output_queue.put(("status", "__post__", "Pos-publicacao: tratamentos de dados...", ""))
-            try:
-                from post_publish_orchestrator import run_post_publish_treatments
-                post_publish["treatments"] = run_post_publish_treatments(
-                    data_source_id=dsid, apply=True, steps=list(options.post_publish_steps),
-                    logger=LOGGER, artifact_dir=run_root,
-                    log_line=lambda ln: output_queue.put(("log", ln + "\n")))
-            except Exception as exc:
-                LOGGER.warning("Pos-publicacao (dados) falhou: %s", exc)
-                post_publish["treatments_error"] = str(exc)
-        if options.watch_dje:
+        output_queue.put(("status", "__post__", "Pos-publicacao: tratamentos de dados...", ""))
+        try:
+            from post_publish_orchestrator import run_post_publish_treatments
+            post_publish["treatments"] = run_post_publish_treatments(
+                data_source_id=dsid, apply=True, steps=list(options.post_publish_steps),
+                logger=LOGGER, artifact_dir=run_root,
+                log_line=lambda ln: output_queue.put(("log", ln + "\n")))
+        except Exception as exc:
+            LOGGER.warning("Pos-publicacao (dados) falhou: %s", exc)
+            post_publish["treatments_error"] = str(exc)
+
+    # `options.publish` continua mandando: e a promessa de "nao escrever no Notion" que
+    # run_batch_videos.py --no-publish faz na propria ajuda. Tirar estas etapas de baixo dele
+    # faria um lote declaradamente somente-leitura gravar partes, criar paginas na base DJe e
+    # rodar relations. O que muda em relacao ao original e so a queda do `publicou`: elas tratam
+    # dos CSVs, nao dos videos, entao um lote que nao publicou nada ainda deve fechar as bases.
+    if options.publish and not stop_event.is_set():
+        if options.enriquecer_sessoes != "nao":
+            output_queue.put(("status", "__post__",
+                              "Confrontando os CSVs do DJe com a base de sessoes...", ""))
+            post_publish["dje_sessoes"] = _gf_run_dje_enrich(
+                options.dje_dir, options.dje_apply, options.enriquecer_sessoes, output_queue)
+        elif options.watch_dje:
+            # Modo legado (so CSVs nunca processados). Hoje so alcancavel por chamador externo
+            # que passe enriquecer_sessoes="nao" junto de watch_dje=True; a GUI usa a caixa
+            # "Pular o confronto", que produz "nao" sem ligar este ramo.
             output_queue.put(("status", "__post__", "Pos-publicacao: CSVs DJE (--once)...", ""))
-            post_publish["dje"] = _gf_run_dje_once(options.dje_dir, options.dje_apply, output_queue)
+            post_publish["dje"] = _gf_run_dje_enrich(
+                options.dje_dir, options.dje_apply, "simples", output_queue)
+
+        if options.ingerir_dje:
+            output_queue.put(("status", "__post__", "Populando a base DJe do Notion...", ""))
+            post_publish["dje_base"] = _gf_run_dje_ingest(
+                options.ingerir_script, options.ingerir_modo, output_queue)
+            output_queue.put(("etapas_mudou", None))
+
         if options.atualizar_relations:
             output_queue.put(("status", "__post__", "Pos-publicacao: relations no Notion...", ""))
-            post_publish["relations"] = _gf_run_relations(options.relations_script, output_queue)
+            post_publish["relations"] = _gf_run_relations(
+                options.relations_script, output_queue, options.relations_etapas,
+                options.relations_max_idade_horas)
         output_queue.put(("status", "__post__", "Pos-publicacao concluida.", ""))
+        output_queue.put(("etapas_mudou", None))
 
     # ===== FILA DE VISTORIA: consolida os itens do run e alimenta a fila global =====
     run_vistoria_items: list[dict[str, Any]] = []
@@ -799,6 +901,9 @@ class BatchGuiApp:
         self.output_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
+        # Threads de fundo que NAO sao o lote (coleta manual, por ora). Contador em vez de
+        # referencia porque podem coexistir; ver _is_running.
+        self._threads_avulsas = 0
         self.videos: list[VideoInput] = []
         self.batch_artifact_dir = ""
         self.resume_root: Path | None = None
@@ -825,7 +930,15 @@ class BatchGuiApp:
         self.show_advanced_var = tk.BooleanVar(value=False)
         self.acervo_l1_var = tk.StringVar(value="Acervo do TSE: consultando...")
         self.acervo_l2_var = tk.StringVar(value="")
-        self.atualizar_relations_var = tk.BooleanVar(value=False)  # pos-publicacao: relations no Notion
+        self.etapas_var = tk.StringVar(value="Etapas do DJe: consultando...")
+        # LIGADAS por padrao desde 19/08/2026. O que tornou isso viavel foi o freio --se-sujo do
+        # relations_manutencao: sem mudanca na base, a etapa custa 2 segundos em vez de ~50 min.
+        self.atualizar_relations_var = tk.BooleanVar(value=True)   # pos-publicacao: relations no Notion
+        self.ingerir_dje_var = tk.BooleanVar(value=True)           # popular a base DJe do Notion
+        # Confronto com a base de sessoes alcancando as paginas criadas neste lote. Marcar a caixa
+        # do "Avancado" troca "pendente" por "forcar" (reprocessa tudo o que esta na pasta).
+        self.forcar_sessoes_var = tk.BooleanVar(value=False)
+        self.pular_sessoes_var = tk.BooleanVar(value=False)
         self.count_var = tk.StringVar(value=f"0/{MAX_LINKS} links")
         self.progress_var = tk.DoubleVar(value=0.0)
         self.last_batch_dir, ultimo_txt = self._find_last_batch()
@@ -914,9 +1027,19 @@ class BatchGuiApp:
         self.acervo_l1.grid(row=0, column=0, sticky=tk.W)
         ttk.Label(acervo_box, textvariable=self.acervo_l2_var,
                   style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
+        # Terceira linha: o que ainda falta fazer com os CSVs ja coletados. Sem ela, um delta
+        # baixado por aqui podia ficar semanas sem entrar na base DJe sem ninguem notar -- foi
+        # exatamente o que aconteceu em 19/08/2026.
+        self.etapas_l = ttk.Label(acervo_box, textvariable=self.etapas_var, style="Muted.TLabel")
+        self.etapas_l.grid(row=2, column=0, sticky=tk.W, pady=(4, 0))
+        Tooltip(self.etapas_l,
+                "Estado das duas bases do Notion para os CSVs que estão na pasta do DJe.\n\n"
+                "É o MESMO estado que a GUI 'DJE Relatórios Semanais' enxerga: se você ingerir "
+                "por lá, aqui aparece em dia, e vice-versa.\n\n"
+                "O lote cuida disso sozinho ao final (veja o Avançado).")
         self.btn_coletar = ttk.Button(acervo_box, text="Coletar do TSE agora",
                                       command=self._coletar_tse_agora)
-        self.btn_coletar.grid(row=0, column=1, rowspan=2, sticky=tk.E)
+        self.btn_coletar.grid(row=0, column=1, rowspan=3, sticky=tk.E)
         Tooltip(self.btn_coletar,
                 "Baixa do portal do TSE as decisões publicadas desde a última coleta e as "
                 "acrescenta ao acervo consolidado.\n\n"
@@ -1059,24 +1182,42 @@ class BatchGuiApp:
 
         ttk.Separator(adv, orient="horizontal").grid(row=5, column=0, columnspan=4,
                                                      sticky="ew", pady=8)
-        ttk.Label(adv, text="Etapas extras (desligadas por padrão):",
+        ttk.Label(adv, text="Etapas de manutenção das bases (ligadas por padrão):",
                   style="Muted.TLabel").grid(row=6, column=0, columnspan=4, sticky=tk.W)
 
         tip(
             ttk.Checkbutton(adv, text="Atualizar relations no Notion (pós-publicação)",
                             variable=self.atualizar_relations_var),
             "Ao final da pós-publicação, religa as páginas do mesmo processo no Notion — dentro da base "
-            "DJe e entre DJe ↔ sessões (inclui as sessões publicadas por este lote).\nIncremental: lê a "
-            "base, compara com o que já está gravado e só escreve o que falta (~15-20 min + o delta). "
-            "Requer 'Publicar direto no Notion'.",
+            "DJe e entre DJe ↔ sessões (inclui as sessões publicadas por este lote).\nIncremental e com "
+            "freio: só roda de fato se nasceram páginas ou entraram decisões desde a última passada — "
+            "quando não mudou nada, custa 2 segundos em vez de ~50 min.",
         ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         tip(
-            ttk.Checkbutton(adv, text="Processar CSVs DJE (rodada --once)",
-                            variable=self.watch_dje_var),
-            "Roda UMA passada do confronto com os CSVs do Diário da Justiça Eletrônico ao final do lote. "
-            "Normalmente desnecessário: o monitor automático (tarefa WatchDJe_Notion) já vigia a pasta DJe "
-            "continuamente e processa qualquer CSV novo.",
+            ttk.Checkbutton(adv, text="Alimentar a base DJe do Notion (pós-publicação)",
+                            variable=self.ingerir_dje_var),
+            "Ao final do lote, joga na base DJe do Notion os CSVs que o coletor baixou e que ainda não "
+            "entraram — a mesma coisa que o '▶ Gerar relatórios' da GUI DJE Relatórios Semanais faz.\n"
+            "Detecta sozinho o que já foi feito lá: se você já tinha ingerido por aquela GUI, esta etapa "
+            "sai em um segundo dizendo 'base em dia'.\nUsa modo create-only: nunca sobrescreve curadoria "
+            "manual sua na base.",
         ).grid(row=7, column=2, columnspan=2, sticky=tk.W, padx=(14, 0), pady=(6, 0))
+        tip(
+            ttk.Checkbutton(adv, text="Reprocessar TODOS os CSVs contra a base de sessões",
+                            variable=self.forcar_sessoes_var),
+            "Normalmente desnecessário. Por padrão o lote já reconfronta os CSVs cujo processamento "
+            "ficou para trás das páginas novas — que é o caso das páginas publicadas por este próprio "
+            "lote.\nMarque para reprocessar tudo o que está na pasta do DJe, inclusive o que já estava "
+            "em dia (mais lento).",
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        tip(
+            ttk.Checkbutton(adv, text="Pular o confronto com a base de sessões",
+                            variable=self.pular_sessoes_var),
+            "Não roda o confronto dos CSVs do DJe com a base de sessões nesta rodada.\n\n"
+            "Marque só quando o watcher automático (tarefa WatchDJe_Notion) estiver ativo E você "
+            "não tiver publicado páginas novas — porque o watcher contínuo não alcança páginas "
+            "criadas depois da passada dele.",
+        ).grid(row=8, column=2, columnspan=2, sticky=tk.W, padx=(14, 0), pady=(6, 0))
 
         def _toggle_advanced(*_args: Any) -> None:
             if self.show_advanced_var.get():
@@ -1460,6 +1601,9 @@ class BatchGuiApp:
             watch_dje=bool(self.watch_dje_var.get()),
             atualizar_tse=not bool(self.pular_tse_var.get()),
             atualizar_relations=bool(self.atualizar_relations_var.get()),
+            ingerir_dje=bool(self.ingerir_dje_var.get()),
+            enriquecer_sessoes=("nao" if self.pular_sessoes_var.get()
+                                else "forcar" if self.forcar_sessoes_var.get() else "pendente"),
         )
 
     def _start_batch(self) -> None:
@@ -1541,27 +1685,53 @@ class BatchGuiApp:
         open_path(path)
 
     def _is_running(self) -> bool:
-        return bool(self.worker and self.worker.is_alive())
+        """Há trabalho pesado em andamento? Conta o lote E as threads avulsas.
+
+        Antes olhava só `self.worker`, então a thread da coleta manual escapava: dava para
+        clicar "Processar lote" com o Edge do coletor aberto, e as duas rodadas se atropelavam.
+        """
+        return bool((self.worker and self.worker.is_alive()) or self._threads_avulsas > 0)
 
     # ------------------------------------------------------ faixa: acervo do TSE
     def _atualizar_faixa_acervo(self) -> None:
-        """Repinta a faixa do acervo. Barato: só lê o estado.json do coletor."""
+        """Repinta a faixa do acervo. Barato: só lê o estado.json do coletor.
+
+        As duas linhas são independentes: a de etapas é repintada num `finally`, senão uma falha
+        do `tse_acervo` (índice sqlite corrompido, disco cheio) deixaria a linha de etapas presa
+        em "consultando..." — perdendo justo o alarme de "há um delta esquecido".
+        """
         estilos = {"ok": "Ok.TLabel", "atencao": "Hint.TLabel", "erro": "Erro.TLabel"}
-        if tse_acervo_mod is None:
-            self.acervo_l1_var.set("Acervo do TSE: indisponível")
-            self.acervo_l2_var.set(f"não consegui importar tse_acervo de {PROJETO_CONVERSOR}")
-            self.acervo_l1.configure(style="Erro.TLabel")
+        try:
+            if tse_acervo_mod is None:
+                self.acervo_l1_var.set("Acervo do TSE: indisponível")
+                self.acervo_l2_var.set(f"não consegui importar tse_acervo de {PROJETO_CONVERSOR}")
+                self.acervo_l1.configure(style="Erro.TLabel")
+                return
+            try:
+                p = tse_acervo_mod.resumo_painel()
+            except Exception as exc:  # noqa: BLE001
+                self.acervo_l1_var.set("Acervo do TSE: indisponível")
+                self.acervo_l2_var.set(str(exc)[:120])
+                self.acervo_l1.configure(style="Erro.TLabel")
+                return
+            self.acervo_l1_var.set(p["linha1"])
+            self.acervo_l2_var.set(p["linha2"])
+            self.acervo_l1.configure(style=estilos.get(p["nivel"], "Muted.TLabel"))
+        finally:
+            self._atualizar_faixa_etapas()
+
+    def _atualizar_faixa_etapas(self) -> None:
+        """Repinta a linha de etapas do DJe. Barato: só lê JSONs locais, nunca o Notion."""
+        if dje_etapas_mod is None:
+            self.etapas_var.set("Etapas do DJe: indisponível (dje_etapas não importou)")
             return
         try:
-            p = tse_acervo_mod.resumo_painel()
+            p = dje_etapas_mod.resumo_painel()
         except Exception as exc:  # noqa: BLE001
-            self.acervo_l1_var.set("Acervo do TSE: indisponível")
-            self.acervo_l2_var.set(str(exc)[:120])
-            self.acervo_l1.configure(style="Erro.TLabel")
+            self.etapas_var.set(f"Etapas do DJe: indisponível ({str(exc)[:80]})")
             return
-        self.acervo_l1_var.set(p["linha1"])
-        self.acervo_l2_var.set(p["linha2"])
-        self.acervo_l1.configure(style=estilos.get(p["nivel"], "Muted.TLabel"))
+        self.etapas_var.set(p["linha1"])
+        self.etapas_l.configure(style="Hint.TLabel" if p["nivel"] == "atencao" else "Muted.TLabel")
 
     def _coletar_tse_agora(self) -> None:
         """Coleta antecipada: adianta o acervo enquanto você prepara os links.
@@ -1584,8 +1754,10 @@ class BatchGuiApp:
                                    self.output_queue, espera_captcha=1800.0,
                                    teto_minutos=opts.tse_teto_minutos)
             finally:
+                self._threads_avulsas -= 1
                 self.output_queue.put(("acervo_mudou", None))
 
+        self._threads_avulsas += 1
         threading.Thread(target=worker, daemon=True).start()
 
     def _drain_output_queue(self) -> None:
@@ -1600,6 +1772,9 @@ class BatchGuiApp:
                     self._atualizar_faixa_acervo()
                     if not self._is_running():
                         self.btn_coletar.configure(state=tk.NORMAL)
+                elif event == "etapas_mudou":
+                    # ingestão/confronto terminou: só a terceira linha precisa repintar
+                    self._atualizar_faixa_etapas()
                 elif event == "status":
                     _, video_id, status, result = item
                     self._update_tree_status(str(video_id), str(status), str(result))
