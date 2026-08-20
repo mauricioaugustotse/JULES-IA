@@ -62,6 +62,142 @@ def _campos_da_linha(rec: dict) -> dict:
     }
 
 
+# ------------------------------------------------------------------- geometria da janela
+MARGEM_TELA = 16   # folga para a janela nao encostar nas bordas da area util
+
+
+def _area_util(win: tk.Misc, ponto: "tuple[int, int] | None" = None) -> tuple[int, int, int, int]:
+    """(x, y, largura, altura) da area util — descontada a barra de tarefas — do monitor que
+    contem `ponto`; sem `ponto`, o monitor onde esta o cursor (aquele em que o usuario clicou
+    no atalho). Quem ja tem janela na tela passa o proprio centro: o cursor pode estar noutro
+    monitor e ai a janela seria arrastada para longe de onde deveria nascer.
+
+    `winfo_screenwidth/height` do Tk so enxerga o monitor primario e ignora a barra de
+    tarefas; com dois monitores (o secundario pode ate ficar em coordenada negativa) isso
+    joga a janela na tela errada. Por isso perguntamos ao Windows: MonitorFromPoint + rcWork.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        # sem argtypes/restype explicitos o ctypes trunca o HMONITOR (handle de 64 bits)
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+        pt = wintypes.POINT()
+        if ponto is not None:
+            pt.x, pt.y, achou = int(ponto[0]), int(ponto[1]), True
+        else:
+            achou = bool(user32.GetCursorPos(ctypes.byref(pt)))
+        if achou:
+            hmon = user32.MonitorFromPoint(pt, 2)  # MONITOR_DEFAULTTONEAREST
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if hmon and user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcWork
+                if r.right > r.left and r.bottom > r.top:
+                    return r.left, r.top, r.right - r.left, r.bottom - r.top
+    except Exception:
+        pass
+    # fallback (API indisponivel/outro SO): monitor primario menos uma barra de tarefas tipica
+    return 0, 0, win.winfo_screenwidth(), max(win.winfo_screenheight() - 48, 200)
+
+
+def _encaixar_na_area(larg: int, alt: int, dec_x: int, dec_y: int,
+                      area: tuple[int, int, int, int],
+                      minimo: tuple[int, int]) -> tuple[int, int, int, int]:
+    """Calcula (largura, altura, x, y) centrados na area util. Funcao pura — testavel.
+
+    `larg`/`alt` sao da area CLIENTE e `dec_x`/`dec_y` a decoracao (bordas + barra de titulo),
+    que conta para caber na tela; `x`/`y` sao do frame, que e o que `geometry()` posiciona.
+    Se nem o tamanho minimo couber, a janela fica encostada no canto da area util — assim ao
+    menos o topo esquerdo (campos de busca) aparece, em vez de nascer metade fora da tela.
+    """
+    ax, ay, aw, ah = area
+    larg = max(min(larg, aw - dec_x - 2 * MARGEM_TELA), minimo[0])
+    alt = max(min(alt, ah - dec_y - 2 * MARGEM_TELA), minimo[1])
+    x = ax + max((aw - larg - dec_x) // 2, 0)
+    y = ay + max((ah - alt - dec_y) // 2, 0)
+    return larg, alt, x, y
+
+
+def _encaixar_dialogo(larg: int, alt: int, mestre: tuple[int, int, int, int],
+                      area: tuple[int, int, int, int]) -> tuple[int, int]:
+    """(x, y) de um dialogo centrado sobre a janela-mae `mestre` (x, y, larg, alt), preso a
+    area util. Funcao pura — testavel.
+
+    A area tem de ser a do monitor da MAE: usar a do monitor sob o cursor mistura dois
+    referenciais e o clamp deixa de corrigir a borda para arrastar o dialogo (modal!) ate a
+    outra tela — com um monitor em coordenada negativa isso acontece sempre.
+    """
+    mx, my, mw, mh = mestre
+    ax, ay, aw, ah = area
+    x = mx + (mw - larg) // 2
+    y = my + (mh - alt) // 3   # um terco, nao metade: o dialogo fica sob o topo da mae
+    # o piso vem por ultimo: um dialogo maior que a area util encosta no canto superior
+    # esquerdo (visivel) em vez de ser empurrado para coordenada negativa
+    x = max(min(x, ax + aw - larg - MARGEM_TELA), ax + MARGEM_TELA)
+    y = max(min(y, ay + ah - alt - MARGEM_TELA), ay + MARGEM_TELA)
+    return x, y
+
+
+def _centralizar_sobre(win: tk.Toplevel, mestre: tk.Misc) -> None:
+    """Centraliza um dialogo sobre a janela-mae, sem deixar que ele passe da area util."""
+    try:
+        win.update_idletasks()
+        ret = (mestre.winfo_rootx(), mestre.winfo_rooty(),
+               mestre.winfo_width(), mestre.winfo_height())
+        centro = (ret[0] + ret[2] // 2, ret[1] + ret[3] // 2)
+        x, y = _encaixar_dialogo(win.winfo_reqwidth(), win.winfo_reqheight(), ret,
+                                 _area_util(win, ponto=centro))
+        win.geometry("+%d+%d" % (x, y))
+    except Exception:
+        pass
+
+
+def _abrir_centralizado(root: tk.Tk, larg_min: int, alt_min: int) -> None:
+    """Abre a janela centralizada na tela, com tamanho suficiente para o conteudo.
+
+    Dois defeitos que isto corrige: (1) sem posicao explicita o Windows empilha as janelas em
+    CASCATA (+26 px a cada abertura), e da terceira abertura em diante o rodape nascia atras
+    da barra de tarefas; (2) o tamanho fixo era menor que o que os widgets pedem (so as sete
+    colunas da tabela somam ~1.264 px), o que cortava a ultima coluna. O tamanho passa a
+    partir do que o conteudo pede e so encolhe quando a tela nao comporta.
+    """
+    try:
+        root.attributes("-alpha", 0.0)  # nasce invisivel: mede-se tudo antes de aparecer
+    except tk.TclError:
+        pass
+    try:
+        root.update_idletasks()  # so depois disto reqwidth/reqheight valem o layout real
+        larg = max(larg_min, root.winfo_reqwidth())
+        alt = max(alt_min, root.winfo_reqheight())
+        # geometry() dimensiona a area CLIENTE mas posiciona o FRAME; sem descontar a
+        # decoracao a janela passa da borda de baixo pela altura da barra de titulo.
+        try:
+            pos = root.wm_geometry().split("+")
+            borda = max(root.winfo_rootx() - int(pos[1]), 0)
+            dec_x, dec_y = borda * 2, max(root.winfo_rooty() - int(pos[2]), 0) + borda
+        except (ValueError, IndexError):
+            dec_x, dec_y = 16, 39
+        larg, alt, x, y = _encaixar_na_area(larg, alt, dec_x, dec_y, _area_util(root),
+                                            tuple(root.wm_minsize()))
+        root.geometry("%dx%d+%d+%d" % (larg, alt, x, y))
+        root.update_idletasks()
+    except Exception:
+        root.geometry("%dx%d" % (larg_min, alt_min))  # pior caso: como era antes
+    finally:
+        try:
+            root.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
+
+
 class SadpConsultaApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -73,9 +209,10 @@ class SadpConsultaApp:
         self.match_iids: set[str] = set()
         self.filtro_termo = ""
         root.title("Consulta SADP — TSE (Acompanhamento Processual)")
-        root.geometry("1180x680")
         root.minsize(880, 480)
         self._build_ui()
+        # depois do _build_ui: a janela e dimensionada pelo que os widgets pedem
+        _abrir_centralizado(root, 1180, 680)
 
     # ---------------------------------------------------------------- UI
     def _build_ui(self) -> None:
@@ -609,8 +746,7 @@ class SadpConsultaApp:
         ttk.Label(frm, textvariable=status, foreground="#1a7a1a").grid(
             row=st["row"], column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        win.update_idletasks()
-        win.geometry("+%d+%d" % (self.root.winfo_rootx() + 60, self.root.winfo_rooty() + 80))
+        _centralizar_sobre(win, self.root)
         win.grab_set()
         self.var_status.set("Localizar no DJe: cole os campos no site, resolva o captcha e pesquise.")
 
