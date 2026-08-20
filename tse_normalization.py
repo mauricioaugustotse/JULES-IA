@@ -1536,7 +1536,11 @@ def extract_labeled_short_processo_with_class(text: str) -> str:
 def format_short_process_number_from_digits(value: str) -> str:
     digits = re.sub(r"\D", "", normalize_text(value))
     if 5 <= len(digits) <= 7:
-        return f"{digits[:-2]}-{digits[-2:]}"
+        # Zero-pad para o nucleo canonico de 7 digitos (NNNNNNN-DD): "312-46" e
+        # "0000312-46" sao o MESMO processo. Sem o pad, as chaves de dedupe e o
+        # find_existing_row nao casavam — em 13/08/2026 (video da sessao publicado em
+        # 20/08) isso criou pagina duplicada "312-46" ao lado da "0000312-46.1995".
+        return f"{digits[:-2].zfill(7)}-{digits[-2:]}"
     if len(digits) == 8:
         # Some extractions drop the fourth digit of the electoral short number,
         # e.g. 06007196 instead of 060007196. We only repair this pattern for

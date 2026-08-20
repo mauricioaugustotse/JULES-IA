@@ -410,8 +410,10 @@ RECOMPUTED_WARNING_PATTERNS = (
     re.compile(r"^(?:classe_processo|tipo_registro|eleicao|origem|tribunal|relator|pedido_vista|resultado|votacao|partes|advogados|composicao) com opções novas no Notion:", re.IGNORECASE),
     re.compile(r"^CNJ indica UF ", re.IGNORECASE),
     re.compile(r"^resultado '", re.IGNORECASE),
+    re.compile(r"^pedido_vista preenchido por auto-reparo", re.IGNORECASE),
     re.compile(r"^Tema/título vazio\.$", re.IGNORECASE),
     re.compile(r"^Número do processo não identificado;", re.IGNORECASE),
+    re.compile(r"^Número do processo incompleto ", re.IGNORECASE),
     re.compile(r"^Data da sessão não identificada em formato ISO\.$", re.IGNORECASE),
     re.compile(r"^Mais de \d+ notícias gerais informadas;", re.IGNORECASE),
     re.compile(r"^noticia_TSE descartada por indisponibilidade da página\.$", re.IGNORECASE),
@@ -3644,6 +3646,7 @@ def refine_session_windows_with_rito(
     session: SessionExtraction,
     events: list[RitoEvent],
     logger: Optional[logging.Logger] = None,
+    video_duration_seconds: Optional[int] = None,
 ) -> tuple[SessionExtraction, dict[str, Any]]:
     """Corrige o plano de janelas com os eventos do rito (100% determinístico).
 
@@ -3685,25 +3688,69 @@ def refine_session_windows_with_rito(
     # 0) Conteúdo pré-abertura: janelas que terminam antes do "declaro aberta a
     # sessão" são vinhetas institucionais/citações do telão — nunca julgamento
     # (origem dos "Julgamento 1" falsos de 23/06 a 01/07/2026).
-    opening_starts = [
-        e.start_seconds for e in events if e.kind in {"sessao_open", "admin_open"}
-    ]
-    if opening_starts:
-        session_opening = min(opening_starts)
-        for window in windows:
-            if window.should_ignore:
-                continue
-            if window_end(window) < session_opening - tolerance:
-                window.should_ignore = True
-                window.ignore_reason = "Conteúdo pré-abertura da sessão (rito na transcrição)."
+    #
+    # DUAS GUARDAS aprendidas em 20/08/2026 (video fEtIjOrLTH8, sessao 06/08):
+    # (a) um `sessao_open` a ate 120 s de um `admin_open` e TRANSICAO para a sessao
+    #     administrativa ("declaro aberta a sessao administrativa" partida entre pares
+    #     de snippets — o pop de L3589 so pega quando caem no MESMO par), nao a
+    #     abertura da sessao;
+    # (b) abertura detectada no MEIO do video (alem de max(600 s, 20% da duracao))
+    #     indica video de CONTINUACAO — julgamentos reais acontecem antes dela.
+    # Sem as guardas, o rito descartou 4 julgamentos reais (t=540..1064) porque a
+    # unica "abertura" achada estava em t=1480 de 2878 s (51% do video).
+    admin_open_starts = [e.start_seconds for e in events if e.kind == "admin_open"]
+    opening_starts = []
+    for e in events:
+        if e.kind == "admin_open":
+            opening_starts.append(e.start_seconds)
+        elif e.kind == "sessao_open":
+            if any(abs(e.start_seconds - a) <= 120 for a in admin_open_starts):
                 report["adjustments"].append(
                     {
-                        "type": "ignore_pre_session",
-                        "title_hint": window.title_hint,
-                        "start_seconds": int(window.start_seconds),
-                        "reason": window.ignore_reason,
+                        "type": "sessao_open_descartado_transicao_admin",
+                        "start_seconds": int(e.start_seconds),
+                        "reason": "sessao_open colado em admin_open: transição para a "
+                                  "sessão administrativa, não abertura da sessão.",
                     }
                 )
+                continue
+            opening_starts.append(e.start_seconds)
+    if opening_starts:
+        session_opening = min(opening_starts)
+        if video_duration_seconds and video_duration_seconds > 0:
+            teto_abertura = max(600, int(video_duration_seconds * 0.20))
+        else:
+            teto_abertura = 900  # sem duracao conhecida: 15 min e generoso para a abertura
+        if session_opening > teto_abertura:
+            report["adjustments"].append(
+                {
+                    "type": "pre_session_anchor_ignorado_meio_do_video",
+                    "start_seconds": int(session_opening),
+                    "reason": f"Abertura detectada em t={session_opening}s, além do teto de "
+                              f"{teto_abertura}s: vídeo de continuação — janelas anteriores "
+                              f"preservadas.",
+                }
+            )
+            log.info(
+                "Rito: abertura em t=%ss (teto %ss) — vídeo de continuação; "
+                "nenhuma janela descartada como pré-abertura.",
+                session_opening, teto_abertura,
+            )
+        else:
+            for window in windows:
+                if window.should_ignore:
+                    continue
+                if window_end(window) < session_opening - tolerance:
+                    window.should_ignore = True
+                    window.ignore_reason = "Conteúdo pré-abertura da sessão (rito na transcrição)."
+                    report["adjustments"].append(
+                        {
+                            "type": "ignore_pre_session",
+                            "title_hint": window.title_hint,
+                            "start_seconds": int(window.start_seconds),
+                            "reason": window.ignore_reason,
+                        }
+                    )
 
     # 1) Resgate da sessão administrativa.
     if admin_opens:
@@ -3838,6 +3885,37 @@ def refine_session_windows_with_rito(
         current_segment = seg
         current_group = [window]
     flush_group()
+
+    # 4) Estende janelas ativas ate a PROCLAMACAO do segmento. Janela que corta antes
+    # da proclamacao deixa o Gemini sem o desfecho — em 13/08 e 18/08/2026 isso publicou
+    # "Suspenso"/"Suspenso por vista" para julgamentos que terminaram (o 0600015-33 tinha
+    # a proclamacao em t=4708 e a janela acabava em 4668). Teto de 600 s de extensao para
+    # nao engolir o julgamento vizinho em caso de segmento mal fechado.
+    for window in result_windows:
+        if window.should_ignore:
+            continue
+        seg = segment_index(window)
+        if seg is None:
+            continue
+        seg_end = segments[seg][1]
+        if seg_end >= 10**9:
+            continue
+        w_end = window_end(window)
+        if w_end < seg_end <= w_end + 600:
+            report["adjustments"].append(
+                {
+                    "type": "extend_to_proclamacao",
+                    "title_hint": window.title_hint,
+                    "start_seconds": int(window.start_seconds),
+                    "reason": f"end estendido de {w_end}s para {seg_end + 15}s "
+                              f"(proclamação do segmento em {seg_end}s).",
+                }
+            )
+            window.end_seconds = int(seg_end) + 15
+            log.info(
+                "Rito: janela '%s' estendida até a proclamação (t=%s).",
+                window.title_hint or "sem título", seg_end,
+            )
 
     updated.judgments = result_windows
     report["windows_after"] = len(result_windows)
@@ -4589,8 +4667,23 @@ class GeminiSessionExtractor:
             rito_report: dict[str, Any] = {"transcript_available": bool(snippets)}
             if snippets:
                 events = detect_rito_events(snippets)
+                # Duracao do video: essencial para a guarda anti-"abertura no meio do
+                # video" (fEtIjOrLTH8, 20/08/2026). Vem do scan; fallback: fim da
+                # transcricao.
+                duration: Optional[int] = None
+                try:
+                    if self.artifact_store.exists("00_scan_windows.json"):
+                        duration = int(
+                            (self.artifact_store.read_json("00_scan_windows.json") or {})
+                            .get("duration_seconds") or 0
+                        ) or None
+                except Exception:  # noqa: BLE001
+                    duration = None
+                if duration is None:
+                    duration = int(snippets[-1].end_seconds) or None
                 session, refinement_report = refine_session_windows_with_rito(
-                    session, events, logger=self.logger
+                    session, events, logger=self.logger,
+                    video_duration_seconds=duration,
                 )
                 rito_report.update(refinement_report)
             self.artifact_store.write_json("01b_rito_refinement.json", rito_report)
@@ -5866,6 +5959,12 @@ class GeminiNewsEnricher:
                     domain_label="TSE",
                     artifact_name=f"06_news_repair_tse_{index:02d}.txt",
                 )
+                # O reparo pode devolver URL de OUTRO dominio (em 20/08/2026 um link do
+                # mpf.mp.br entrou como noticia_TSE por aqui). So tse.jus.br sobrevive.
+                repaired_tse_urls = [
+                    u for u in repaired_tse_urls
+                    if TSE_DOMAIN_RE.search(domain_from_url(u) or "")
+                ]
                 valid_tse_urls, extra_dropped_tse_urls, extra_irrelevant_tse_urls = filter_relevant_institutional_news_urls(repaired_tse_urls, row)
                 dropped_tse_urls = dedupe_preserve_order(dropped_tse_urls + extra_dropped_tse_urls)
                 irrelevant_tse_urls = dedupe_preserve_order(irrelevant_tse_urls + extra_irrelevant_tse_urls)
@@ -5877,6 +5976,11 @@ class GeminiNewsEnricher:
                     domain_label="TRE",
                     artifact_name=f"06_news_repair_tre_{index:02d}.txt",
                 )
+                # mesma guarda de dominio do ramo TSE: so tre-XX.jus.br sobrevive ao reparo
+                repaired_tre_urls = [
+                    u for u in repaired_tre_urls
+                    if TRE_DOMAIN_RE.search(domain_from_url(u) or "")
+                ]
                 valid_tre_urls, extra_dropped_tre_urls, extra_irrelevant_tre_urls = filter_relevant_institutional_news_urls(repaired_tre_urls, row)
                 dropped_tre_urls = dedupe_preserve_order(dropped_tre_urls + extra_dropped_tre_urls)
                 irrelevant_tre_urls = dedupe_preserve_order(irrelevant_tre_urls + extra_irrelevant_tre_urls)
@@ -6460,15 +6564,19 @@ class NotionSessoesClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         response: requests.Response | None = None
-        for attempt in range(4):
+        # 6 tentativas com backoff ate ~30 s (total ~60 s): as rajadas de
+        # ConnectionResetError 10054 / 504 do Notion duram MINUTOS (medido em
+        # 20/08/2026, quando o backoff de ~9 s derrubou uma publicacao no meio).
+        max_attempts = 6
+        for attempt in range(max_attempts):
             try:
                 response = self.session.request(method, self.base_url + path, timeout=60, **kwargs)
             except requests.RequestException:
-                if attempt >= 3:
+                if attempt >= max_attempts - 1:
                     raise
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(min(30.0, 2.0 * (2 ** attempt)))
                 continue
-            if response.status_code == 429 and attempt < 3:
+            if response.status_code == 429 and attempt < max_attempts - 1:
                 retry_after = response.headers.get("Retry-After")
                 try:
                     sleep_seconds = float(retry_after) if retry_after else 1.5 * (attempt + 1)
@@ -6476,8 +6584,8 @@ class NotionSessoesClient:
                     sleep_seconds = 1.5 * (attempt + 1)
                 time.sleep(max(sleep_seconds, 0.5))
                 continue
-            if response.status_code >= 500 and attempt < 3:
-                time.sleep(1.5 * (attempt + 1))
+            if response.status_code >= 500 and attempt < max_attempts - 1:
+                time.sleep(min(30.0, 2.0 * (2 ** attempt)))
                 continue
             break
         if response is None:
@@ -7163,11 +7271,30 @@ class NotionSessoesClient:
         schema: NotionDataSourceSchema,
         youtube_link: str,
         numero_processo: str,
+        data_sessao: str = "",
     ) -> Optional[NotionRowMatch]:
         candidates: list[dict[str, Any]] = []
         numero_filter = self.build_filter_condition(schema, "numero_processo", numero_processo)
         if numero_filter:
             candidates.extend(self.query_data_source(numero_filter))
+        # A igualdade exata NAO enxerga a mesma pagina gravada com o numero em outra
+        # forma — nos DOIS sentidos: query curta × base completa (o chamador passa o
+        # canonico "0600504-40" e a pagina guarda "0600504-40.2026.6.00.0000"; foi o que
+        # duplicou a sessao 03/08 inteira em 20/08/2026) e query completa × base curta.
+        # Busca tambem por CONTEM o nucleo curto canonico, SEMPRE que ele exista; a
+        # comparacao canonica logo abaixo decide se e a mesma pagina.
+        short_core = canonicalize_numero_processo(numero_processo)
+        if short_core:
+            prop = schema.properties.get("numero_processo")
+            if prop is not None and prop.type in {"rich_text", "title"}:
+                contains_filter = {
+                    "property": "numero_processo",
+                    prop.type: {"contains": short_core},
+                }
+                try:
+                    candidates.extend(self.query_data_source(contains_filter))
+                except Exception:  # noqa: BLE001
+                    pass  # busca auxiliar: a exata e o youtube_link continuam valendo
         if youtube_link:
             youtube_filter = self.build_filter_condition(schema, "youtube_link", youtube_link)
             if youtube_filter:
@@ -7200,6 +7327,21 @@ class NotionSessoesClient:
                     page_id=candidate.get("id", ""),
                     url=candidate.get("url", ""),
                 )
+            # Mesmo numero + MESMA data de sessao, mas video diferente: e a mesma sessao
+            # dividida em partes (transmissao em dois videos). Sem este ramo, o processo
+            # publicado pela parte 1 era recriado pela parte 2 — origem das duplicatas da
+            # sessao de 13/08/2026. Sessoes DISTINTAS do mesmo processo continuam gerando
+            # paginas separadas (a data difere).
+            if candidate_numero == normalized_numero and data_sessao:
+                candidate_sessao = ""
+                if "data_sessao" in schema.properties:
+                    candidate_sessao = self._extract_property_text(
+                        candidate, schema, "data_sessao")[:10]
+                if candidate_sessao and candidate_sessao == str(data_sessao)[:10]:
+                    return NotionRowMatch(
+                        page_id=candidate.get("id", ""),
+                        url=candidate.get("url", ""),
+                    )
         return None
 
     def _build_property_value(
@@ -7304,6 +7446,38 @@ class NotionSessoesClient:
         return self._write_row_with_schema_recovery(schema, row, page_id=page_id)
 
 
+def _extract_vista_minister(texto: str, composicao: list[str]) -> str:
+    """Ministro do pedido de vista, garimpado no texto extraido (melhor esforco).
+
+    Primeiro procura um nome da COMPOSICAO a ate ~80 caracteres da palavra "vista"
+    (isolada, para nao casar "prevista"/"revista"); depois um padrao generico
+    "Min. Fulano ... vista" / "vista ... Min. Fulano". Devolve "" quando nao acha —
+    quem chama decide o fallback.
+    """
+    if not texto:
+        return ""
+    for membro in composicao or []:
+        nome = re.sub(r"^min(?:istr[oa])?\.?\s*", "", str(membro or ""),
+                      flags=re.IGNORECASE).strip()
+        if len(nome) < 4:
+            continue
+        alvo = re.escape(nome)
+        # janela de ate ~60 caracteres QUAISQUER entre "vista" e o nome ("pedido de
+        # vista do Ministro Fulano" tem palavras no meio, nao so pontuacao)
+        if re.search(rf"\bvistas?\b[\s\S]{{0,60}}?{alvo}|{alvo}[\s\S]{{0,60}}?\bvistas?\b",
+                     texto, re.IGNORECASE):
+            return f"Min. {nome}"
+    m = re.search(
+        r"Min(?:istr[oa])?\.?\s+([A-ZÀ-Ý][\wÀ-ÿ.'-]+(?:\s+(?:d[aeo]s?\s+)?[A-ZÀ-Ý][\wÀ-ÿ.'-]+){0,3})[\s\S]{0,60}?\bvistas?\b"
+        r"|\bvistas?\b[\s\S]{0,60}?Min(?:istr[oa])?\.?\s+([A-ZÀ-Ý][\wÀ-ÿ.'-]+(?:\s+(?:d[aeo]s?\s+)?[A-ZÀ-Ý][\wÀ-ÿ.'-]+){0,3})",
+        texto)
+    if m:
+        nome = (m.group(1) or m.group(2) or "").strip().rstrip(".,;")
+        if nome:
+            return f"Min. {nome}"
+    return ""
+
+
 def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
     """Checagens determinísticas de coerência para a base servir de RAG.
 
@@ -7311,6 +7485,16 @@ def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
     padrões RECOMPUTED_*, então revalidações não acumulam duplicatas.
     """
     digits = re.sub(r"\D", "", str(row.numero_processo or ""))
+    # Numero sem letras (nao e "PA 19" e afins) com menos digitos que o nucleo curto
+    # eleitoral (NNNNNNN-DD = 9): extracao truncada. O zero-pad da canonicalizacao ja
+    # evita a duplicata ("312-46" ≡ "0000312-46"), mas o valor gravado segue incompleto
+    # e merece vistoria — as duplicatas de 13/08/2026 vieram com as demais colunas
+    # erradas junto.
+    if 0 < len(digits) < 9 and not re.search(r"[A-Za-z]", str(row.numero_processo or "")):
+        row.add_warning(
+            f"Número do processo incompleto ({len(digits)} dígito(s): "
+            f"'{row.numero_processo}') — conferir na vistoria."
+        )
     if len(digits) == 20 and digits[13] == "6":
         tr_code = digits[14:16]
         tribunal = str(row.tribunal or "").strip().upper()
@@ -7332,10 +7516,26 @@ def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
                     f"CNJ indica UF {uf}; " + " e ".join(divergencias) + " divergem — conferir na vistoria."
                 )
     if row.resultado == "Suspenso por vista" and not row.pedido_vista:
-        if any(warning.startswith("Aprovado em vistoria") for warning in row.warnings):
+        # AUTO-REPARO antes de bloquear (20/08/2026): a inconsistencia e da EXTRACAO, nao
+        # do julgamento — o 0600870-47 (Medina/MG, sessao 18/08) foi extraido completo e
+        # sumiu do Notion por causa do bloqueio silencioso. Tenta achar o ministro da
+        # vista no proprio texto extraido; nao achando, publica com a lacuna sinalizada
+        # (a vistoria corrige depois). Bloquear julgamento real e pior que publicar com
+        # lacuna visivel.
+        texto_busca = " ".join(filter(None, [
+            row.votacao, row.analise_do_conteudo_juridico, row.raciocinio_juridico]))
+        ministro_vista = _extract_vista_minister(texto_busca, row.composicao)
+        if ministro_vista:
+            row.pedido_vista = ministro_vista
+            row.add_warning(
+                f"pedido_vista preenchido por auto-reparo ({ministro_vista}) — conferir na vistoria.")
+        elif any(warning.startswith("Aprovado em vistoria") for warning in row.warnings):
             row.add_warning("resultado 'Suspenso por vista' sem pedido_vista (aceito em vistoria).")
         else:
-            row.add_error("resultado 'Suspenso por vista' sem pedido_vista identificado.")
+            row.pedido_vista = "(ministro não identificado)"
+            row.add_warning(
+                "resultado 'Suspenso por vista' sem ministro da vista identificado — "
+                "publicado com lacuna; conferir na vistoria.")
     allowed = resultado_allowed_for_classe(row.classe_processo)
     if allowed is not None and row.resultado and row.resultado not in allowed:
         row.add_warning(
@@ -7758,6 +7958,9 @@ def build_preview_rows(
                         notion_schema,
                         youtube_link=build_video_only_youtube_link(row.youtube_link),
                         numero_processo=canon_num,
+                        # mesma sessao em outro video (transmissao em partes) e a MESMA
+                        # pagina — ver find_existing_row
+                        data_sessao=row.data_sessao,
                     )
                 else:
                     # Sem numero: identidade pela URL EXATA (com timestamp) do julgamento,

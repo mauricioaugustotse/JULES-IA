@@ -197,9 +197,16 @@ def save_state(state: dict) -> None:
 def _pid_alive(pid: int) -> bool:
     """True se o processo `pid` ainda existe (Windows e POSIX).
 
-    Atencao: no Windows, os.kill(pid, 0) NAO e uma checagem inocua de vida -- o sinal 0
+    Atencao (1): no Windows, os.kill(pid, 0) NAO e uma checagem inocua de vida -- o sinal 0
     e interpretado como CTRL_C_EVENT, falha para um PID arbitrario e daria 'morto' para
-    processo vivo. Por isso usamos a API Win32 (OpenProcess + WaitForSingleObject)."""
+    processo vivo. Por isso usamos a API Win32 (OpenProcess + WaitForSingleObject).
+
+    Atencao (2): ACCESS_DENIED no OpenProcess NAO prova vida. Medido em 20/08/2026: o PID
+    48064, morto havia horas, devolvia ACCESS_DENIED em toda chamada -- o lock ficou eterno,
+    a Tarefa Agendada saiu na hora por um dia inteiro e nenhum confronto rodou (as paginas
+    do lote das 12:46 ficaram sem partes/advogados). Sem handle, a palavra final e do
+    tasklist: vivo SO se a linha do PID existir E for de um python -- o mesmo criterio
+    anti-PID-reciclado de dje_etapas.trava (ProjetoConversor)."""
     if pid <= 0:
         return False
     if os.name == "nt":
@@ -213,17 +220,27 @@ def _pid_alive(pid: int) -> bool:
             kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
             SYNCHRONIZE = 0x00100000
             WAIT_TIMEOUT = 0x00000102
-            ERROR_ACCESS_DENIED = 5
             handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-            if not handle:
-                # sem handle: ACCESS_DENIED => existe (outro contexto); demais => nao existe
-                return ctypes.get_last_error() == ERROR_ACCESS_DENIED
-            try:
-                return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:
-            return True  # erro inesperado: assume vivo (conservador, evita 2 watchers)
+            if handle:
+                try:
+                    return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+                finally:
+                    kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            pass  # cai para a confirmacao via tasklist
+        # Sem handle (ACCESS_DENIED ou PID livre): exigir confirmacao POSITIVA.
+        # encoding="oem": o tasklist responde no codepage do console (cp850); em modo UTF-8
+        # (-X utf8) o text=True sem encoding estoura no 'Ç' de "INFORMAÇÕES: nenhuma tarefa".
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, encoding="oem",
+                errors="replace", timeout=30,
+            ).stdout or ""
+            linha = next((l for l in out.splitlines() if str(pid) in l), "")
+            return "python" in linha.lower()
+        except Exception:  # noqa: BLE001
+            return True  # tasklist indisponivel: assume vivo (conservador, evita 2 watchers)
     try:
         os.kill(pid, 0)
     except OSError:
@@ -233,20 +250,52 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+# Teto de idade do lock, independente da deteccao de PID: o arquivo e reescrito a cada
+# aquisicao, entao um lock intocado ha um dia nao pertence a nenhum watcher legitimo.
+# E a segunda linha de defesa contra o lock eterno de 19-20/08/2026.
+LOCK_MAX_AGE_H = 24.0
+
+
+def _lock_owner_pid() -> int:
+    """PID gravado no lock. Le o formato novo (JSON {pid, iso, argv}) e o antigo (PID cru)."""
+    raw = LOCK_FILE.read_text(encoding="utf-8").strip()
+    try:
+        return int((json.loads(raw) or {}).get("pid") or 0)
+    except Exception:  # noqa: BLE001
+        try:
+            return int(raw or "0")
+        except Exception:  # noqa: BLE001
+            return 0
+
+
 def acquire_lock() -> bool:
     """Guarda de instancia unica para o modo continuo. Retorna False se ja ha um watcher
-    vivo (e o chamador deve sair). Lock orfao (PID morto) e sobrescrito."""
+    vivo (e o chamador deve sair). Lock orfao (PID morto ou velho demais) e sobrescrito,
+    com registro no log — para o proximo incidente ser legivel."""
     PERM_DIR.mkdir(parents=True, exist_ok=True)
     if LOCK_FILE.exists():
         try:
-            other = int((LOCK_FILE.read_text(encoding="utf-8").strip() or "0"))
-        except Exception:
+            other = _lock_owner_pid()
+        except Exception:  # noqa: BLE001
             other = 0
+        try:
+            idade_h = (time.time() - LOCK_FILE.stat().st_mtime) / 3600
+        except OSError:
+            idade_h = 0.0
         if other and other != os.getpid() and _pid_alive(other):
-            log(f"Ja existe um watcher rodando (PID {other}). Saindo.")
-            return False
-        # lock orfao (processo morto ou ilegivel): sobrescreve
-    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+            if idade_h > LOCK_MAX_AGE_H:
+                log(f"Lock com {idade_h:.1f}h (PID {other}) passou do teto de "
+                    f"{LOCK_MAX_AGE_H:.0f}h; cedendo a vaga.")
+            else:
+                log(f"Ja existe um watcher rodando (PID {other}). Saindo.")
+                return False
+        elif other:
+            log(f"Lock orfao de PID {other} cedido (processo morto).")
+    LOCK_FILE.write_text(json.dumps({
+        "pid": os.getpid(),
+        "iso": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "argv": sys.argv[1:],
+    }, ensure_ascii=False), encoding="utf-8")
     return True
 
 
@@ -254,8 +303,8 @@ def release_lock() -> None:
     try:
         if LOCK_FILE.exists():
             try:
-                owner = int((LOCK_FILE.read_text(encoding="utf-8").strip() or "0"))
-            except Exception:
+                owner = _lock_owner_pid()
+            except Exception:  # noqa: BLE001
                 owner = os.getpid()
             if owner == os.getpid():
                 LOCK_FILE.unlink()

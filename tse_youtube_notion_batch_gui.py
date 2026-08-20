@@ -44,7 +44,8 @@ from tse_youtube_notion_core import (
     require_youtube_transcript_api,
     validate_preview_row,
 )
-from tse_normalization import infer_session_date_from_video_title
+from tse_normalization import (infer_session_date_from_video_title,
+                               normalize_numero_processo_display)
 
 import vistoria_queue
 
@@ -211,6 +212,31 @@ def item_has_strong_evidence(item: dict[str, Any]) -> bool:
 def item_video_link(item: dict[str, Any]) -> str:
     row = item.get("row") or {}
     return str(row.get("youtube_link") or item.get("youtube_url") or "")
+
+
+def vistoria_item_numero_display(item: dict[str, Any]) -> str:
+    """Numero do processo de um item da fila, LEGIVEL para decidir.
+
+    Ordem: campo estruturado (row/extra.dje/hint); nao havendo, pesca o numero das
+    `reasons` (os itens `faltante_dje` trazem o CNJ so no texto do motivo — na tela
+    apareciam como "(sem número)", visto em 20/08/2026). Sempre formata: 20 digitos
+    crus viram NNNNNNN-DD.AAAA.J.TR.OOOO.
+    """
+    row = item.get("row") or {}
+    dje = (item.get("extra") or {}).get("dje") or {}
+    bruto = str(row.get("numero_processo") or dje.get("numeroUnico")
+                or item.get("numero_hint") or "")
+    if not bruto.strip():
+        texto = " ".join(str(r) for r in item.get("reasons") or [])
+        m = re.search(r"\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b|\b\d{20}\b|\b\d{7}-\d{2}\b", texto)
+        bruto = m.group(0) if m else ""
+    if not bruto.strip():
+        return ""
+    digits = re.sub(r"\D", "", bruto)
+    if len(digits) == 20:
+        return (f"{digits[0:7]}-{digits[7:9]}.{digits[9:13]}."
+                f"{digits[13]}.{digits[14:16]}.{digits[16:20]}")
+    return normalize_numero_processo_display(bruto) or bruto
 
 
 def item_timestamp_seconds(item: dict[str, Any]) -> int | None:
@@ -558,9 +584,15 @@ def _gf_run_streaming(cmd: list[str], prefixo: str, cwd: Path,
     """
     import subprocess
     try:
+        # CREATE_NO_WINDOW: como esta GUI roda sob pythonw, o python.exe filho ganhava um
+        # console proprio — uma janela preta que, fechada pelo usuario, mandava CTRL_CLOSE
+        # a toda a arvore (0xC000013A). Foi o que matou o relations em 20/08/2026, deixando
+        # lock orfao e a etapa 'cross' sem rodar. Sem janela, nao ha o que fechar.
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         p = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1,
                              encoding="utf-8", errors="replace",
+                             creationflags=flags,
                              env={**os.environ, "PYTHONIOENCODING": "utf-8"})
         assert p.stdout is not None
         for ln in p.stdout:
@@ -851,6 +883,29 @@ def process_video_batch(
         output_queue.put(("status", "__post__", "Pos-publicacao concluida.", ""))
         output_queue.put(("etapas_mudou", None))
 
+    # Falhas das etapas pos-publicacao NAO podem sumir no "0 com erro" do resumo: em
+    # 20/08/2026 o relations morreu com 0xC000013A (janela de console fechada) e o lote
+    # fechou "4 concluidos, 0 com erro" — o usuario so descobriu fuçando o JSON. Codigos
+    # informativos por etapa: dje_sessoes 4 = watcher residente com o lock (adiado);
+    # dje_base 2 = outra ingestao em curso, 3 = nada a fazer.
+    _POST_OK: dict[str, set] = {
+        "dje_sessoes": {0, 4}, "dje": {0, 4}, "dje_base": {0, 2, 3}, "relations": {0},
+    }
+    post_publish_falhas = sorted(
+        etapa_nome for etapa_nome, codigo in post_publish.items()
+        if etapa_nome in _POST_OK and not (
+            isinstance(codigo, int) and codigo in _POST_OK[etapa_nome])
+    )
+    if "treatments_error" in post_publish:
+        post_publish_falhas.insert(0, "treatments")
+    if post_publish_falhas:
+        for etapa_nome in post_publish_falhas:
+            output_queue.put(("log",
+                              f"ATENCAO: etapa pos-publicacao '{etapa_nome}' NAO concluiu "
+                              f"(retorno {post_publish.get(etapa_nome)!r}). As bases podem "
+                              f"ter ficado desatualizadas — veja o log acima.\n"))
+        post_publish["falhas"] = post_publish_falhas
+
     # ===== FILA DE VISTORIA: consolida os itens do run e alimenta a fila global =====
     run_vistoria_items: list[dict[str, Any]] = []
     for item in summaries:
@@ -882,7 +937,10 @@ def process_video_batch(
         "notion_data_source_id": runtime["notion_data_source_id"],
         "total_requested": len(videos),
         "total_done": sum(1 for item in summaries if item.get("status") == "done"),
-        "total_error": sum(1 for item in summaries if item.get("status") == "error"),
+        # Falha pos-publicacao conta como erro do LOTE: o resumo "0 com erro" com o
+        # relations morto foi o que escondeu o incidente de 20/08/2026.
+        "total_error": sum(1 for item in summaries if item.get("status") == "error")
+        + len(post_publish.get("falhas") or []),
         "videos": summaries,
     }
     (run_root / "batch_summary.json").write_text(
@@ -1813,12 +1871,33 @@ class BatchGuiApp:
                     self.batch_artifact_dir = str(item[1])
                 elif event == "batch_done":
                     summary = item[1]
+                    # O resumo tem de carregar TUDO que precisa de atencao: em 20/08/2026
+                    # um video saiu com 7 julgamentos a menos (verdict "verificar") e o
+                    # relations morreu — e o resumo dizia "4 concluidos, 0 com erro".
+                    videos_verificar = [
+                        str(v.get("video_id", "?"))
+                        for v in (summary.get("videos") or [])
+                        if isinstance(v, dict)
+                        and (v.get("rito_count_check") or {}).get("verdict") == "verificar"
+                    ]
+                    pp_falhas = (summary.get("post_publish") or {}).get("falhas") or []
                     message = (
                         "\nResumo: "
                         f"{summary.get('total_done', 0)} concluidos, "
                         f"{summary.get('total_error', 0)} com erro. "
                         f"Artifacts: {summary.get('artifact_dir', '')}\n"
                     )
+                    if videos_verificar:
+                        message += (
+                            f"ATENCAO: {len(videos_verificar)} video(s) com contagem do rito "
+                            f"divergente ({', '.join(videos_verificar)}) — pode haver "
+                            f"julgamento sem linha publicada; confira a fila de vistoria.\n"
+                        )
+                    if pp_falhas:
+                        message += (
+                            f"ATENCAO: etapa(s) pos-publicacao que NAO concluiram: "
+                            f"{', '.join(pp_falhas)} — veja o log acima.\n"
+                        )
                     self._append_output(message)
                 elif event == "fatal_error":
                     _, error, detail = item
@@ -1966,7 +2045,7 @@ class BatchGuiApp:
         for item in ordered:
             row = item.get("row") or {}
             dje = (item.get("extra") or {}).get("dje") or {}
-            numero = row.get("numero_processo") or dje.get("numeroUnico") or item.get("numero_hint") or ""
+            numero = vistoria_item_numero_display(item)
             tema = (
                 row.get("tema") or dje.get("ementa") or item.get("tema_hint")
                 or "; ".join(item.get("reasons") or [])
@@ -2135,7 +2214,7 @@ class BatchGuiApp:
             row = item.get("row") or {}
             dje = (item.get("extra") or {}).get("dje") or {}
             lines = [
-                f"Processo: {row.get('numero_processo') or dje.get('numeroUnico') or item.get('numero_hint') or '(sem número)'}    "
+                f"Processo: {vistoria_item_numero_display(item) or '(sem número)'}    "
                 f"Sessão: {item.get('data_sessao') or '?'}    Situação: {item.get('disposition')}    "
                 f"Fonte: {item.get('source')}",
             ]
