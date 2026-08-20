@@ -120,7 +120,14 @@ class BatchOptions:
     atualizar_relations: bool = True
     relations_script: str = r"C:\Users\mauri\ProjetoConversor\relations_manutencao.py"
     # Etapas do freio: com --se-sujo, "ligado por padrao" nao significa 50 min por lote.
-    relations_etapas: str = "interna,cross,temas"
+    # `temas` NAO entra aqui. Ela liga a base temas <-> base DJe e nao enxerga a base de
+    # sessoes, entao publicar video nao lhe da trabalho nenhum. Pior: o custo dela e quase todo
+    # fixo -- medido em 19/08/2026, 200 min para 61 gravacoes, dos quais ~1h so perguntando ao
+    # Notion "ja gravei este teor?" em 13.898 paginas que ja estavam prontas. E, como o lock de
+    # relations_manutencao e unico, ela sequestraria por horas as duas etapas baratas.
+    # Onde `temas` roda: no atalho "Atualizar base Temas (TSE)", que e o gatilho de verdade
+    # (a base temas ganhando julgados novos), e numa passada semanal de madrugada.
+    relations_etapas: str = "interna,cross"
     relations_max_idade_horas: float = 20.0
     # Popular a base DJe do Notion com os CSVs pendentes, ao final do lote. Ate 19/08/2026 so a
     # GUI "DJE Relatorios Semanais" fazia isto, e um delta coletado por aqui ficava no limbo.
@@ -650,7 +657,7 @@ def _gf_run_dje_ingest(script: str, modo: str,
 
 
 def _gf_run_relations(script: str, output_queue: "queue.Queue[tuple[str, Any]]",
-                      etapas: str = "interna,cross,temas",
+                      etapas: str = "interna,cross",
                       max_idade_horas: float = 20.0) -> Any:
     """Relations no Notion via relations_manutencao.py (ProjetoConversor).
 
@@ -1191,7 +1198,9 @@ class BatchGuiApp:
             "Ao final da pós-publicação, religa as páginas do mesmo processo no Notion — dentro da base "
             "DJe e entre DJe ↔ sessões (inclui as sessões publicadas por este lote).\nIncremental e com "
             "freio: só roda de fato se nasceram páginas ou entraram decisões desde a última passada — "
-            "quando não mudou nada, custa 2 segundos em vez de ~50 min.",
+            "quando não mudou nada, custa 2 segundos em vez de ~2 h.\n\nA base de TEMAS não entra aqui: "
+            "ela não enxerga as sessões, então publicar vídeo não lhe dá trabalho nenhum. Ela roda no "
+            "atalho 'Atualizar base Temas (TSE)', que é o gatilho de verdade.",
         ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         tip(
             ttk.Checkbutton(adv, text="Alimentar a base DJe do Notion (pós-publicação)",
