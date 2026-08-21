@@ -1,7 +1,8 @@
 """Consulta SADP — TSE (Acompanhamento Processual): GUI independente para garimpar processos.
 
 Digite um número curto (ex.: "23287" ou "232-87") ou um CNJ-20 e veja TODOS os processos
-que o SADP Push (https://sadppush.tse.jus.br/sadpPush/, publico, SEM captcha) retorna para
+que o SADP Consulta (https://sadp-consulta.tse.jus.br/consulta, publico, SEM captcha — a API
+REST que substituiu o SADP Push, desativado pelo TSE em ago/2026) retorna para
 aquele numero — inclusive os de OUTRAS origens (homonimos) e os recursos relacionados ao
 mesmo CNJ — para identificar o caso certo.
 
@@ -22,7 +23,9 @@ from tkinter import ttk, messagebox
 
 import sadp_lookup as sadp
 
-DETALHE_URL = sadp.SADP_BASE + "ExibirDadosProcesso.do?comboTribunal=tse&nprot={nprot}"
+# A SPA nova nao tem deep-link por protocolo (a rota consulta/processo/detalhe navega por
+# estado interno); o link abre a tela de consulta, onde o numero e colado.
+DETALHE_URL = sadp.SADP_BASE + "/processo?nprot={nprot}"
 
 # cores das tags (precedencia: palpite > realce > zebra-por-grupo)
 COR_PALPITE = "#bfe3c0"   # verde — melhor palpite (municipio/UF/ano)

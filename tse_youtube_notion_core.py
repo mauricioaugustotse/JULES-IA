@@ -384,6 +384,31 @@ NOT_FOUND_TEXT_MARKERS = (
 
 TSE_DOMAIN_RE = re.compile(r"(?:^|\.)tse\.jus\.br$", re.IGNORECASE)
 TRE_DOMAIN_RE = re.compile(r"(?:^|\.)tre-[a-z]{2}\.jus\.br$", re.IGNORECASE)
+
+# Convenção do usuário (20/08/2026): caso envolvendo deputado federal ganha 💚 no ícone da
+# página; deputado estadual OU distrital ganha 🧡; os dois cargos juntos, verde. O ⏰ (vista
+# em aberto) prevalece — por isso vistas/sobrestados não recebem coração, e updates nunca
+# tocam o ícone (só a criação), preservando ⏰ e curadoria manual.
+ICONE_DEP_FEDERAL = "💚"
+ICONE_DEP_ESTADUAL = "🧡"
+_DEP_FEDERAL_RE = re.compile(r"deputad[oa]s?\s+federa(?:l|is)", re.IGNORECASE)
+_DEP_ESTADUAL_RE = re.compile(r"deputad[oa]s?\s+(?:estadua(?:l|is)|distrita(?:l|is))", re.IGNORECASE)
+
+
+def suggest_deputado_icon(row: "PublishPreviewRow") -> str:
+    """Sugere o coração da convenção para uma linha a publicar; '' quando não se aplica."""
+    resultado = str(getattr(row, "resultado", "") or "")
+    if resultado in ("Suspenso por vista", "Sobrestado"):
+        return ""  # vista em aberto é território do ⏰
+    blob = " ".join(
+        str(getattr(row, campo, "") or "")
+        for campo in ("tema", "punchline", "analise_do_conteudo_juridico", "raciocinio_juridico", "partes")
+    )
+    if _DEP_FEDERAL_RE.search(blob):
+        return ICONE_DEP_FEDERAL
+    if _DEP_ESTADUAL_RE.search(blob):
+        return ICONE_DEP_ESTADUAL
+    return ""
 GENERAL_DOMAINS = [
     "folha.uol.com.br",
     "estadao.com.br",
@@ -6699,6 +6724,11 @@ class NotionSessoesClient:
         flag_prop = prepared_schema.properties.get("incluir_no_rag")
         if flag_prop is not None and getattr(flag_prop, "type", "") == "checkbox":
             payload["properties"]["incluir_no_rag"] = {"checkbox": True}
+        # Convenção dos corações (deputado federal 💚 / estadual-distrital 🧡): só na
+        # criação — update nunca toca o ícone, para o ⏰ de vista e a curadoria prevalecerem.
+        coracao = suggest_deputado_icon(row)
+        if coracao:
+            payload["icon"] = {"type": "emoji", "emoji": coracao}
         return self._request("POST", "/pages", json=payload)
 
     def _write_row_with_schema_recovery(
