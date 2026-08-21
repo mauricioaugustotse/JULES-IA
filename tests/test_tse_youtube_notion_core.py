@@ -192,7 +192,7 @@ class FakeNotionClient:
         self.created = []
         self.updated = []
 
-    def find_existing_row(self, schema, youtube_link: str, numero_processo: str):
+    def find_existing_row(self, schema, youtube_link: str, numero_processo: str, data_sessao: str = ""):
         if numero_processo == "0600249-07":
             return NotionRowMatch(page_id="page-123", url="https://notion.so/page-123")
         return None
@@ -2376,7 +2376,9 @@ def test_refine_windows_merges_vote_slices_between_apregoamento_and_proclamacao(
     merged = [w for w in refined.judgments if not w.should_ignore]
     assert len(merged) == 2
     assert merged[0].start_seconds == 90
-    assert merged[0].end_seconds == 1000
+    # extend_to_proclamacao (20/08/2026): a janela do segmento se estende ate cobrir a
+    # proclamacao (t=1200-1204) — sem invadir o apregoamento seguinte (t=1280).
+    assert 1204 <= merged[0].end_seconds < 1280
     assert merged[0].mentioned_process_numbers == ["0600212-13", "0601542-45"]
     assert merged[1].mentioned_process_numbers == ["0600940-96"]
     assert any(adj["type"] == "merge" for adj in report["adjustments"])
@@ -2507,7 +2509,10 @@ def test_apply_rag_checks_accepts_matching_cnj_uf():
     assert not any(w.startswith("CNJ indica UF") for w in row.warnings)
 
 
-def test_apply_rag_checks_blocks_suspenso_por_vista_sem_pedido_vista():
+def test_apply_rag_checks_repairs_suspenso_por_vista_sem_pedido_vista():
+    # Comportamento de 20/08/2026: a inconsistencia e da EXTRACAO, nao do julgamento —
+    # nada de bloquear. Sem pista no texto, publica com lacuna sinalizada; com pista,
+    # auto-repara o ministro da vista.
     schema = make_schema()
     row = PublishPreviewRow(
         tema="Tema",
@@ -2515,7 +2520,20 @@ def test_apply_rag_checks_blocks_suspenso_por_vista_sem_pedido_vista():
         pedido_vista="",
     )
     core.apply_rag_consistency_checks(row)
-    assert any("sem pedido_vista" in e for e in row.errors)
+    assert not row.errors
+    assert row.pedido_vista == "(ministro não identificado)"
+    assert any("publicado com lacuna" in w for w in row.warnings)
+    reparado = PublishPreviewRow(
+        tema="Tema",
+        resultado="Suspenso por vista",
+        pedido_vista="",
+        analise_do_conteudo_juridico="Após o voto do relator, pediu vista a Min. Estela Aranha.",
+        composicao=["Min. Estela Aranha", "Min. Dias Toffoli"],
+    )
+    core.apply_rag_consistency_checks(reparado)
+    assert not reparado.errors
+    assert reparado.pedido_vista == "Min. Estela Aranha"
+    assert any("auto-reparo" in w for w in reparado.warnings)
     ok = PublishPreviewRow(resultado="Suspenso por vista", pedido_vista="Min. André Mendonça")
     core.apply_rag_consistency_checks(ok)
     assert not ok.errors
@@ -4807,6 +4825,44 @@ def test_cnj_check_digit_reprova_numero_fabricado():
     assert cnj_check_digit_is_valid("0600504-40") is None
     assert cnj_check_digit_is_valid("") is None
     assert cnj_expected_check_digit("0600713-13.2026.6.00.0000") == "09"
+
+
+def test_instrucao_autos_originais_corrige_ano_trocado():
+    from tse_normalization import instrucao_autos_originais_cnj
+
+    # auditoria de agosto/2026: a extração assumiu o ano da sessão (0600748-13 saiu
+    # ".2026" em 03/08) — a instrução tramita nos autos originais de 2019
+    assert (
+        instrucao_autos_originais_cnj("0600748-13.2026.6.00.0000")
+        == "0600748-13.2019.6.00.0000"
+    )
+    # número curto da instrução também completa para o canônico
+    assert instrucao_autos_originais_cnj("0600749-95") == "0600749-95.2019.6.00.0000"
+    # número já canônico: nada a corrigir
+    assert instrucao_autos_originais_cnj("0600748-13.2019.6.00.0000") == ""
+    # núcleo fora da tabela: intocado
+    assert instrucao_autos_originais_cnj("0600870-47.2024.6.13.0175") == ""
+    assert instrucao_autos_originais_cnj("") == ""
+
+
+def test_apply_rag_checks_corrige_instrucao_e_alerta_dv_reprovado():
+    # instrução com ano trocado: corrigida para os autos originais, com warning
+    row = PublishPreviewRow(numero_processo="0600748-13.2026.6.00.0000", tribunal="TSE")
+    core.apply_rag_consistency_checks(row)
+    assert row.numero_processo == "0600748-13.2019.6.00.0000"
+    assert any("autos originais da instrução" in w for w in row.warnings)
+    assert not any("Dígito verificador" in w for w in row.warnings)
+    # CNJ completo com DV inválido (fora da tabela de instruções): warning de vistoria
+    suspeito = PublishPreviewRow(numero_processo="0000295-14.2026.6.00.0000", tribunal="TSE")
+    core.apply_rag_consistency_checks(suspeito)
+    assert suspeito.numero_processo == "0000295-14.2026.6.00.0000"
+    assert any("Dígito verificador do CNJ reprova" in w for w in suspeito.warnings)
+    # CNJ válido: nenhum dos dois warnings
+    ok = PublishPreviewRow(numero_processo="0600870-47.2024.6.13.0175", tribunal="TRE-MG")
+    core.apply_rag_consistency_checks(ok)
+    assert not any(
+        "Dígito verificador" in w or "autos originais" in w for w in ok.warnings
+    )
 
 
 def test_sanitize_scan_chunk_descarta_blocos_fora_da_janela_e_do_video():

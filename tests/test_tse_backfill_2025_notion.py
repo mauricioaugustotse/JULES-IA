@@ -2997,12 +2997,14 @@ def test_chunk_support_for_candidate_item_accepts_single_chunk_overlay_case_and_
 
 
 def test_special_process_lookup_key_preserves_overlay_class_for_same_process():
-    assert backfill._special_process_lookup_key("262-19", "ED-PC") == "ED-PC 262-19"
+    # zero-pad do nucleo curto (20/08/2026)
+    assert backfill._special_process_lookup_key("262-19", "ED-PC") == "ED-PC 0000262-19"
     assert backfill._special_process_lookup_key("0600001-01.2024.6.00.0000", "AgRg-REspe") == "AgRg-REspe 0600001-01"
 
 
 def test_select_identity_target_for_exact_video_prefers_overlay_special_over_plain_process():
-    process_key = "262-19"
+    # chaves na forma zero-padded (20/08/2026) — como as lookups reais as geram
+    process_key = "0000262-19"
     plain_target = backfill.IdentityArtifactTarget(
         video_id="video-a",
         numero_processo="262-19",
@@ -3016,16 +3018,16 @@ def test_select_identity_target_for_exact_video_prefers_overlay_special_over_pla
         video_id="video-a",
         numero_processo="262-19",
         process_key=process_key,
-        special_key="ED-PC 262-19",
+        special_key="ED-PC 0000262-19",
         session_date="2021-02-11",
         start_seconds=1890,
         tipo_registro="Julgamento 4",
     )
     universe = backfill.IdentityRepairUniverse(
         targets_by_process={process_key: [plain_target]},
-        targets_by_special={"ED-PC 262-19": [special_target]},
+        targets_by_special={"ED-PC 0000262-19": [special_target]},
         target_by_video_process={("video-a", process_key): plain_target},
-        target_by_video_special={("video-a", "ED-PC 262-19"): special_target},
+        target_by_video_special={("video-a", "ED-PC 0000262-19"): special_target},
         existing_page_ids_by_video_process={("video-a", process_key): {"page-1"}},
     )
 

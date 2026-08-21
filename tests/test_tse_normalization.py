@@ -31,7 +31,8 @@ def test_canonicalize_numero_processo_extracts_short_number():
     assert canonicalize_numero_processo("060036879") == "0600368-79"
     assert canonicalize_numero_processo("06007196") == "0600071-96"
     assert canonicalize_numero_processo("060061316874") == "0613168-74"
-    assert canonicalize_numero_processo("ED na PC nº 26219") == "262-19"
+    # zero-pad do nucleo curto (20/08/2026): "262-19" ≡ "0000262-19" para o upsert
+    assert canonicalize_numero_processo("ED na PC nº 26219") == "0000262-19"
 
 
 def test_normalize_classe_processo_canonicalizes_known_alias():
@@ -207,8 +208,9 @@ def test_normalize_numero_processo_display_strips_class_prefix_and_formats_short
     assert normalize_numero_processo_display("REsp 60350714") == "603507-14"
     assert normalize_numero_processo_display("ADI 7228") == "ADI 7228"
     assert normalize_numero_processo_display("ADO 38") == "ADO 38"
-    assert normalize_numero_processo_display("PC 26219") == "262-19"
-    assert normalize_numero_processo_display("ED na PC nº 26219") == "262-19"
+    # zero-pad do nucleo curto (20/08/2026)
+    assert normalize_numero_processo_display("PC 26219") == "0000262-19"
+    assert normalize_numero_processo_display("ED na PC nº 26219") == "0000262-19"
     assert normalize_numero_processo_display("060071-96") == "0600071-96"
     assert normalize_numero_processo_display("06007196") == "0600071-96"
     assert normalize_numero_processo_display("060061316874") == "0613168-74"

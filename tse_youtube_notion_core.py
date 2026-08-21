@@ -28,6 +28,7 @@ from tse_normalization import (
     canonicalize_party_option_label,
     canonicalize_numero_processo,
     cnj_check_digit_is_valid,
+    instrucao_autos_originais_cnj,
     resultado_allowed_for_classe,
     dedupe_preserve_order,
     extract_chunk_judgment_process_values,
@@ -443,6 +444,8 @@ RECOMPUTED_WARNING_PATTERNS = (
     re.compile(r"^Mais de \d+ notícias gerais informadas;", re.IGNORECASE),
     re.compile(r"^noticia_TSE descartada por indisponibilidade da página\.$", re.IGNORECASE),
     re.compile(r"^noticia_TRE descartada por indisponibilidade da página\.$", re.IGNORECASE),
+    re.compile(r"^Número corrigido para os autos originais da instrução", re.IGNORECASE),
+    re.compile(r"^Dígito verificador do CNJ reprova", re.IGNORECASE),
 )
 
 NOTION_PROPERTY_MAP = {
@@ -3719,8 +3722,12 @@ def refine_session_windows_with_rito(
     #     administrativa ("declaro aberta a sessao administrativa" partida entre pares
     #     de snippets — o pop de L3589 so pega quando caem no MESMO par), nao a
     #     abertura da sessao;
-    # (b) abertura detectada no MEIO do video (alem de max(600 s, 20% da duracao))
-    #     indica video de CONTINUACAO — julgamentos reais acontecem antes dela.
+    # (b) video de CONTINUACAO — julgamentos reais acontecem ANTES da "abertura"
+    #     detectada. O sinal e o RITO (apregoamento antes da abertura), nao o
+    #     relogio: transmissao normal fica dezenas de minutos em vinheta antes do
+    #     "declaro aberta" (18/08/2026: abertura aos 39 min) e o teto por % da
+    #     duracao usado ate 21/08 presumia continuacao nesses videos, preservando
+    #     vinheta institucional como janela de julgamento.
     # Sem as guardas, o rito descartou 4 julgamentos reais (t=540..1064) porque a
     # unica "abertura" achada estava em t=1480 de 2878 s (51% do video).
     admin_open_starts = [e.start_seconds for e in events if e.kind == "admin_open"]
@@ -3742,24 +3749,25 @@ def refine_session_windows_with_rito(
             opening_starts.append(e.start_seconds)
     if opening_starts:
         session_opening = min(opening_starts)
-        if video_duration_seconds and video_duration_seconds > 0:
-            teto_abertura = max(600, int(video_duration_seconds * 0.20))
-        else:
-            teto_abertura = 900  # sem duracao conhecida: 15 min e generoso para a abertura
-        if session_opening > teto_abertura:
+        apregoamentos_antes_da_abertura = [
+            e.start_seconds
+            for e in apregoamentos
+            if e.start_seconds < session_opening - tolerance
+        ]
+        if apregoamentos_antes_da_abertura:
             report["adjustments"].append(
                 {
                     "type": "pre_session_anchor_ignorado_meio_do_video",
                     "start_seconds": int(session_opening),
-                    "reason": f"Abertura detectada em t={session_opening}s, além do teto de "
-                              f"{teto_abertura}s: vídeo de continuação — janelas anteriores "
-                              f"preservadas.",
+                    "reason": f"Abertura detectada em t={session_opening}s com "
+                              f"{len(apregoamentos_antes_da_abertura)} apregoamento(s) antes "
+                              f"dela: vídeo de continuação — janelas anteriores preservadas.",
                 }
             )
             log.info(
-                "Rito: abertura em t=%ss (teto %ss) — vídeo de continuação; "
-                "nenhuma janela descartada como pré-abertura.",
-                session_opening, teto_abertura,
+                "Rito: abertura em t=%ss com %s apregoamento(s) antes dela — vídeo de "
+                "continuação; nenhuma janela descartada como pré-abertura.",
+                session_opening, len(apregoamentos_antes_da_abertura),
             )
         else:
             for window in windows:
@@ -7524,6 +7532,27 @@ def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
         row.add_warning(
             f"Número do processo incompleto ({len(digits)} dígito(s): "
             f"'{row.numero_processo}') — conferir na vistoria."
+        )
+    # Instruções das resoluções "permanentes" tramitam nos autos ORIGINAIS: quando o
+    # núcleo+DV casam com uma instrução conhecida e o ano gravado difere (a extração
+    # assume o ano da sessão — 0600748-13 saiu ".2026" em 03/08/2026), corrige para o
+    # CNJ canônico. Correção determinística: a tabela é curada e núcleo+DV bastam.
+    autos_originais = instrucao_autos_originais_cnj(row.numero_processo)
+    if autos_originais:
+        anterior = row.numero_processo
+        row.numero_processo = autos_originais
+        digits = re.sub(r"\D", "", autos_originais)
+        row.add_warning(
+            f"Número corrigido para os autos originais da instrução "
+            f"({anterior} → {autos_originais})."
+        )
+    # DV do CNJ (mod 97): reprovação não prova fabricação (ASR corrompe dígito real),
+    # mas todo número fabricado/ano trocado reprova — vistoria decide (auditoria de
+    # agosto/2026: 0600748-13.2026 e 0000295-14.2026 teriam sido pegos aqui).
+    if len(digits) == 20 and cnj_check_digit_is_valid(row.numero_processo) is False:
+        row.add_warning(
+            "Dígito verificador do CNJ reprova (mod 97) — possível ano/dígito "
+            "corrompido na extração; conferir na vistoria."
         )
     if len(digits) == 20 and digits[13] == "6":
         tr_code = digits[14:16]

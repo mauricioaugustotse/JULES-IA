@@ -1502,6 +1502,38 @@ def cnj_check_digit_is_valid(numero: str) -> bool | None:
     return match is not None and match.group("dv") == esperado
 
 
+# Instruções das resoluções "permanentes" tramitam nos AUTOS ORIGINAIS — o ano da
+# SESSÃO não é o ano do CNJ. A extração de vídeo assume o ano corrente e fabrica um
+# número que o DV reprova (03/08/2026: 0600748-13 saiu ".2026"; auditoria de agosto).
+# Chave = núcleo NNNNNNN+DD (9 dígitos); núcleo+DV identificam a instrução com folga.
+INSTRUCAO_AUTOS_ORIGINAIS = {
+    "060074121": "0600741-21.2019.6.00.0000",  # FEFC
+    "060074206": "0600742-06.2019.6.00.0000",  # pesquisas eleitorais
+    "060074558": "0600745-58.2019.6.00.0000",  # representações
+    "060074728": "0600747-28.2019.6.00.0000",  # arrecadação e gastos (Res. 23.607)
+    "060074813": "0600748-13.2019.6.00.0000",  # registro de candidaturas (Res. 23.609)
+    "060074995": "0600749-95.2019.6.00.0000",  # fiscalização e auditoria (Res. 23.673)
+    "060075165": "0600751-65.2019.6.00.0000",  # propaganda eleitoral (Res. 23.610)
+    "060059254": "0600592-54.2021.6.00.0000",  # sistemas eleitorais
+}
+
+
+def instrucao_autos_originais_cnj(numero: str) -> str:
+    """CNJ canônico quando o número é de instrução permanente gravada com ano trocado.
+
+    Devolve o CNJ dos autos originais se o núcleo (7 dígitos + DV) casa com uma
+    instrução conhecida e o número informado difere do canônico (ano errado ou
+    número curto); devolve "" quando não há nada a corrigir.
+    """
+    digits = re.sub(r"\D", "", str(numero or ""))
+    if len(digits) < 9:
+        return ""
+    canonical = INSTRUCAO_AUTOS_ORIGINAIS.get(digits[:9], "")
+    if not canonical or re.sub(r"\D", "", canonical) == digits:
+        return ""
+    return canonical
+
+
 def extract_full_cnj(text: str) -> str:
     match = re.search(CNJ_REGEX, normalize_text(text))
     return match.group(0) if match else ""
