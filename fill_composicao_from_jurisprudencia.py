@@ -119,10 +119,14 @@ def main() -> int:
     def t(p, f):
         return client._extract_property_text(p, schema, f)
 
+    # O vocabulário sai das próprias páginas (o que a base ja usa), mas passa por
+    # `normalize_ministro_name` — que termina no vocabulário único. Sem isso, uma grafia
+    # divergente sobrevivente na base se auto-perpetua: ela é o nome mais frequente, vira
+    # o canônico desta rodada e é regravada em toda página que a rodada tocar.
     canon_count = collections.Counter()
     for p in pages:
         for mns in parse_multi_value_text(t(p, "composicao")):
-            canon_count[mns] += 1
+            canon_count[normalize_ministro_name(mns) or mns] += 1
     canon_fold = {}
     for nm, _n in canon_count.most_common():
         cf = fold(nm)

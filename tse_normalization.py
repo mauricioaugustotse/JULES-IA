@@ -3,11 +3,24 @@ from __future__ import annotations
 import ast
 import csv
 import re
+import sys
 import unicodedata
 from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
+
+# Vocabulário ÚNICO de ministros, compartilhado com a base DJe. Módulo puro (sem
+# dependências), importado por caminho porque os dois repositórios têm venvs separados.
+# `normalize_ministro_name` aplica `canonizar` no RETORNO: é o último a falar sobre o
+# nome em todo o lado sessões, então é o único ponto que precisa da ponte.
+if r"C:\Users\mauri\ProjetoConversor" not in sys.path:
+    sys.path.append(r"C:\Users\mauri\ProjetoConversor")
+try:
+    from _ministros_canonico import canonizar as canonizar_ministro
+except Exception:  # noqa: BLE001 — sem o ProjetoConversor por perto, degrada sem quebrar
+    def canonizar_ministro(nome: str) -> str:  # type: ignore[misc]
+        return nome
 
 
 CNJ_REGEX = r"\b\d{6,7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b"
@@ -203,8 +216,8 @@ MINISTRO_ALIAS_MAP = {
     "maria isabel gallotti": "Min. Isabel Gallotti",
     "isabel gallotti": "Min. Isabel Gallotti",
     "benedito goncalves": "Min. Benedito Gonçalves",
-    "andre ramos tavares": "Min. Ramos Tavares",
-    "ramos tavares": "Min. Ramos Tavares",
+    "andre ramos tavares": "Min. André Ramos Tavares",
+    "ramos tavares": "Min. André Ramos Tavares",
     "carlos mario da silva velloso filho": "Min. Carlos Mário da Silva Velloso Filho",
     "carlos mario velloso filho": "Min. Carlos Mário da Silva Velloso Filho",
     "carlos bastide horbach": "Min. Carlos Horbach",
@@ -247,7 +260,8 @@ MINISTRO_ALIAS_MAP = {
     "luiz roberto barroso": "Min. Luís Roberto Barroso",
     "roberto barroso": "Min. Luís Roberto Barroso",
     "marco aurelio": "Min. Marco Aurélio",
-    "maria claudia bucchianeri pinheiro": "Min. Maria Cláudia Bucchianeri",
+    "maria claudia bucchianeri": "Min. Maria Cláudia Bucchianeri Pinheiro",
+    "maria claudia bucchianeri pinheiro": "Min. Maria Cláudia Bucchianeri Pinheiro",
     "maria thereza": "Min. Maria Thereza de Assis Moura",
     "maria thereza de assis moura": "Min. Maria Thereza de Assis Moura",
     "mauro campbell": "Min. Mauro Campbell Marques",
@@ -331,8 +345,8 @@ MINISTROS_JURISTAS = {
     "Min. Luciana Lóssio",
     "Min. Luiz Carlos Madeira",
     "Min. Nauê Bernardo Pinheiro de Azevedo",
-    "Min. Maria Cláudia Bucchianeri",
-    "Min. Ramos Tavares",
+    "Min. Maria Cláudia Bucchianeri Pinheiro",
+    "Min. André Ramos Tavares",
     "Min. Sérgio Banhos",
     "Min. Tarcísio Vieira de Carvalho Neto",
     "Min. Vera Lúcia Santana Araújo",
@@ -681,7 +695,7 @@ def looks_like_advogado_party_entry(value: str) -> bool:
 
 def _cleanup_party_name(value: str) -> str:
     cleaned = PARTY_OAB_REGEX.sub("", value or "")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;,:-")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;,:-–—")
     return cleaned.strip()
 
 
@@ -885,7 +899,7 @@ def _is_party_entity_parenthetical_group(value: str) -> bool:
 
 def canonicalize_party_option_label(value: str) -> str:
     cleaned = normalize_mpe_reference(value or "")
-    cleaned = normalize_text(cleaned).strip().strip(" .;,:-")
+    cleaned = normalize_text(cleaned).strip().strip(" .;,:-–—")
     if not cleaned or cleaned == "MPE" or is_mpe_noise_entry(cleaned) or PARTY_PLACEHOLDER_REGEX.match(cleaned):
         return ""
     cleaned = re.sub(r"(?i)^\s*part[ea]\s*[:\-]\s*", "", cleaned).strip()
@@ -918,7 +932,7 @@ def canonicalize_party_option_label(value: str) -> str:
             cleaned = f"{cleaned})"
     cleaned = re.sub(r"(?i)\s+e\s+demais$", "", cleaned).strip()
     cleaned = re.sub(r"(?i)\s+e\s+outr[oa]s?$", "", cleaned).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;,:-")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;,:-–—")
     if not cleaned or cleaned == "MPE" or is_mpe_noise_entry(cleaned) or PARTY_PLACEHOLDER_REGEX.match(cleaned):
         return ""
     if looks_like_advogado_party_entry(cleaned):
@@ -1737,7 +1751,7 @@ def normalize_origem_value(value: str) -> str:
         return CAPITAL_NAME_TO_VALUE[normalized_key]
     zona_match = re.search(r"(?i)(?:\d+\S*\s+)?zona eleitoral de?\s+([^/]+)/([a-z]{2})", value)
     if zona_match:
-        city = zona_match.group(1).strip(" ,.;:-")
+        city = zona_match.group(1).strip(" ,.;:-–—")
         uf = zona_match.group(2).upper()
         if city:
             return f"{city}/{uf}"
@@ -1755,7 +1769,7 @@ def normalize_origem_value(value: str) -> str:
         match = re.match(pattern, value)
         if not match:
             continue
-        stripped = match.group(1).strip(" ,.;:-")
+        stripped = match.group(1).strip(" ,.;:-–—")
         normalized = normalize_origem_value(stripped)
         if normalized:
             return normalized
@@ -1888,10 +1902,11 @@ def normalize_ministro_name(name: str) -> str:
         return "Min. Nunes Marques"
     if normalized_key in {"nao especificado", "relator", "ministro", "ministra"}:
         return ""
-    alias = MINISTRO_ALIAS_MAP.get(normalized_key)
-    if alias:
-        return alias
-    return name
+    # `canonizar` por último, inclusive sobre o alias: o mapa acima cobre as grafias que
+    # CHEGAM (transcrição, DJe, OCR), e o vocabulário único decide a que SAI. Sem esta
+    # linha, um nome já canônico vindo do DJe ("Min. André Ramos Tavares") era rebaixado
+    # aqui para a variante curta e recriava a opção divergente no select (24/08/2026).
+    return canonizar_ministro(MINISTRO_ALIAS_MAP.get(normalized_key) or name)
 
 
 def _extract_ministro_prefix(value: str) -> str:

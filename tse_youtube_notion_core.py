@@ -3044,6 +3044,30 @@ def _extract_origin_markers(origem: str) -> tuple[str, str]:
     return fold_text_for_match(city), fold_text_for_match(uf)
 
 
+_NAME_ENTRY_TRIM_REGEX = re.compile(r"^[\s\-–—;,.]+|[\s\-–—;,]+$")
+
+
+def sanitize_name_entries(entries: list[str]) -> list[str]:
+    """Higieniza listas de nomes (partes/advogados) antes de publicar.
+
+    Remove pontuação/travessão sobrando nas pontas de cada entrada (ASR grava
+    "Dr. Fulano –") e deduplica case-insensitive preservando a ordem — o mesmo
+    nome repetido pelo modelo não pode virar registro duplicado na base.
+    """
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for entry in entries or []:
+        value = _NAME_ENTRY_TRIM_REGEX.sub("", re.sub(r"\s{2,}", " ", str(entry or ""))).strip()
+        if not value:
+            continue
+        key = fold_text_for_match(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(value)
+    return cleaned
+
+
 def _extract_party_markers(partes: list[str]) -> list[str]:
     markers: list[str] = []
     generic_terms = {
@@ -7979,8 +8003,8 @@ def build_preview_rows(
                 resultado=item.resultado_final.strip(),
                 votacao=item.votacao.strip(),
                 data_sessao=analysis.session.data_sessao or item.data_sessao,
-                partes=item.partes + item.indicados_lista_triplice,
-                advogados=item.advogados,
+                partes=sanitize_name_entries(item.partes + item.indicados_lista_triplice),
+                advogados=sanitize_name_entries(item.advogados),
                 composicao=composicao,
                 punchline=item.punchline.strip(),
                 analise_do_conteudo_juridico=item.analise_do_conteudo_juridico.strip(),

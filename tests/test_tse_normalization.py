@@ -319,7 +319,7 @@ _COMPOSICAO_PLENA_3_2_2 = [
     "Min. Isabel Gallotti",
     "Min. Antônio Carlos Ferreira",
     "Min. Floriano de Azevedo Marques",
-    "Min. Ramos Tavares",
+    "Min. André Ramos Tavares",
 ]
 
 
@@ -366,3 +366,44 @@ def test_composicao_regimental_issue_flags_category_excess():
 def test_composicao_regimental_issue_accepts_valid_six_member_bench():
     assert composicao_regimental_issue(_COMPOSICAO_PLENA_3_2_2[:6]) == ""
     assert is_regimentally_valid_composicao(_COMPOSICAO_PLENA_3_2_2[:6]) is False
+
+
+# --------------------------------------------------------------- vocabulário único
+# Trava contra a regressão de 24/08/2026: o alias map devolvia "Min. Ramos Tavares" e
+# "Min. Maria Cláudia Bucchianeri" enquanto a base DJe gravava a forma completa, e cada
+# rodada do watcher recriava a opção divergente no select de `sessões`. Estes testes
+# quebram se alguém reintroduzir uma variante — inclusive uma que o MIGRACAO não conheça.
+
+def test_alias_map_e_roster_falam_o_vocabulario_unico():
+    from _ministros_canonico import nao_canonicos
+
+    from tse_normalization import (MINISTRO_ALIAS_MAP, MINISTROS_JURISTAS,
+                                   MINISTROS_STF, MINISTROS_STJ)
+    roster = MINISTROS_STF | MINISTROS_STJ | MINISTROS_JURISTAS
+    assert nao_canonicos(MINISTRO_ALIAS_MAP.values()) == []
+    assert nao_canonicos(roster) == []
+
+
+def test_roster_nao_tem_o_mesmo_ministro_escrito_de_dois_jeitos():
+    from _ministros_canonico import colisoes_por_subconjunto
+
+    from tse_normalization import (MINISTROS_JURISTAS, MINISTROS_STF, MINISTROS_STJ)
+    roster = MINISTROS_STF | MINISTROS_STJ | MINISTROS_JURISTAS
+    assert colisoes_por_subconjunto(roster) == []
+
+
+def test_normalize_ministro_name_devolve_sempre_a_forma_canonica():
+    # a variante curta ENTRA (transcrição de vídeo a produz) e sai canonizada
+    assert normalize_ministro_name("Ramos Tavares") == "Min. André Ramos Tavares"
+    assert normalize_ministro_name("Min. Ramos Tavares") == "Min. André Ramos Tavares"
+    # e a forma que vem do DJe não é rebaixada de volta
+    assert normalize_ministro_name("Min. André Ramos Tavares") == "Min. André Ramos Tavares"
+    assert (normalize_ministro_name("Maria Cláudia Bucchianeri")
+            == "Min. Maria Cláudia Bucchianeri Pinheiro")
+    assert normalize_ministro_name("Antonio Carlos Ferreira") == "Min. Antônio Carlos Ferreira"
+
+
+def test_normalize_ministro_name_e_idempotente():
+    from tse_normalization import MINISTRO_ALIAS_MAP
+    for valor in MINISTRO_ALIAS_MAP.values():
+        assert normalize_ministro_name(valor) == valor

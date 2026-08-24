@@ -51,7 +51,7 @@ def test_core_minister_normalization_prevents_duplicate_recreation() -> None:
     assert normalize_ministro_name("Luís Edson Fachin") == "Min. Edson Fachin"
     assert normalize_ministro_name("Henrique Neves") == "Min. Henrique Neves da Silva"
     assert normalize_ministro_name("Paulo Tarso Sanseverino") == "Min. Paulo de Tarso Sanseverino"
-    assert normalize_pedido_vista_value("Maria Claudia Bucchianeri Pinheiro") == "Min. Maria Cláudia Bucchianeri"
+    assert normalize_pedido_vista_value("Maria Claudia Bucchianeri Pinheiro") == "Min. Maria Cláudia Bucchianeri Pinheiro"
 
 
 def test_planned_remaining_options_removes_unused_and_preserves_used_color() -> None:

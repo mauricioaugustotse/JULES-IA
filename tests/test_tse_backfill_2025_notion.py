@@ -1108,7 +1108,7 @@ def test_repair_existing_video_rows_composition_focus_uses_best_session_date_com
         "Min. Nunes Marques",
         "Min. Raul Araújo",
         "Min. Floriano de Azevedo Marques",
-        "Min. Ramos Tavares",
+        "Min. André Ramos Tavares",
         "Min. Isabel Gallotti",
         "Min. Edson Fachin",
     ]
@@ -1162,7 +1162,7 @@ def test_repair_existing_video_rows_composition_focus_uses_best_session_date_com
         "Min. Nunes Marques",
         "Min. Raul Araújo",
         "Min. Floriano de Azevedo Marques",
-        "Min. Ramos Tavares",
+        "Min. André Ramos Tavares",
         "Min. Isabel Gallotti",
     ]
     records = [
@@ -1225,7 +1225,7 @@ def test_repair_existing_video_rows_composition_focus_uses_valid_artifact_same_d
         "Min. Sérgio Banhos",
         "Min. Carlos Horbach",
     ]
-    invalid_eight = valid_seven + ["Min. Maria Cláudia Bucchianeri"]
+    invalid_eight = valid_seven + ["Min. Maria Cláudia Bucchianeri Pinheiro"]
     (artifact_dir / "01_session_windows.json").write_text(
         json.dumps(
             {
@@ -1460,10 +1460,10 @@ def test_repair_existing_video_rows_composition_focus_does_not_downgrade_invalid
         "Min. Nunes Marques",
         "Min. Raul Araújo",
         "Min. Floriano de Azevedo Marques",
-        "Min. Ramos Tavares",
+        "Min. André Ramos Tavares",
         "Min. Isabel Gallotti",
         "Min. Edson Fachin",
-        "Min. Maria Claudia Bucchianeri",
+        "Min. Maria Cláudia Bucchianeri Pinheiro",
     ]
     (artifact_dir / "01_session_windows.json").write_text(
         json.dumps(

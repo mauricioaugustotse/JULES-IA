@@ -66,10 +66,12 @@ def _subsequencia(curto: list[str], longo: list[str]) -> bool:
 def canonizar(nome: str) -> str:
     """Canoniza o nome vindo do CSV do DJe, ou devolve '' se não reconhecer.
 
-    O `normalize_ministro_name` (MINISTRO_ALIAS_MAP) tem a palavra final porque é ele
-    que define as opções do select na base de sessões: sem essa âncora, o
-    fallback-identidade do import acima grava a grafia crua do DJe e recria as
-    variantes ('Min. André Ramos Tavares', 'Min. ... Bucchianeri Pinheiro').
+    O `normalize_ministro_name` continua tendo a palavra final — é ele que define as
+    opções do select em `sessões` —, mas desde 24/08/2026 ele próprio termina em
+    `_ministros_canonico.canonizar`, então já devolve o vocabulário único. Antes disso
+    ele REBAIXAVA o que vinha canônico do DJe ('Min. André Ramos Tavares' virava
+    'Min. Ramos Tavares') e era a origem das opções divergentes entre as duas bases.
+
     Nome fora do roster é DESCARTADO em vez de gravado — como a composição só é
     escrita com 3 a 7 nomes, um desconhecido faz o campo ser deixado como está,
     que é o modo de falhar seguro (não poluir o select)."""

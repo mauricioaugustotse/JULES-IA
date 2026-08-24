@@ -27,3 +27,7 @@ CHAVE_SECRETA_API_Mauricio_local.txt
 *.pem
 *.p12
 artifacts/
+
+# Checkpoints de execucao do kit de manutencao (mesma natureza de artifacts/):
+# listas de page_id ja processados, reescritas a cada rodada.
+manutencao_sessoes/.estado/

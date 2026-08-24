@@ -350,7 +350,7 @@ def test_build_preview_rows_prefers_session_composition_when_item_is_sparse():
         "Min. Nunes Marques",
         "Min. Floriano de Azevedo Marques",
         "Min. Antônio Carlos Ferreira",
-        "Min. Ramos Tavares",
+        "Min. André Ramos Tavares",
     ]
 
 
@@ -1211,7 +1211,7 @@ def test_tema_looks_generic_flags_relational_case_stub():
     row = PublishPreviewRow(
         classe_processo="REspe",
         numero_processo="0600003-05",
-        relator="Min. Ramos Tavares",
+        relator="Min. André Ramos Tavares",
     )
     assert tema_looks_generic(
         "Caso do município de Aracaju, relator Ministro Raul Araújo",
@@ -1370,7 +1370,7 @@ def test_infer_relator_from_row_text_reads_relatoria_phrase():
     row = PublishPreviewRow(
         analise_do_conteudo_juridico="O processo estava sob relatoria do Ministro Ramos Tavares e foi levado a julgamento."
     )
-    assert infer_relator_from_row_text(row) == "Min. Ramos Tavares"
+    assert infer_relator_from_row_text(row) == "Min. André Ramos Tavares"
 
 
 def test_infer_votacao_from_row_text_detects_unanimity():

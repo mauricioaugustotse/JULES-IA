@@ -112,6 +112,20 @@ PIPELINE_META = SCRIPT_DIR / "fill_metadata_from_jurisprudencia.py"    # eleicao
 # deposita o delta e este watcher o consome), a integracao tambem tem de ser.
 PIPELINE_VISTA = SCRIPT_DIR / "suspenso_crosscheck_csv.py"             # fecha "Suspenso por vista"
 PIPELINE_TEOR = SCRIPT_DIR / "fill_inteiro_teor.py"                    # inteiro teor no CORPO da pagina
+# 24/08/2026 — campanha da cadeia do julgado: o crosscheck acima cobre so quem estava
+# marcado "Suspenso por vista". Linhas ANTERIORES gravadas com desfecho conclusivo
+# indevido (fase de julgamento interrompido) exigem juizo, entao o watcher NAO corrige:
+# apenas DETECTA pares novos e alimenta a fila cadeia_fila_pendente.json (rotina
+# manutencao_sessoes\cadeia_julgado.py; painel decide, aplicar_cadeia.py aplica).
+PIPELINE_CADEIA = SCRIPT_DIR / "manutencao_sessoes" / "cadeia_julgado.py"
+# 24/08/2026 — conferencia do vocabulario de ministros. Vive no ProjetoConversor porque e
+# la que mora `_ministros_canonico`, a fonte da verdade das DUAS bases; roda com o Python
+# daquele projeto (dependencias proprias). So LE os dois schemas, entao e barato e nunca
+# reprova a rodada: rc 2 vira aviso no log. Existe porque teste nenhum enxerga uma opcao
+# recriada a mao pela UI do Notion -- e foi assim que as bases divergiram (ver a memoria
+# `dje-composicao-congelada-lista-curta` e `_ministros_conferir.py`).
+CONFERIR_MINISTROS = Path(r"C:\Users\mauri\ProjetoConversor\_ministros_conferir.py")
+PY_CONVERSOR = Path(r"C:\Users\mauri\AppData\Local\Programs\Python\Python313\python.exe")
 
 TSE_SIGNATURE_COLS = ("siglaTribunalJE", "textoDecisao", "partes", "relatores", "numeroProcesso")
 CNJ20_RE = re.compile(r"\d{20}")
@@ -379,6 +393,37 @@ def newest_report_summary() -> dict:
         return {}
 
 
+def _conferir_vocabulario_ministros() -> None:
+    """Advisory: as duas bases ainda gravam o mesmo nome para o mesmo ministro?
+
+    Nunca reprova a rodada — o vocabulario divergente nao invalida o que os pipelines
+    acabaram de escrever, mas precisa ser VISTO no log do dia em que aparecer, e nao
+    meses depois numa auditoria. Conserto no proprio texto do aviso."""
+    if not CONFERIR_MINISTROS.exists():
+        return
+    exe = str(PY_CONVERSOR) if PY_CONVERSOR.exists() else sys.executable
+    try:
+        proc = subprocess.run([exe, str(CONFERIR_MINISTROS)],
+                              cwd=str(CONFERIR_MINISTROS.parent),
+                              capture_output=True, text=True, timeout=300)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  ! conferencia de ministros (advisory) falhou: {exc}")
+        return
+    if proc.returncode == 0:
+        log("  Vocabulario de ministros: DJe e sessoes conferem.")
+        return
+    if proc.returncode == 2:
+        avisos = [ln for ln in (proc.stdout or "").splitlines() if ln.strip().startswith("!")]
+        log("  ! VOCABULARIO DE MINISTROS DIVERGENTE entre as bases:")
+        for ln in avisos[:10]:
+            log(f"    {ln.strip()}")
+        log("    conserto: ProjetoConversor\\_ministros_migrar.py --base sessoes --apply "
+            "e depois _schema_limpar_orfas.py --apply")
+        return
+    log(f"  ! conferencia de ministros (advisory) retornou {proc.returncode}: "
+        f"{(proc.stderr or '').strip()[-200:]}")
+
+
 def _run_one(path: Path, label: str, staging: Path, apply: bool, data_source_id: str | None,
              env: dict) -> int:
     """Roda um pipeline (fill_*/classe/complete_cnj) sobre o staging.
@@ -466,6 +511,21 @@ def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict
     if apply:
         for csv_path in sorted(staging.glob("*.csv")):
             _run_missing_scan(csv_path, data_source_id, env)
+        # 8) cadeia do julgado: so DETECTA (fila de pendentes p/ painel); nunca aplica.
+        #    Advisory: falha aqui nao invalida a rodada nem impede o carimbo do CSV.
+        try:
+            proc = subprocess.run([sys.executable, str(PIPELINE_CADEIA), "--so-a", "--fila"],
+                                  cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True,
+                                  timeout=1800)
+            ultima = (proc.stdout or "").strip().splitlines()
+            if proc.returncode == 0 and ultima:
+                log(f"  Cadeia do julgado: {ultima[-2] if len(ultima) >= 2 else ultima[-1]}")
+            else:
+                log(f"  ! cadeia (advisory) retornou {proc.returncode}: "
+                    f"{(proc.stderr or '').strip()[-200:]}")
+        except Exception as exc:
+            log(f"  ! cadeia (advisory) falhou: {exc}")
+        _conferir_vocabulario_ministros()
     resumo = dict(newest_report_summary() or {})   # copia: nao mutar o dict que veio do disco
     if falhas:
         resumo["_falhas"] = falhas
