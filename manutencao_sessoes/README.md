@@ -110,6 +110,48 @@ Fonte da verdade: o **cabeçalho FORMAL** do acórdão gravado no corpo
 - Regra geral: divergência DENTRO da família (REspe × AgRg-REspe × ED-REspe) é fase
   processual, não erro. Nunca criar option nova de classe — fragmenta o vocabulário.
 
+## Relation `sessões` <-> `DJe` (25/08/2026)
+`auditar_relation_dje.py [--apply]` — parte das SESSÕES sem relation e faz uma consulta
+por processo (minutos), em vez de reler as 188 mil páginas do DJe como o
+`..\..\ProjetoConversor\DJE_relations.py --modo cross` (~30 min só de leitura).
+**A ausência da relation é um DETECTOR, não só uma falha de ligação** — foi assim que a
+rodada de 25/08 separou 615 páginas sem relation em:
+- **391 com par no DJe** (369 com acórdão) — a ligação é que nunca fora gravada. O `cross`
+  grava do lado DJe **sem comparar com o estado atual**, então uma rodada que não conclui
+  não deixa rastro de que faltou: as páginas do DJe já existiam (58/60 da amostra criadas
+  antes de agosto) e mesmo assim ficaram soltas. Depois do reparo: 3.164/3.388 (93,4%).
+- **130 atos administrativos** (Instrução/PA/"Aprovada") — não geram acórdão no repositório
+  de jurisprudência; a ausência é CORRETA e não deve virar alerta.
+- **26 sessões recentes** (acórdão ainda não publicado) e **11 linhas suspensas por vista**
+  (o acórdão pertence à linha conclusiva — mesma regra do teor).
+- **57 suspeitas**, das quais 9 com ano do CNJ POSTERIOR à sessão (número errado, mesmo
+  padrão do `detectar_cnj_impossivel.py`). **Todas as 57 estão sem inteiro teor**: falta de
+  acórdão e falta de teor têm a mesma causa, então uma varredura confirma a outra.
+
+Pegadinha do acervo: `dje` NÃO é o DJe — é o repositório de jurisprudência do TSE. Um
+julgamento por maioria tem acórdão por definição, mas ele pode não estar no acervo (o
+0600421-63.2020.6.05.0107, julgado em 05/03/2026, só tem lá a monocrática de 2023; no
+consolidado de 1,2 GB há uma única ocorrência do CNJ-20, a mesma monocrática). Antes de
+concluir "número errado", conferir se a monocrática existente bate em relator/classe/município.
+
+`preencher_teor_do_dje.py [--apply] [--janela]` — depois de reparada a relation, o
+ACORDAO pareado vira fonte local de teor: `textoEmenta` + `textoDecisao` da pagina do DJe
+sao o mesmo material que o motor extrai do CSV, sem SJUR nem CSV de 1,2 GB. Rodada de
+25/08: **132 paginas ganharam teor** (mediana 3.323 chars).
+
+**So a DATA EXATA autoriza gravar** (`dataDecisao` == data da sessao). **PEGADINHA QUE A
+PRIMEIRA VERSAO PAGOU:** o gate original aceitava ate 180d quando o dispositivo concordava
+com a etiqueta `votacao` (unanimidade x maioria) — isso NAO separa nada, porque a maioria
+dos julgamentos e unanime e a concordancia sai por acaso. Dos 30 casos aprovados assim,
+praticamente todos eram acordaos de EMBARGOS DE DECLARACAO julgados meses depois
+("Desprovido" na pagina x "rejeitou os embargos" no acordao). **Só o RESULTADO separa fases
+do processo; a votacao, nunca** — com esse teste a janela [-5,+60]d reprovou 25 de 33, e por
+isso ela so entra sob `--janela`, ainda exigindo resultado igual e nao-embargos.
+Divergencia de resultado no balde de data exata (6 de 25 na auditoria) e limitacao do
+parser ("deu parcial provimento" -> "Provido em parte"), nao acordao errado.
+
+Linhas "Suspenso"/"Suspenso*" sao puladas: o acordao pertence a irma conclusiva.
+
 ## Voo profundo meritório (funil barato Haiku→Sonnet)
 - `gerar_lotes_triagem.py` → workflow `triagem-meritoria-full.js` (Haiku, 5
   dimensões vs teor+cadeia) → revisão Sonnet → `aplicar_revisao.py`.
