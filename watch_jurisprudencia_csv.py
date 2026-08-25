@@ -118,6 +118,17 @@ PIPELINE_TEOR = SCRIPT_DIR / "fill_inteiro_teor.py"                    # inteiro
 # apenas DETECTA pares novos e alimenta a fila cadeia_fila_pendente.json (rotina
 # manutencao_sessoes\cadeia_julgado.py; painel decide, aplicar_cadeia.py aplica).
 PIPELINE_CADEIA = SCRIPT_DIR / "manutencao_sessoes" / "cadeia_julgado.py"
+# 25/08/2026 — relation `sessoes` <-> `DJe` e o teor que ela destrava. Cada CSV novo cria
+# paginas no DJe, e a ligacao delas com a sessao correspondente ficava dependendo de alguem
+# lembrar de rodar o `DJE_relations.py --modo cross` (que le as 188 mil paginas do DJe e
+# grava sem comparar com o estado atual -- uma rodada que nao conclui e indistinguivel de
+# uma sem trabalho, e foi assim que 391 pares disponiveis passaram tres rodadas soltos).
+# Aqui a varredura parte das SESSOES sem relation: uma consulta por processo, minutos.
+# Em seguida, so nas paginas ligadas AGORA, o acordao pareado vira fonte de inteiro teor
+# para quem o CSV do dia nao cobriu. Os dois sao advisory: nunca reprovam a rodada.
+PIPELINE_RELATION = SCRIPT_DIR / "manutencao_sessoes" / "auditar_relation_dje.py"
+PIPELINE_TEOR_DJE = SCRIPT_DIR / "manutencao_sessoes" / "preencher_teor_do_dje.py"
+FILA_RELATION = SCRIPT_DIR / "artifacts" / "notion_sessoes_auditoria" / "relation_fila_novas.json"
 # 24/08/2026 — conferencia do vocabulario de ministros. Vive no ProjetoConversor porque e
 # la que mora `_ministros_canonico`, a fonte da verdade das DUAS bases; roda com o Python
 # daquele projeto (dependencias proprias). So LE os dois schemas, entao e barato e nunca
@@ -471,6 +482,47 @@ def _run_missing_scan(csv_path: Path, data_source_id: str | None, env: dict) -> 
         log(f"  Faltantes: relatorio em {MISSING_OUT_DIR} (fila de vistoria alimentada; importe com import_dje_faltantes.py)")
 
 
+def _relation_e_teor_do_dje(env: dict) -> None:
+    """Etapa 9 (advisory): liga as sessoes as decisoes novas do DJe e, so nas paginas
+    ligadas agora, grava o inteiro teor a partir do acordao pareado.
+
+    ADVISORY DE VERDADE: qualquer falha vira aviso no log e nao invalida a rodada nem
+    impede o carimbo do CSV -- sao passos de enriquecimento, nao de ingestao. O teor so
+    roda se o passo anterior deixou fila; sem `--fila` ele varreria as ~3,2 mil paginas
+    com relation relendo blocos (~40 min), o que nao cabe numa rodada automatica."""
+    try:
+        proc = subprocess.run([sys.executable, str(PIPELINE_RELATION), "--apply"],
+                              cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True,
+                              timeout=3600)
+        linhas = [l for l in (proc.stdout or "").strip().splitlines() if "RESUMO" in l]
+        if proc.returncode == 0:
+            log(f"  Relation DJe: {linhas[-1] if linhas else 'sem novidades'}")
+        else:
+            log(f"  ! relation (advisory) retornou {proc.returncode}: "
+                f"{(proc.stderr or '').strip()[-200:]}")
+            return
+    except Exception as exc:
+        log(f"  ! relation (advisory) falhou: {exc}")
+        return
+    if not FILA_RELATION.exists():
+        return
+    try:
+        if not json.loads(FILA_RELATION.read_text(encoding="utf-8")):
+            return                      # nenhuma ligacao nova: nada que o teor possa usar
+        proc = subprocess.run([sys.executable, str(PIPELINE_TEOR_DJE), "--apply",
+                               "--fila", str(FILA_RELATION)],
+                              cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True,
+                              timeout=3600)
+        linhas = [l for l in (proc.stdout or "").strip().splitlines() if "RESUMO" in l]
+        if proc.returncode == 0:
+            log(f"  Teor pelo acordao pareado: {linhas[-1] if linhas else 'sem novidades'}")
+        else:
+            log(f"  ! teor-do-dje (advisory) retornou {proc.returncode}: "
+                f"{(proc.stderr or '').strip()[-200:]}")
+    except Exception as exc:
+        log(f"  ! teor-do-dje (advisory) falhou: {exc}")
+
+
 def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict:
     """Confronta o(s) CSV(s) do lote com a base de sessoes, na ordem:
     1) completa o CNJ-20 das paginas incompletas (amplia o match dos demais);
@@ -525,6 +577,7 @@ def run_pipeline(staging: Path, apply: bool, data_source_id: str | None) -> dict
                     f"{(proc.stderr or '').strip()[-200:]}")
         except Exception as exc:
             log(f"  ! cadeia (advisory) falhou: {exc}")
+        _relation_e_teor_do_dje(env)
         _conferir_vocabulario_ministros()
     resumo = dict(newest_report_summary() or {})   # copia: nao mutar o dict que veio do disco
     if falhas:

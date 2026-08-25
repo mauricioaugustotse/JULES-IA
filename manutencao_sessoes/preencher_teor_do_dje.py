@@ -49,6 +49,10 @@ ART = Path(r"C:\Users\mauri\JULES-IA\artifacts\notion_sessoes_auditoria")
 APPLY = "--apply" in sys.argv
 LIMITE = int(sys.argv[sys.argv.index("--limite") + 1]) if "--limite" in sys.argv else 0
 JANELA = "--janela" in sys.argv   # aceita [-5,+60]d com confirmacao pelo RESULTADO
+# --fila <arquivo.json>: restringe aos page_ids da lista (o watcher passa a fila que o
+# auditar_relation_dje acabou de ligar). Sem ela, varre todas as paginas com relation --
+# correto para campanha, caro demais para rodada automatica (~40 min so de leitura).
+FILA = sys.argv[sys.argv.index("--fila") + 1] if "--fila" in sys.argv else ""
 
 _S = requests.Session()
 _S.headers.update({"Authorization": f"Bearer {report.resolve_notion_key()}",
@@ -131,11 +135,18 @@ def main():
         if not cur:
             break
 
+    escopo = None
+    if FILA:
+        escopo = set(json.loads(Path(FILA).read_text(encoding="utf-8")))
+        print("  fila: {} paginas".format(len(escopo)), flush=True)
+
     alvos = []
     for r in pages:
         p = r["properties"]
         rel = txt(p.get(REL_SES)) or []
         if not rel:
+            continue
+        if escopo is not None and r["id"] not in escopo:
             continue
         alvos.append({"page_id": r["id"], "url": r.get("url"),
                       "numero": txt(p.get("numero_processo")),

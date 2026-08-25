@@ -6,6 +6,14 @@ rodar SEM flag = dry-run (relatório); `--apply` = grava. Logs restauráveis em
 `..\artifacts\notion_sessoes_auditoria\`.
 
 ## O que roda SOZINHO (não precisa destes scripts)
+- **Relation DJe + teor pelo acordao pareado** (etapa 9 do watcher, 25/08/2026):
+  `auditar_relation_dje.py --apply` liga as sessoes as decisoes novas do DJe e deixa em
+  `artifacts
+otion_sessoes_auditoriaelation_fila_novas.json` SO as paginas ligadas
+  naquela rodada; em seguida `preencher_teor_do_dje.py --apply --fila <ela>` grava o teor
+  dessas. Os dois sao advisory (falha vira aviso, nao reprova o CSV). A fila e o que torna
+  o segundo passo viavel: sem `--fila` ele releria os blocos das ~3,2 mil paginas com
+  relation (~40 min).
 - `..\watch_jurisprudencia_csv.py` (watcher do DJe) chama `..\fill_inteiro_teor.py`
   a cada CSV novo — teores novos já saem com o cortador v3 (ementas estruturadas,
   itens numerados, sem órfãos) e fonte por (CNJ, data) com janela [-5,+60]d.

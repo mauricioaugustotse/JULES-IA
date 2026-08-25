@@ -35,6 +35,7 @@ DS_DJE = "32872195-5c64-8093-ab9b-000b8a94e7dd"
 DS_SESSOES = "2eb72195-5c64-80ea-9cd5-000b0e01745d"
 REL_SES = "Related to DJe (sess\u00e3o de julgamento)"
 ART = Path(r"C:\Users\mauri\JULES-IA\artifacts\notion_sessoes_auditoria")
+FILA = ART / "relation_fila_novas.json"   # page_ids ligados na rodada (entrada do teor)
 # classes/resultados que produzem ato normativo ou administrativo, nao acordao
 ADM_CLASSES = {"Instrução", "PA", "Lista Tríplice"}
 ADM_RESULTADOS = {"Aprovada", "Homologada"}
@@ -176,11 +177,19 @@ def main():
             print(f"  {i}/{len(sem)} {dict(stats)}", flush=True)
 
     print("\nRESUMO:", dict(stats))
-    arq = ART / f"relation_dje_{'apply' if APPLY else 'dry'}_{time.strftime('%Y%m%d_%H%M%S')}.json"
     ART.mkdir(parents=True, exist_ok=True)
+    arq = ART / f"relation_dje_{'apply' if APPLY else 'dry'}_{time.strftime('%Y%m%d_%H%M%S')}.json"
     arq.write_text(json.dumps({"stats": dict(stats), "itens": res}, ensure_ascii=False, indent=1),
                    encoding="utf-8")
     print("salvo:", arq)
+    # Fila para o passo seguinte do watcher: SO as paginas ligadas AGORA. Sem ela o
+    # `preencher_teor_do_dje.py` teria de reler os blocos das ~3,2 mil paginas com
+    # relation (~40 min) para achar as poucas que estreiam sem teor a cada rodada.
+    if APPLY:
+        novas = [x["page_id"] for x in res
+                 if x.get("diag", "").startswith("par_existe") and not x.get("erro_gravacao")]
+        FILA.write_text(json.dumps(novas, ensure_ascii=False), encoding="utf-8")
+        print(f"fila para o teor: {len(novas)} paginas -> {FILA}")
     return 0
 
 
