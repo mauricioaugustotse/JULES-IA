@@ -94,6 +94,22 @@ acórdão de 21/11, +56d) — foi assim que 29 páginas ganharam documento de ou
 Ao achar um padrão novo: ajustar `segmenta_semantico`, rodar `pytest tests -q`,
 `regravar_uma.py` no caso testemunha e depois `sanear_formato_teor.py --apply`.
 
+## Classe do processo (24-25/08/2026)
+Fonte da verdade: o **cabeçalho FORMAL** do acórdão gravado no corpo
+("INSTRUÇÃO (11544) N. 0600749-95.2019...", "AÇÃO CAUTELAR (12061) Nº ...").
+- `classe_pelo_cabecalho.py` — confere etiqueta × cabeçalho. **PEGADINHA QUE CUSTOU CARO:**
+  a primeira versão lia a EMENTA e propôs 806 trocas erradas ("ELEIÇÕES 2016. REGISTRO DE
+  CANDIDATURA. RECURSO ESPECIAL..." → RCand, quando a classe é o recurso e RCand é o
+  ASSUNTO). A versão atual exige que a classe ABRA o texto e venha seguida do número do
+  processo; revalidando as 806 sobraram **9 reais** (`revalidar_classe.py`).
+- `classe_por_consenso_cnj.py` — propaga a classe oficial para as páginas do MESMO CNJ que
+  não têm teor (um processo tem uma classe só). Foi como se resolveram as instruções
+  normativas rotuladas "PC"/"PA" (0600749-95, 0600748-13, 0600747-28): 14 aplicadas.
+  Guarda: não propaga quando o `resultado` é incompatível com a classe (ex.: "Provido" numa
+  Instrução) — isso indica número errado NAQUELA linha, e vai para revisão.
+- Regra geral: divergência DENTRO da família (REspe × AgRg-REspe × ED-REspe) é fase
+  processual, não erro. Nunca criar option nova de classe — fragmenta o vocabulário.
+
 ## Voo profundo meritório (funil barato Haiku→Sonnet)
 - `gerar_lotes_triagem.py` → workflow `triagem-meritoria-full.js` (Haiku, 5
   dimensões vs teor+cadeia) → revisão Sonnet → `aplicar_revisao.py`.

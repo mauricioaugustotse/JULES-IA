@@ -76,6 +76,42 @@ por_cnj = defaultdict(list)
 for ln in linhas:
     por_cnj[ln["cnj"]].append(ln)
 
+# Agrupamento por NÚCLEO (7 dígitos + DV), além do CNJ-20 exato.
+# Um número corrompido pelo ASR quebra o agrupamento por CNJ-20 e esconde a cadeia:
+# a fraude à cota de gênero do CE aparecia como 0600003-05.2024.6.06.0028 em 29/05/2024
+# e 0600003-05.2021.6.06.0062 em 15/08/2024 — mesmo núcleo, mesma cadeia, agrupamentos
+# distintos. Aqui só o núcleo+DV precisa coincidir; a similaridade de TEMA confirma.
+STOP_TEMA = {"de", "da", "do", "das", "dos", "e", "em", "a", "o", "por", "para", "no", "na"}
+
+
+def _tokens_tema(s):
+    return {w for w in re.findall(r"\w{4,}", (s or "").lower()) if w not in STOP_TEMA}
+
+
+def _tema_parecido(a, b):
+    ta, tb = _tokens_tema(a), _tokens_tema(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / max(1, min(len(ta), len(tb))) >= 0.5
+
+
+por_nucleo = defaultdict(list)
+for ln in linhas:
+    por_nucleo[ln["cnj"][:9]].append(ln)
+for nucleo, grp in por_nucleo.items():
+    cnjs = {x["cnj"] for x in grp}
+    if len(cnjs) < 2:
+        continue  # já coberto pelo agrupamento exato
+    for i, a in enumerate(grp):
+        for b in grp[i + 1:]:
+            if a["cnj"] == b["cnj"] or not _tema_parecido(a["tema"], b["tema"]):
+                continue
+            chave = f"nucleo:{nucleo}"
+            if a not in por_cnj[chave]:
+                por_cnj[chave].append(a)
+            if b not in por_cnj[chave]:
+                por_cnj[chave].append(b)
+
 # --- Direção A ---
 dir_a = []
 for cnj, grp in por_cnj.items():
