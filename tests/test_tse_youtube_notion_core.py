@@ -5126,3 +5126,42 @@ def test_video_sem_julgamento_nao_escala(tmp_path):
     assert merged.data_sessao == "2026-08-03"
     # so as 2 janelas do plano primary: o fallback NAO foi acionado
     assert chamadas["n"] == 2
+
+
+def test_tema_que_nomeia_ministro_e_recusado():
+    # Caso real (0600680-86.2020.6.24.0056): o vídeo trazia só a proclamação
+    # ("pedido de vista do Ministro Sérgio Banhos") e o modelo tomou quem falou
+    # pelo assunto julgado. A punchline confirmava o engano: "Julgamento sobre
+    # ministro Sérgio Banhos em Balneário Camboriú/SC foi suspenso...".
+    row = PublishPreviewRow(numero_processo="0600680-86", classe_processo="AgRg-AREspe")
+    assert tema_looks_generic("Ministro Sérgio Banhos", row)
+    assert tema_looks_generic(
+        "O Ministro Relator Herman Benjamin informa a rejeição de embargos de declaração", row
+    )
+
+
+def test_tema_com_autoridade_na_tese_continua_valido():
+    # O veto exige CARGO + NOME PRÓPRIO. Onde a autoridade integra a tese — e não
+    # substitui a matéria — o tema é legítimo e não pode ser descartado.
+    row = PublishPreviewRow(numero_processo="0000265-76", classe_processo="ED-PC")
+    assert not tema_looks_generic("Nulidade parcial de acórdão por impedimento de Ministro", row)
+    assert not tema_looks_generic(
+        "Competência monocrática do relator em processos de prestação de contas eleitorais", row
+    )
+    assert not tema_looks_generic(
+        "Suspensão de julgamento de recurso especial eleitoral por determinação do relator", row
+    )
+
+
+def test_tema_que_e_so_rotulo_processual_e_recusado():
+    # O prompt já proibia em palavras ("nunca use apenas ... a classe processual"),
+    # mas instrução não é garantia: "Embargos de declaração" chegou a ser o tema de
+    # 6 páginas da base. O veto aqui é determinístico.
+    row = PublishPreviewRow(numero_processo="0000481-03", classe_processo="ED-REspe")
+    for rotulo in ("Embargos de declaração", "Agravo regimental", "Registro de candidatura",
+                   "Recurso especial eleitoral", "Questão de ordem"):
+        assert tema_looks_generic(rotulo, row), rotulo
+    # a matéria concreta que substituiu cada um deles continua passando
+    assert not tema_looks_generic(
+        "Acesso ao áudio da fundamentação do acórdão e alegação de omissão", row
+    )

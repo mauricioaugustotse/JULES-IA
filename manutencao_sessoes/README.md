@@ -9,7 +9,8 @@ rodar SEM flag = dry-run (relatório); `--apply` = grava. Logs restauráveis em
 - **Relation DJe + teor pelo acordao pareado** (etapa 9 do watcher, 25/08/2026):
   `auditar_relation_dje.py --apply` liga as sessoes as decisoes novas do DJe e deixa em
   `artifacts
-otion_sessoes_auditoriaelation_fila_novas.json` SO as paginas ligadas
+otion_sessoes_auditoria
+elation_fila_novas.json` SO as paginas ligadas
   naquela rodada; em seguida `preencher_teor_do_dje.py --apply --fila <ela>` grava o teor
   dessas. Os dois sao advisory (falha vira aviso, nao reprova o CSV). A fila e o que torna
   o segundo passo viavel: sem `--fila` ele releria os blocos das ~3,2 mil paginas com
@@ -159,6 +160,26 @@ Divergencia de resultado no balde de data exata (6 de 25 na auditoria) e limitac
 parser ("deu parcial provimento" -> "Provido em parte"), nao acordao errado.
 
 Linhas "Suspenso"/"Suspenso*" sao puladas: o acordao pertence a irma conclusiva.
+
+## Coluna `tema` (25/08/2026)
+`auditar_tema.py [--csv]` — audita a coluna com **a mesma funcao que o fluxo usa ao
+publicar** (`core.tema_looks_generic`). Regra de ouro: **regra nova entra no core** (onde ha
+teste que a trava) **e o auditor a herda**; se o auditor tivesse padroes proprios, a base
+ficaria limpa por um criterio e suja pelo outro.
+
+Dois defeitos que o gate nao pegava e agora pega:
+- **nome de autoridade no lugar da materia** ("Ministro Sergio Banhos"). Nasce quando o
+  video traz so a proclamacao — "pedido de vista do Ministro X" — e o modelo toma quem
+  falou pelo assunto julgado; a punchline denunciava ("Julgamento sobre ministro Sergio
+  Banhos..."). O veto exige CARGO + NOME PROPRIO, entao "nulidade por impedimento de
+  Ministro" e "competencia monocratica do relator" continuam validos: ali a autoridade
+  integra a TESE. Sem essa distincao, 6 temas legitimos teriam sido destruidos.
+- **rotulo processual puro** ("Embargos de declaracao", "Agravo regimental"): dizem o RITO,
+  nao a materia. O prompt ja os proibia em palavras — e mesmo assim eram o tema de 6
+  paginas. **Instrucao de prompt nao e garantia; o veto tem de ser deterministico.**
+
+Rodada de 25/08: 12 temas reescritos a partir do teor (fonte oficial) + prompt reforcado
+(nome de ministro e rito proibidos explicitamente) + 3 testes. Auditoria seguinte: 0 recusados.
 
 ## Voo profundo meritório (funil barato Haiku→Sonnet)
 - `gerar_lotes_triagem.py` → workflow `triagem-meritoria-full.js` (Haiku, 5

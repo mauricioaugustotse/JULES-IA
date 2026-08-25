@@ -560,7 +560,7 @@ ORIENTAÇÕES OBRIGATÓRIAS POR CAMPO:
 - `raciocinio_juridico`: reconstrua os argumentos jurídicos aplicados ao caso concreto. Indique quais premissas fáticas ou processuais foram tomadas como dadas, qual norma, súmula ou precedente foi usado, qual argumento da parte foi acolhido ou rejeitado e por que isso levou ao resultado.
 - `raciocinio_juridico`: não escreva apenas que o recurso foi provido ou desprovido. Explique o encadeamento lógico entre fatos, norma e conclusão.
 - `raciocinio_juridico`: mencione barreiras processuais, como vedação ao reexame de fatos e provas, apenas quando elas forem efetivamente usadas como razão de decidir no voto.
-- `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta, como "conduta vedada por uso de bens públicos" ou "fraude à cota de gênero em chapa proporcional". Não descreva o resultado, não repita número do processo, não use nomes das partes como eixo principal e nunca use apenas rótulos genéricos como "Processo", "Julgamento" ou só a classe processual. Se o vídeo não permitir identificar o tema com segurança, deixe o campo vazio.
+- `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta, como "conduta vedada por uso de bens públicos" ou "fraude à cota de gênero em chapa proporcional". Nunca use o nome de ministro, relator ou de quem pediu vista como tema: pedido de vista, leitura de voto e proclamação são incidentes da sessão, não a matéria julgada — o tema tem de sair da controvérsia, mesmo quando o vídeo só mostra a proclamação. "Embargos de declaração" e "Agravo regimental" também descrevem o rito, não a matéria: em vez deles, diga sobre O QUE se embargou ou se agravou. Não descreva o resultado, não repita número do processo, não use nomes das partes como eixo principal e nunca use apenas rótulos genéricos como "Processo", "Julgamento" ou só a classe processual. Se o vídeo não permitir identificar o tema com segurança, deixe o campo vazio.
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 - `classe_processo`: leia a classe processual exatamente como aparece na autuação/cabeçalho exibido na tela e no pregão do caso (ex.: "AgR-AREspe nº 0601309-60"). Capture a classe COMPLETA, preservando os prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED), antes da classe-base. Não reduza um "AgR-AREspe" a "AREspe" nem um "ED-REspe" a "REspe". Se houver agravo regimental sendo julgado pelo colegiado contra decisão monocrática, a classe é a forma com AgRg-. Se a tela não exibir a classe com clareza, deixe o campo vazio em vez de adivinhar a classe-base.
 - `origem`: informe o MUNICÍPIO de origem do processo no formato "Cidade/UF" (ex.: "Santo Antônio do Tauá/PA"), tal como citado no caso. Não preencha origem com o tribunal ("Tribunal Regional Eleitoral do Pará", "TRE-PA") nem com a capital do estado quando o município específico aparecer no vídeo; o nome do tribunal de origem pertence a outro contexto, não à coluna origem.
@@ -582,7 +582,7 @@ TAREFA:
 - Se o trecho contiver mais de um processo julgado em conjunto, retorne um item por processo.
 - Não crie item para número de processo citado apenas como precedente, comparação, referência jurisprudencial ou exemplo.
 - Extraia os mesmos campos exigidos na etapa detalhada do vídeo, preservando fidelidade máxima ao conteúdo efetivamente transcrito.
-- `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta. Nunca use número do processo, "Processo", "Julgamento", nomes das partes como eixo principal ou apenas a classe processual. Se não houver base suficiente na transcrição, deixe vazio.
+- `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta. Nunca use o nome de ministro, relator ou de quem pediu vista como tema: pedido de vista, leitura de voto e proclamação são incidentes da sessão, não a matéria julgada — o tema tem de sair da controvérsia, mesmo quando o vídeo só mostra a proclamação. "Embargos de declaração" e "Agravo regimental" também descrevem o rito, não a matéria: em vez deles, diga sobre O QUE se embargou ou se agravou. Nunca use número do processo, "Processo", "Julgamento", nomes das partes como eixo principal ou apenas a classe processual. Se não houver base suficiente na transcrição, deixe vazio.
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 - `classe_processo`: capture a classe COMPLETA como anunciada/transcrita, preservando prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED). Não reduza "AgR-AREspe" a "AREspe". Se a transcrição não trouxer a classe com clareza, deixe vazio.
 - `origem`: informe o MUNICÍPIO no formato "Cidade/UF" como citado no caso, não o tribunal (TRE) nem a capital quando o município específico aparecer.
@@ -1086,6 +1086,37 @@ def infer_theme_from_row_text(row: "PublishPreviewRow") -> str:
     return ""
 
 
+# 25/08/2026 — `tema` que nomeia autoridade em vez de descrever a materia. Nasce quando o
+# video traz so a proclamacao ("pedido de vista do Ministro Sergio Banhos") e o modelo toma
+# quem falou pelo assunto julgado. Exige CARGO + NOME PROPRIO: assim "nulidade por
+# impedimento de Ministro" e "competencia monocratica do relator" continuam validos, porque
+# neles a autoridade integra a TESE e nao substitui o tema.
+_TEMA_AUTORIDADE_RE = re.compile(
+    r"(?:[Mm]in(?:istr[oa])?\.?|[Dd]esembargador(?:a)?)\s+"
+    r"(?:[Rr]elator(?:a)?\s+)?"
+    r"[A-ZÁÂÃÉÊÍÓÔÕÚÇ][\wÀ-ÿ]+\s+"
+    r"[A-ZÁÂÃÉÊÍÓÔÕÚÇ][\wÀ-ÿ]+"
+)
+# rotulos que dizem o RITO, nao a materia. O prompt ja os proibia em palavras ("nunca use
+# apenas ... a classe processual"), mas instrucao nao e garantia: "Embargos de declaracao"
+# apareceu como tema em 6 paginas. Aqui o veto e deterministico.
+_TEMA_ROTULOS_PROCESSUAIS = {
+    "embargos", "embargos de declaracao", "segundos embargos de declaracao",
+    "embargos de declaracao em recurso especial", "agravo", "agravo regimental",
+    "agravo interno", "agravo de instrumento", "agravo em recurso especial",
+    "recurso", "recurso especial", "recurso especial eleitoral", "recurso ordinario",
+    "recurso eleitoral", "mandado de seguranca", "acao cautelar", "habeas corpus",
+    "peticao", "consulta", "representacao", "reclamacao", "processo administrativo",
+    "acao rescisoria", "registro de candidatura", "requerimento de registro de candidatura",
+    "direito eleitoral", "materia eleitoral", "questao de ordem",
+}
+
+
+def _tema_nomeia_autoridade(value: str) -> bool:
+    """True quando o tema aponta uma pessoa do tribunal como se fosse o assunto."""
+    return bool(_TEMA_AUTORIDADE_RE.search(value or ""))
+
+
 def _tema_looks_generic(value: str, row: "PublishPreviewRow") -> bool:
     normalized = normalize_class_text(value)
     if not normalized:
@@ -1095,6 +1126,10 @@ def _tema_looks_generic(value: str, row: "PublishPreviewRow") -> bool:
     if _is_meta_legal_sentence(normalized):
         return True
     if _looks_like_relational_case_stub(normalized):
+        return True
+    if _tema_nomeia_autoridade(value):
+        return True
+    if normalized in _TEMA_ROTULOS_PROCESSUAIS:
         return True
     if re.match(r"^(?:o|a)\s+(?:processo|caso|feito)\s+(?:trata|discute|versa)\s+(?:de|sobre)\b", normalized):
         return True
