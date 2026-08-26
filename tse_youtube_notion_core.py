@@ -5617,6 +5617,30 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
         if not leituras:
             return []
 
+        # A SAUDACAO DA ABERTURA vence a votacao. O presidente cumprimenta os ministros no
+        # comeco da sessao, e a janela que cobre esse trecho traz a composicao LIDA, nao
+        # lembrada. Em 25/08/2026 o chunk da abertura devolveu os 7 corretos (3 do STF, 2 do
+        # STJ, 2 juristas) e a votacao os diluiu no meio de 17 leituras de memoria,
+        # publicando 5 nomes -- dois deles de ministros que nem estavam na Corte.
+        # `is_regimentally_valid_composicao` e o filtro: exige o desenho 3+2+2, que leitura
+        # de memoria quase nunca acerta (a do chunk 06 daquele lote tinha 7 nomes e reprovou
+        # por category_excess). Havendo mais de uma leitura valida, ganha a mais repetida; no
+        # empate, a mais cedo no video -- ou seja, a mais proxima da abertura.
+        validas: dict[tuple[str, ...], int] = {}
+        ordem: dict[tuple[str, ...], int] = {}
+        for indice, nomes in enumerate(leituras):
+            normalizada = normalize_composition_list(
+                [normalize_ministro_name(nome) for nome in nomes if normalize_ministro_name(nome)]
+            )
+            if not is_regimentally_valid_composicao(normalizada):
+                continue
+            chave = tuple(normalizada)
+            validas[chave] = validas.get(chave, 0) + 1
+            ordem.setdefault(chave, indice)
+        if validas:
+            melhor = min(validas, key=lambda ch: (-validas[ch], ordem[ch]))
+            return list(melhor)
+
         votos: dict[str, int] = {}
         primeira_aparicao: dict[str, int] = {}
         for indice, nomes in enumerate(leituras):
@@ -8272,6 +8296,48 @@ def _looks_like_non_judgment_item(row: PublishPreviewRow) -> bool:
     return False
 
 
+def _relatores_da_base(notion_client=None, meses: int = 6) -> list[str]:
+    """Relatores gravados na base na janela pedida (um item por julgamento)."""
+    import datetime as _dt
+
+    corte = (_dt.date.today() - _dt.timedelta(days=30 * meses)).isoformat()
+    paginas = notion_client.query_data_source({"and": [
+        {"property": "data_sessao", "date": {"on_or_after": corte}},
+        {"property": "relator", "select": {"is_not_empty": True}},
+    ]})
+    return [
+        (((p.get("properties", {}) or {}).get("relator") or {}).get("select") or {}).get("name") or ""
+        for p in paginas
+    ]
+
+
+def _elenco_vigente(notion_client=None) -> list[str]:
+    """Os 7 titulares do plenario, apurados por relatoria recente; [] se indisponivel.
+
+    A composicao de uma sessao e o colegiado COMPLETO por padrao: em 25/08/2026 os sete
+    estavam presentes e a extracao registrou cinco. [] desliga o completamento.
+    """
+    global _ELENCO_CACHE
+    if _ELENCO_CACHE is not None:
+        return _ELENCO_CACHE
+    _ELENCO_CACHE = []
+    # Sem client explicito nao ha I/O: apurar por conta propria faria a suite de testes
+    # (e qualquer chamada offline) bater no Notion sem ninguem ter pedido.
+    if notion_client is None:
+        return _ELENCO_CACHE
+    try:
+        from gabinete_relator import JANELA_ELENCO_MESES, apurar_elenco
+
+        relatores = _relatores_da_base(notion_client, meses=JANELA_ELENCO_MESES)
+        _ELENCO_CACHE = apurar_elenco([{"relator": r} for r in relatores])
+    except Exception:  # noqa: BLE001 - sem rede/base, nao completa nada
+        _ELENCO_CACHE = []
+    return _ELENCO_CACHE
+
+
+_ELENCO_CACHE: Optional[list[str]] = None
+
+
 def _membros_por_relatoria(notion_client=None) -> set[str]:
     """Ministros com relatoria na base (janela de gabinete_relator); set() se indisponivel.
 
@@ -8283,14 +8349,15 @@ def _membros_por_relatoria(notion_client=None) -> set[str]:
     if _MEMBROS_CACHE is not None:
         return _MEMBROS_CACHE
     _MEMBROS_CACHE = set()
+    if notion_client is None:  # ver _elenco_vigente: nada de I/O implicito
+        return _MEMBROS_CACHE
     try:
         import datetime as _dt
 
         from gabinete_relator import JANELA_MESES, apurar_membros
 
-        client = notion_client or NotionSessoesClient(get_notion_api_key())
         corte = (_dt.date.today() - _dt.timedelta(days=30 * JANELA_MESES)).isoformat()
-        paginas = client.query_data_source({"and": [
+        paginas = notion_client.query_data_source({"and": [
             {"property": "data_sessao", "date": {"on_or_after": corte}},
             {"property": "relator", "select": {"is_not_empty": True}},
         ]})
@@ -8312,15 +8379,30 @@ def consolidate_rows_composicao(
     notion_schema: Optional[NotionDataSourceSchema] = None,
     notion_client: Optional["NotionSessoesClient"] = None,
 ) -> None:
-    """Sanitiza a composicao extraída: normaliza, deduplica, restringe ao elenco
-    conhecido e, quando a lista exceder o plenário (7), substitui pelo conjunto de
-    participantes efetivamente identificados no vídeo (relatores e pedidos de vista).
+    """Reconstroi a composicao de cada linha a partir do ELENCO vigente do plenario.
 
-    A extração global tende a listar TODO ministro citado na sessão — inclusive os
-    de precedentes históricos e corruptelas de transcrição ("Min. Diestéfali") — o
-    que produzia listas de 13+ nomes. Nomes fora das opções já existentes no Notion
-    não são gravados (não criam opção nova); a ata oficial (fluxo DJE) refina depois.
+    A composicao extraida do video e pouco confiavel: o scan pede a lista em cada uma das
+    ~18 janelas, o modelo preenche de memoria e a apuracao por maioria tem uma faixa de
+    empate tecnico onde o ruido decide. Ela erra nos dois sentidos --
+      - a MENOS: em 25/08/2026 registrou 5 dos 7 presentes, faltando os dois do STJ, que
+        nao relataram nada naquela sessao (nenhuma prova interna os alcancava);
+      - a MAIS: listava ministros de precedentes historicos, corruptelas do ASR
+        ("Min. Diestefali") e quem ja deixou a Corte, chegando a 13+ nomes.
+
+    Por isso a composicao NAO e sanitizada, e sim reconstruida, nesta ordem:
+      1. o colegiado vigente (os 7 mais frequentes nas relatorias dos ultimos 3 meses);
+      2. mais quem ATUOU nesta sessao (relator ou pedido de vista) e nao esteja nele --
+         cobre substituto e convocado, que sao presenca provada;
+      3. o que o video trouxe entra so como complemento, e apenas para quem tem relatoria
+         na base (ate o cap de 7).
+    Ausencia e a excecao e nao aparece no video de forma capturavel: a linha sai com o
+    plenario cheio e um aviso para a vistoria corrigir pela ata ou pelo acordao no DJe.
+
+    Sem elenco apurado (base nova, rede fora), cai no comportamento antigo: sanitiza o que
+    veio, garante quem atuou e so poda listas maiores que o plenario.
     """
+    from gabinete_relator import CADEIRAS_TSE, nao_e_membro
+
     participantes: list[str] = []
     for row in rows:
         for name in (row.relator, row.pedido_vista):
@@ -8334,46 +8416,58 @@ def consolidate_rows_composicao(
         if prop is not None and prop.options:
             allowed = set(prop.options)
 
-    # Quem NUNCA relatou na base nao integra a Corte: em 26/08/2026 "Min. Alexandre de
-    # Moraes" tinha ZERO relatorias em 13 meses e ~290 julgamentos, contra 10 aparicoes
-    # nesta coluna. Vazio quando a apuracao nao e confiavel -- ai nada e removido.
-    from gabinete_relator import nao_e_membro
-
     membros = _membros_por_relatoria(notion_client)
+    elenco = _elenco_vigente(notion_client)
 
     for row in rows:
-        comp: list[str] = []
+        extraida: list[str] = []
         for name in row.composicao:
             canonical = normalize_ministro_name(name)
-            if canonical and canonical not in comp:
-                comp.append(canonical)
+            if canonical and canonical not in extraida:
+                extraida.append(canonical)
 
-        # 1) QUEM ATUOU ESTAVA LA. Relator e autor do pedido de vista sao presenca provada;
-        #    faltar na composicao e contradicao interna da propria linha. Ate 26/08/2026 este
-        #    reparo so rodava quando a lista passava de 7 nomes, entao a sessao de 25/08 saiu
-        #    com 5 nomes SEM Estela Aranha (relatora de dois processos) e SEM Dias Toffoli
-        #    (relator de um e autor da vista em outro).
+        if elenco:
+            comp = list(elenco)
+            # substituto/convocado: atuou, logo estava, mesmo fora do elenco titular
+            fora_do_elenco = [m for m in participantes if m not in comp]
+            if fora_do_elenco:
+                comp.extend(fora_do_elenco)
+                row.add_warning(
+                    "composicao inclui quem atuou fora do colegiado titular (" +
+                    ", ".join(fora_do_elenco) + "); confira substituicao/convocacao na ata.")
+            # o video so complementa, e so com quem tem relatoria na base
+            for nome in extraida:
+                if nome in comp or len(comp) >= CADEIRAS_TSE:
+                    continue
+                if membros and nao_e_membro(membros, nome):
+                    continue
+                comp.append(nome)
+            descartados = [m for m in extraida if m not in comp]
+            if descartados:
+                row.add_warning(
+                    "composicao extraida do video trazia nome fora do colegiado vigente "
+                    "(descartado): " + ", ".join(descartados) + ".")
+            acrescentados = [m for m in comp if m not in extraida]
+            if acrescentados:
+                row.add_warning(
+                    "composicao completada com o colegiado vigente (" + ", ".join(acrescentados) +
+                    "); se houve ausencia nesta sessao, corrija pela ata ou pelo acordao no DJe.")
+            row.composicao = comp
+            continue
+
+        # --- sem elenco apurado: comportamento conservador de sempre
+        comp = list(extraida)
         ausentes = [m for m in participantes if m not in comp]
         if ausentes:
             comp.extend(ausentes)
             row.add_warning(
                 "composicao nao trazia quem atuou na sessao (" + ", ".join(ausentes) +
                 "); incluidos por relatoria/pedido de vista.")
-
-        # 2) Nome sem nenhuma relatoria na base sai -- mas nunca um participante desta sessao.
-        if membros:
-            forasteiros = [m for m in comp
-                           if m not in participantes and nao_e_membro(membros, m)]
-            if forasteiros:
-                comp = [m for m in comp if m not in forasteiros]
-                row.add_warning(
-                    "composicao com nome sem nenhuma relatoria na base (removido): " +
-                    ", ".join(forasteiros) + " — conferir pela ata ou pelo acordao no DJe.")
         # Lista plausível (<=7) fica intacta: um nome legítimo ainda sem opção no
         # Notion não pode ser descartado (o aviso de "opções novas" já denuncia).
         # O saneamento agressivo é só para as listas-salada (>7), que misturam
         # ministros de precedentes históricos e corruptelas de transcrição.
-        if len(comp) > 7:
+        if len(comp) > CADEIRAS_TSE:
             if allowed is not None:
                 dropped = [name for name in comp if name not in allowed]
                 if dropped:
@@ -8381,7 +8475,7 @@ def consolidate_rows_composicao(
                         "composicao com nomes fora do elenco conhecido (descartados): " + ", ".join(dropped)
                     )
                     comp = [name for name in comp if name in allowed]
-            if len(comp) > 7 and participantes:
+            if len(comp) > CADEIRAS_TSE and participantes:
                 comp = list(participantes)
                 row.add_warning(
                     "composicao excedia o plenário (7); substituída pelos participantes identificados no vídeo (relatores/vistas). Confirme pela ata."
@@ -8397,15 +8491,20 @@ def build_preview_rows(
 ) -> list[PublishPreviewRow]:
     rows: list[PublishPreviewRow] = []
     session_composicao = normalize_composition_list(analysis.session.composicao)
-    # Aproveita a composicao da sessao como fallback sempre que ela tiver tamanho
-    # plausivel (6 ou 7 ministros). Antes, QUALQUER divergencia regimental
-    # (ex.: um ministro fora do roster, distribuicao institucional atipica) zerava
-    # TODO o fallback e deixava a coluna composicao vazia, mesmo havendo os 7 nomes
-    # corretos extraidos. O ranking _composition_quality continua preferindo
-    # composicoes regimentalmente plenas (3+2+2); a divergencia vira aviso na linha,
-    # nao motivo de descarte. Listas com 8+ ou <=5 nomes seguem descartadas porque
-    # exigem reconciliacao/cap (fora deste escopo) antes de serem confiaveis.
-    session_composicao_fallback = session_composicao if 6 <= len(session_composicao) <= 7 else []
+    # Aproveita a composicao da sessao como fallback quando ela tiver tamanho plausivel.
+    # Antes, QUALQUER divergencia regimental (ex.: um ministro fora do roster, distribuicao
+    # institucional atipica) zerava TODO o fallback e deixava a coluna composicao vazia,
+    # mesmo havendo os 7 nomes corretos extraidos. O ranking _composition_quality continua
+    # preferindo composicoes regimentalmente plenas (3+2+2); a divergencia vira aviso na
+    # linha, nao motivo de descarte.
+    # O piso desceu de 6 para 5 em 26/08/2026: a extracao da sessao de 25/08 devolveu CINCO
+    # nomes (os sete estavam presentes; faltavam no REGISTRO os dois do STJ, que nao
+    # relataram nada e por isso nenhuma prova interna os alcancava). Com o piso em 6, uma
+    # leitura assim perdia o fallback inteiro e publicava a coluna VAZIA -- e o
+    # completamento pelo colegiado vigente, em consolidate_rows_composicao, nem tinha o que
+    # completar. Dado incompleto e sinalizado vale mais que dado ausente. Listas com 8+
+    # seguem descartadas (exigem reconciliacao/cap) e as de 4 ou menos tambem.
+    session_composicao_fallback = session_composicao if 5 <= len(session_composicao) <= 7 else []
     authoritative_session_date = normalize_session_date_to_iso(analysis.session.data_sessao)
     for bundle_index, bundle in enumerate(analysis.bundles, start=1):
         if bundle.should_ignore:
@@ -8461,7 +8560,9 @@ def build_preview_rows(
                 row.add_warning(
                     "composicao com divergencia regimental ("
                     + row_composition_issue
-                    + "); confira os 7 ministros participantes do julgamento."
+                    + "); confira os 7 ministros participantes do julgamento. A lista ja "
+                      "vem completada com o colegiado vigente — se houve ausencia nesta "
+                      "sessao, e aqui que se corrige, pela ata ou pelo acordao no DJe."
                 )
             if notion_client and notion_schema and row.youtube_link:
                 canon_num = canonicalize_numero_processo(row.numero_processo)

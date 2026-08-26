@@ -185,6 +185,15 @@ def relator_do_gabinete(mapa: dict[str, str], orgao_julgador: str) -> str:
 # contra 10 aparicoes na coluna composicao. Nome que nunca relata nao e membro.
 # ---------------------------------------------------------------------------
 MIN_MEMBROS_PLAUSIVEL = 7
+# O plenario do TSE tem 7 cadeiras (3 do STF, 2 do STJ, 2 juristas).
+CADEIRAS_TSE = 7
+# Janela para apurar o ELENCO vigente. Curta: 3 meses bastam para os 7 titulares
+# aparecerem relatando e deixam a cauda de quem saiu para tras (em 26/08/2026, com 3
+# meses, os 7 mais frequentes eram exatamente o colegiado, e Isabel Gallotti -- que
+# deixou a Corte -- ficava em 8o com uma unica relatoria).
+JANELA_ELENCO_MESES = 3
+# O 7o colocado precisa de pelo menos isto para o elenco ser considerado apurado.
+MIN_RELATORIAS_TITULAR = 3
 
 
 def apurar_membros(paginas: list[dict[str, Any]]) -> set[str]:
@@ -210,3 +219,26 @@ def nao_e_membro(membros: set[str], nome: str) -> bool:
     if len(membros) < MIN_MEMBROS_PLAUSIVEL:
         return False
     return bool(nome) and nome not in membros
+
+
+def apurar_elenco(paginas: list[dict[str, Any]]) -> list[str]:
+    """Os titulares vigentes: os CADEIRAS_TSE ministros que mais relataram na janela.
+
+    A composicao de uma sessao e, por padrao, o colegiado COMPLETO -- ausencia e a
+    excecao, nao a regra. Em 25/08/2026 os sete estavam presentes e a extracao registrou
+    cinco; completar pelo elenco acerta o caso comum e deixa a ausencia para a vistoria.
+
+    Devolve [] quando a apuracao nao sustenta um elenco (poucos relatores, ou o 7o
+    colocado com relatorias de menos para ser titular) -- sem elenco, nada e completado.
+    """
+    contagem = collections.Counter(
+        str(item.get("relator") or "").strip()
+        for item in paginas
+        if str(item.get("relator") or "").strip()
+    )
+    if len(contagem) < CADEIRAS_TSE:
+        return []
+    top = contagem.most_common(CADEIRAS_TSE)
+    if top[-1][1] < MIN_RELATORIAS_TITULAR:
+        return []
+    return [nome for nome, _ in top]

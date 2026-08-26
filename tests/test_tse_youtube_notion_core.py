@@ -61,6 +61,8 @@ from tse_youtube_notion_core import (
     _normalize_session_extraction_payload,
     detect_rito_events,
     _repair_cnj_year,
+    is_regimentally_valid_composicao,
+    normalize_composition_list,
 )
 
 
@@ -5458,22 +5460,29 @@ def test_relator_vazio_e_preenchido_pelo_gabinete_sem_aviso(monkeypatch):
     assert not any("divergia do gabinete" in w for w in row.warnings), "preencher vazio nao e divergencia"
 
 
-_MEMBROS_FICTICIOS = {
-    "Min. Nunes Marques", "Min. Antônio Carlos Ferreira", "Min. Ricardo Villas Bôas Cueva",
-    "Min. André Mendonça", "Min. Estela Aranha", "Min. Floriano de Azevedo Marques",
-    "Min. Dias Toffoli", "Min. Isabel Gallotti",
-}
+_ELENCO_VIGENTE = [
+    "Min. Nunes Marques", "Min. André Mendonça", "Min. Dias Toffoli",
+    "Min. Antônio Carlos Ferreira", "Min. Estela Aranha",
+    "Min. Ricardo Villas Bôas Cueva", "Min. Floriano de Azevedo Marques",
+]
+# Isabel Gallotti tem relatorias na base (deixou a Corte em 2026) mas nao e titular vigente.
+_MEMBROS_FICTICIOS = set(_ELENCO_VIGENTE) | {"Min. Isabel Gallotti"}
+# Como o modelo devolveu a composicao de 25/08/2026: cinco nomes, dois intrusos, sem o STJ.
+_COMP_EXTRAIDA = ["Min. Floriano de Azevedo Marques", "Min. Nunes Marques",
+                  "Min. André Mendonça", "Min. Alexandre de Moraes", "Min. Isabel Gallotti"]
 
 
-def _rows_sessao_25_08(monkeypatch, membros=None):
+def _rows_sessao_25_08(monkeypatch, elenco=None, membros=None):
     import tse_youtube_notion_core as core
     monkeypatch.setattr(core, "_MEMBROS_CACHE",
                         _MEMBROS_FICTICIOS if membros is None else membros, raising=False)
-    comp = ["Min. Floriano de Azevedo Marques", "Min. Nunes Marques", "Min. André Mendonça",
-            "Min. Alexandre de Moraes", "Min. Isabel Gallotti"]
+    monkeypatch.setattr(core, "_ELENCO_CACHE",
+                        list(_ELENCO_VIGENTE if elenco is None else elenco), raising=False)
+
     def _r(numero, relator, vista=""):
         return PublishPreviewRow(numero_processo=numero, relator=relator, pedido_vista=vista,
-                                 composicao=list(comp), data_sessao="2026-08-25", classe_processo="")
+                                 composicao=list(_COMP_EXTRAIDA), data_sessao="2026-08-25",
+                                 classe_processo="")
     return [
         _r("0600787-63.2026.6.00.0000", "Min. André Mendonça"),
         _r("0600786-78.2026.6.00.0000", "Min. Estela Aranha"),
@@ -5482,42 +5491,93 @@ def _rows_sessao_25_08(monkeypatch, membros=None):
     ]
 
 
-def test_composicao_recebe_quem_atuou_na_sessao(monkeypatch):
-    """Regressao de 25/08/2026: a composicao saiu com 5 nomes SEM Estela Aranha (relatora de
-    dois processos) e SEM Dias Toffoli (relator de um e autor da vista em outro). O reparo
-    existia, mas so rodava quando a lista passava de 7 nomes."""
+def test_composicao_sai_com_o_colegiado_vigente_completo(monkeypatch):
+    """Regressao de 25/08/2026: os SETE ministros estavam presentes (o presidente cumprimentou
+    os do STJ na abertura) e a extracao registrou CINCO — faltavam justamente os dois do STJ,
+    que nao relataram nada e por isso nenhuma prova interna os alcancava."""
     rows = _rows_sessao_25_08(monkeypatch)
     consolidate_rows_composicao(rows)
     for row in rows:
-        assert "Min. Estela Aranha" in row.composicao
-        assert "Min. Dias Toffoli" in row.composicao
-    assert any("nao trazia quem atuou na sessao" in w for w in rows[0].warnings)
+        assert sorted(row.composicao) == sorted(_ELENCO_VIGENTE)
+    assert any("completada com o colegiado vigente" in w for w in rows[0].warnings)
 
 
-def test_composicao_perde_nome_que_nunca_relatou(monkeypatch):
-    """'Min. Alexandre de Moraes': ZERO relatorias em 13 meses contra 10 aparicoes nesta
-    coluna. Isabel Gallotti FICA — tem relatorias na base, e nao atuar numa sessao nao
-    prova ausencia."""
+def test_composicao_descarta_quem_saiu_da_corte_e_o_ruido(monkeypatch):
+    """'Min. Alexandre de Moraes' (zero relatorias em 13 meses) e 'Min. Isabel Gallotti'
+    (relatou ate 2026, mas nao e titular vigente) saem, ainda que o video os liste."""
     rows = _rows_sessao_25_08(monkeypatch)
     consolidate_rows_composicao(rows)
     assert "Min. Alexandre de Moraes" not in rows[0].composicao
-    assert "Min. Isabel Gallotti" in rows[0].composicao
-    assert any("sem nenhuma relatoria na base" in w for w in rows[0].warnings)
+    assert "Min. Isabel Gallotti" not in rows[0].composicao
+    assert any("fora do colegiado vigente" in w for w in rows[0].warnings)
 
 
-def test_composicao_nao_remove_ninguem_sem_apuracao_confiavel(monkeypatch):
-    """Falso positivo aqui APAGA ministro legitimo: sem apuracao (rede caida, base nova),
-    a remocao fica desligada e so a inclusao por atuacao roda."""
-    for membros in (set(), {"Min. Nunes Marques", "Min. André Mendonça"}):
-        rows = _rows_sessao_25_08(monkeypatch, membros=membros)
-        consolidate_rows_composicao(rows)
-        assert "Min. Alexandre de Moraes" in rows[0].composicao
-        assert "Min. Estela Aranha" in rows[0].composicao, "a inclusao por atuacao nao depende disso"
+def test_quem_atuou_entra_mesmo_fora_do_elenco_titular(monkeypatch):
+    """Substituto/convocado: atuou, logo estava — mesmo sem cadeira titular."""
+    elenco = [m for m in _ELENCO_VIGENTE if m != "Min. Dias Toffoli"] + ["Min. Raul Araújo"]
+    rows = _rows_sessao_25_08(monkeypatch, elenco=elenco)
+    consolidate_rows_composicao(rows)
+    assert "Min. Dias Toffoli" in rows[0].composicao, "relatou e pediu vista nesta sessao"
+    assert any("fora do colegiado titular" in w for w in rows[0].warnings)
 
 
-def test_composicao_nunca_remove_quem_atuou_na_propria_sessao(monkeypatch):
-    """Blindagem: mesmo fora do conjunto de membros, quem relatou na sessao nao pode sair."""
-    membros = _MEMBROS_FICTICIOS - {"Min. Dias Toffoli"}
-    rows = _rows_sessao_25_08(monkeypatch, membros=membros)
+def test_sem_elenco_apurado_cai_no_conservador(monkeypatch):
+    """Base nova ou rede fora: nao inventa colegiado, so garante quem atuou."""
+    rows = _rows_sessao_25_08(monkeypatch, elenco=[])
     consolidate_rows_composicao(rows)
     assert "Min. Dias Toffoli" in rows[0].composicao
+    assert "Min. Antônio Carlos Ferreira" not in rows[0].composicao, "sem elenco nao completa"
+    assert any("nao trazia quem atuou na sessao" in w for w in rows[0].warnings)
+
+
+def _merge(chunks_composicoes):
+    """Roda _merge_session_chunks so pela composicao de cada chunk."""
+    import logging
+    extractor = GeminiSessionExtractor.__new__(GeminiSessionExtractor)
+    extractor.logger = logging.getLogger("test_merge_composicao")
+    chunks = [SessionExtraction(data_sessao="", composicao=list(c), judgments=[])
+              for c in chunks_composicoes]
+    return extractor._merge_session_chunks(chunks).composicao
+
+
+# A leitura da ABERTURA em 25/08/2026 (o presidente cumprimenta os ministros): 3 do STF,
+# 2 do STJ, 2 juristas.
+_ABERTURA = ["Min. Kassio Nunes Marques", "Min. André Mendonça", "Min. Dias Toffoli",
+             "Min. Antonio Carlos Ferreira", "Min. Ricardo Villas Bôas Cueva",
+             "Min. Floriano de Azevedo Marques", "Min. Estela Aranha"]
+# Leitura de MEMORIA do mesmo lote: 7 nomes tambem, mas reprova no desenho regimental.
+_DE_MEMORIA = ["Min. Alexandre de Moraes", "Min. Nunes Marques", "Min. Raul Araújo",
+               "Min. Isabel Gallotti", "Min. Floriano de Azevedo Marques",
+               "Min. André Ramos Tavares", "Min. Estela Aranha"]
+
+
+def test_composicao_da_abertura_vence_a_votacao_entre_chunks():
+    """Regressao de 25/08/2026: a janela da abertura devolveu os 7 ministros corretos e a
+    votacao por maioria os diluiu em 17 leituras de memoria, publicando 5 nomes — dois
+    deles de ministros que nem estavam na Corte. Uma leitura regimentalmente valida (3+2+2)
+    e leitura, nao lembranca: ela vence."""
+    ruido = [["Min. Floriano de Azevedo Marques", "Min. Nunes Marques"]] * 10
+    comp = _merge([_ABERTURA] + ruido + [_DE_MEMORIA])
+    assert sorted(comp) == sorted(normalize_composition_list(_ABERTURA))
+    assert "Min. Alexandre de Moraes" not in comp
+    assert "Min. Isabel Gallotti" not in comp
+
+
+def test_leitura_de_memoria_com_7_nomes_nao_passa_por_valida():
+    """O filtro nao e o tamanho da lista: _DE_MEMORIA tem 7 nomes e reprova por
+    category_excess. Sem nenhuma leitura valida, cai na votacao de sempre."""
+    assert not is_regimentally_valid_composicao(normalize_composition_list(_DE_MEMORIA))
+    comp = _merge([_DE_MEMORIA] * 3 + [["Min. Nunes Marques"]] * 3)
+    assert sorted(comp) != sorted(normalize_composition_list(_ABERTURA))
+
+
+def test_entre_leituras_validas_ganha_a_mais_repetida_e_no_empate_a_mais_cedo():
+    # tambem 3+2+2: Raul Araujo no lugar de Cueva (os dois do STJ)
+    outra = ["Min. Nunes Marques", "Min. André Mendonça", "Min. Dias Toffoli",
+             "Min. Antônio Carlos Ferreira", "Min. Raul Araújo",
+             "Min. Floriano de Azevedo Marques", "Min. Estela Aranha"]
+    assert is_regimentally_valid_composicao(normalize_composition_list(outra))
+    # mais repetida ganha
+    assert sorted(_merge([_ABERTURA, outra, outra])) == sorted(normalize_composition_list(outra))
+    # empate -> a que aparece antes (mais perto da abertura)
+    assert sorted(_merge([_ABERTURA, outra])) == sorted(normalize_composition_list(_ABERTURA))
