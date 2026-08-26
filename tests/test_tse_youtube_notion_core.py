@@ -55,6 +55,12 @@ from tse_youtube_notion_core import (
     tema_looks_generic,
     create_gemini_client,
     validate_preview_row,
+    VIDEO_DETAIL_TAIL_PADDING_SECONDS,
+    _normalize_judgment_bundle_payload,
+    apply_rag_consistency_checks,
+    _normalize_session_extraction_payload,
+    detect_rito_events,
+    _repair_cnj_year,
 )
 
 
@@ -3777,8 +3783,104 @@ def test_extract_judgment_bundle_uses_refined_start_seconds():
     )
 
     assert captured["start_seconds"] == 915
-    assert captured["end_seconds"] == 1000
+    # sem bloco seguinte, o recorte ganha a folga de cauda inteira (a proclamacao vem
+    # depois do ultimo voto e ficava fora da janela do scan)
+    assert captured["end_seconds"] == 1000 + VIDEO_DETAIL_TAIL_PADDING_SECONDS
     assert bundle.start_seconds == 915
+
+
+def test_detail_end_seconds_estende_ate_a_proclamacao_sem_invadir_o_proximo_bloco():
+    """Regressao da sessao de 25/08/2026: o bloco do RO 0600960-72 acabava em 4465 s e o
+    pedido de vista do Min. Andre Mendonca foi anunciado em 4470 s, fora do recorte."""
+    ro = SessionWindow(title_hint="RO", start_seconds=2407, end_seconds=4465,
+                       mentioned_process_numbers=["0600960-72"])
+    seguinte = SessionWindow(title_hint="proximo", start_seconds=4500, end_seconds=4608,
+                             mentioned_process_numbers=["0601227-59"])
+    session = SessionExtraction(data_sessao="25/08/2026", composicao=[],
+                                judgments=[ro, seguinte])
+    fim = GeminiSessionExtractor._detail_end_seconds(session, ro)
+    assert fim == 4500, "tem de alcancar o anuncio em 4470"
+    assert fim <= seguinte.start_seconds, "nunca invade o bloco seguinte"
+    # o ultimo bloco nao tem vizinho a frente: leva a folga cheia
+    assert GeminiSessionExtractor._detail_end_seconds(session, seguinte) == 4608 + VIDEO_DETAIL_TAIL_PADDING_SECONDS
+    # janela sem fim declarado continua sem fim (recorte vai ate o fim do video)
+    aberta = SessionWindow(title_hint="aberta", start_seconds=10, end_seconds=None)
+    assert GeminiSessionExtractor._detail_end_seconds(
+        SessionExtraction(data_sessao="", composicao=[], judgments=[aberta]), aberta) is None
+
+
+def test_normalize_judgment_bundle_resgata_campos_com_nome_natural():
+    """Regressao: o DETAIL_SYSTEM_PROMPT pede os campos pelos nomes naturais e o modelo
+    devolvia 'pedido_de_vista'/'UF'/'resolucoes'; sem alias tudo era descartado em silencio
+    (o 0601908-68 de 25/08/2026 virou '(ministro nao identificado)' no Notion)."""
+    payload = {
+        "items": [
+            {
+                "numero_do_processo": "0601908-68",
+                "pedido_de_vista": "Min. Nunes Marques",
+                "UF": "DF",
+                "pontos_processuais": "Consulta eleitoral; pedido de vista.",
+                "efeitos_praticos": "Define prazos de repasse.",
+                "resolucoes": "Resolução TSE nº 23.746/2023",
+                "jurisprudencia_citada": "RO 0600384-25",
+                "legislacao": "Art. 41 da Lei 9.096/1995",
+                "indicados_em_lista_triplice": "Fulana de Tal, Beltrana de Tal",
+            }
+        ]
+    }
+    item = _normalize_judgment_bundle_payload(payload)["items"][0]
+    assert item["pedido_vista"] == "Min. Nunes Marques"
+    assert item["uf"] == "DF"
+    assert item["pontos_processuais_relevantes"].startswith("Consulta eleitoral")
+    assert item["efeitos_e_providencias_praticas"].startswith("Define prazos")
+    assert item["resolucoes_citadas"] == "Resolução TSE nº 23.746/2023"
+    assert item["precedentes_citados"] == "RO 0600384-25"
+    assert item["fundamentacao_normativa"] == "Art. 41 da Lei 9.096/1995"
+    assert item["indicados_lista_triplice"] == ["Fulana de Tal", "Beltrana de Tal"]
+
+
+def test_normalize_judgment_bundle_nao_sobrescreve_o_campo_canonico():
+    """Em apelido de verdade (dois nomes para o MESMO campo), o canonico manda."""
+    item = _normalize_judgment_bundle_payload({
+        "items": [{"pedido_de_vista": "Min. A", "pedido_vista": "Min. B",
+                   "UF": "AM", "uf": "SP"}]
+    })["items"][0]
+    assert item["pedido_vista"] == "Min. B"
+    assert item["uf"] == "SP"
+
+
+def test_normalize_judgment_bundle_costura_jurisprudencia_e_legislacao():
+    """jurisprudencia_citada/legislacao NAO sao apelidos: o modelo preenche os dois lados com
+    conteudo diferente e renomear perderia metade. No raw_detail_07 de 25/08/2026 veio
+    jurisprudencia_citada='ADI 5274 (STF)' ao lado de precedentes_citados='RO 0600384-25'."""
+    item = _normalize_judgment_bundle_payload({
+        "items": [{"jurisprudencia_citada": "ADI 5274 (STF)",
+                   "precedentes_citados": "RO 0600384-25",
+                   "legislacao": "Art. 41 da Lei 9.096/1995",
+                   "fundamentacao_normativa": "Art. 73, VI, 'a', da Lei 9.504/97"}]
+    })["items"][0]
+    assert "ADI 5274" in item["precedentes_citados"]
+    assert "RO 0600384-25" in item["precedentes_citados"]
+    assert "Art. 41" in item["fundamentacao_normativa"]
+    assert "Art. 73" in item["fundamentacao_normativa"]
+    # campo canonico vazio: o alias simplesmente ocupa o lugar
+    so_alias = _normalize_judgment_bundle_payload({
+        "items": [{"jurisprudencia_citada": "ADI 5274"}]})["items"][0]
+    assert so_alias["precedentes_citados"] == "ADI 5274"
+    # e nao duplica o que ja estiver escrito
+    repetido = _normalize_judgment_bundle_payload({
+        "items": [{"jurisprudencia_citada": "ADI 5274",
+                   "precedentes_citados": "ADI 5274 e outros"}]})["items"][0]
+    assert repetido["precedentes_citados"] == "ADI 5274 e outros"
+
+
+def test_normalize_session_resgata_composicao_ministros():
+    """chunk 16 de 25/08/2026 usou a chave `composicao_ministros`, fora do mapa: a leitura
+    inteira da composicao daquele trecho era descartada."""
+    out = _normalize_session_extraction_payload(
+        {"data_sessao": None, "composicao_ministros": ["Min. Floriano de Azevedo Marques"],
+         "julgamentos": []})
+    assert out["composicao"] == ["Min. Floriano de Azevedo Marques"]
 
 
 def test_analyze_session_generates_placeholder_when_bundle_extraction_fails(tmp_path):
@@ -5165,3 +5267,257 @@ def test_tema_que_e_so_rotulo_processual_e_recusado():
     assert not tema_looks_generic(
         "Acesso ao áudio da fundamentação do acórdão e alegação de omissão", row
     )
+
+
+def _row_ro(**kw):
+    base = dict(numero_processo="0600960-72.2022.6.02.0000", classe_processo="RO",
+                resultado="Desprovido", votacao="Unânime")
+    base.update(kw)
+    return PublishPreviewRow(**base)
+
+
+def _avisa_vista(row):
+    apply_rag_consistency_checks(row)
+    return any("anuncia pedido de vista neste julgamento" in w for w in row.warnings)
+
+
+def test_avisa_quando_desfecho_definitivo_convive_com_vista_pedida_agora():
+    """Regressao de 25/08/2026: o RO 0600960-72 saiu 'Unânime'/'Desprovido' com o pedido de
+    vista do Min. Andre Mendonca fora da janela do scan."""
+    assert _avisa_vista(_row_ro(
+        analise_do_conteudo_juridico="Apos o voto do relator, o Min. Andre Mendonca pediu vista dos autos."))
+    assert _avisa_vista(_row_ro(
+        punchline="O Ministro Dias Toffoli antecipou o pedido de vista e o julgamento foi suspenso."))
+
+
+def test_nao_avisa_quando_a_vista_e_de_sessao_anterior():
+    """Caso retomado hoje e legitimamente definitivo — o aviso nao pode virar ruido."""
+    assert not _avisa_vista(_row_ro(
+        analise_do_conteudo_juridico="Retomado o julgamento apos o voto-vista do Min. Nunes Marques, o recurso foi desprovido."))
+    assert not _avisa_vista(_row_ro(
+        raciocinio_juridico="Em sessão anterior houve pedido de vista do Min. X; agora o colegiado concluiu."))
+    assert not _avisa_vista(_row_ro(
+        analise_do_conteudo_juridico="Em prosseguimento do julgamento, apos o pedido de vista do Min. Y, o recurso foi provido."))
+    # e nao dispara em julgamento que ja esta marcado como suspenso
+    assert not _avisa_vista(_row_ro(resultado="Suspenso por vista", votacao="Suspenso",
+                                    analise_do_conteudo_juridico="O Min. X pediu vista."))
+
+
+def test_resgate_de_bloco_apregoado_marcado_como_cerimonial():
+    """Regressao de 25/08/2026: as listas triplices de Maceio/AL e Florianopolis/SC vieram
+    com should_ignore=true e ignore_reason VAZIO e foram carimbadas de 'cerimonial'."""
+    def w(titulo, numeros, ignorar=True, motivo=""):
+        return SessionWindow(title_hint=titulo, start_seconds=1, end_seconds=2,
+                             mentioned_process_numbers=numeros,
+                             should_ignore=ignorar, ignore_reason=motivo)
+    resgata = GeminiSessionExtractor._should_rescue_ignored_window
+    assert resgata(w("0600787-63", ["0600787-63"]))
+    assert resgata(w("Lista triplice TRE-SC", ["0600786-78"]))
+    # julgamento EM LISTA continua ignorado (decisao de projeto)
+    assert not resgata(w("Lista 1 e 2", ["0600001-11"]))
+    # motivo escrito pelo modelo e respeitado
+    assert not resgata(w("0600123-45", ["0600123-45"], motivo="Apenas leitura do relatorio"))
+    # bloco cerimonial de verdade continua fora, mesmo citando processo
+    assert not resgata(w("Sessao solene de abertura", ["0600999-99"]))
+    # sem numero apregoado nao ha o que resgatar
+    assert not resgata(w("Abertura", []))
+    # e nao mexe em bloco que ja estava ativo
+    assert not resgata(w("0600123-45", ["0600123-45"], ignorar=False))
+
+
+def _rito(texto):
+    return sorted({e.kind for e in detect_rito_events(
+        [TranscriptSnippet(text=texto, start_seconds=10, end_seconds=20)])})
+
+
+def test_rito_nao_confunde_lista_triplice_com_julgamento_em_lista():
+    """Sem esta ressalva o evento 'lista' engole o apregoamento e o passo 2 do refine desliga
+    a janela — o mesmo desfecho que matou as listas triplices de 25/08/2026 no caminho sem
+    transcricao. Aqui o risco e para videos COM legenda."""
+    assert _rito("chamo a julgamento as listas triplices desta sessao") == ["apregoamento"]
+    assert _rito("Chamo a julgamento as listas tríplices para o TRE-SC") == ["apregoamento"]
+    assert _rito("apregoo para o julgamento as listas triplices") == ["apregoamento"]
+    # o julgamento EM LISTA continua sendo detectado como tal (decisao de projeto)
+    assert _rito("chamo a julgamento as listas desta pauta") == ["lista"]
+    assert _rito("passo ao julgamento em lista dos processos remanescentes") == ["lista"]
+    assert _rito("apregoo para o julgamento as listas") == ["lista"]
+    # apregoamento comum segue intacto
+    assert _rito("chamo a julgamento o recurso ordinario") == ["apregoamento"]
+
+
+def test_pedido_vista_nao_aceita_resposta_de_sim_ou_nao():
+    """pedido_vista guarda NOME de ministro; ha "Sim" gravado assim nos artefatos e isso
+    viraria uma opcao nova no select do Notion."""
+    for lixo in ("Sim", "não", "N/A", "nenhum", "true"):
+        item = _normalize_judgment_bundle_payload({"items": [{"pedido_de_vista": lixo}]})["items"][0]
+        assert item["pedido_vista"] == "", lixo
+    for nome in ("Min. Nunes Marques", "Ministro André Mendonça"):
+        item = _normalize_judgment_bundle_payload({"items": [{"pedido_de_vista": nome}]})["items"][0]
+        assert item["pedido_vista"] == nome
+
+
+def test_repair_cnj_year_corrige_ano_com_duas_provas():
+    """A CTA 0601908-68 da sessao de 25/08/2026 saiu ".2023" quando os autos sao ".2022".
+    Mantido nucleo+DV, o modulo 97 fecha para UM unico ano; o DataJud e a segunda prova."""
+    consultados = []
+
+    def lookup_ok(numero, tribunal="", session=None):
+        consultados.append(numero)
+        return object()
+
+    def lookup_vazio(numero, tribunal="", session=None):
+        consultados.append(numero)
+        return None
+
+    assert _repair_cnj_year("0601908-68.2023.6.00.0000", lookup_ok, None,
+                            tribunal="TSE") == "0601908-68.2022.6.00.0000"
+    assert consultados == ["0601908-68.2022.6.00.0000"], "so o ano cujo DV fecha e consultado"
+
+    # sem a confirmacao do DataJud nao corrige (uma prova so nao basta)
+    assert _repair_cnj_year("0601908-68.2023.6.00.0000", lookup_vazio, None, tribunal="TSE") is None
+
+    # nucleo corrompido: nenhum ano fecha o DV -> nada a fazer, vai para a vistoria
+    assert _repair_cnj_year("0600169-43.2026.6.00.0000", lookup_ok, None, tribunal="TRE-DF") is None
+
+    # numero curto nao e assunto deste reparo (quem completa e o lookup)
+    assert _repair_cnj_year("0600787-63", lookup_ok, None) is None
+
+    # se a rede cair, devolve None em vez de propagar
+    def lookup_explode(numero, tribunal="", session=None):
+        raise RuntimeError("timeout")
+    assert _repair_cnj_year("0601908-68.2023.6.00.0000", lookup_explode, None) is None
+
+
+def test_relator_corrigido_pelo_gabinete_do_datajud(monkeypatch):
+    """Caso real de 26/08/2026: a lista triplice do TRE-AM (GABINETE JURISTA 1) saiu com
+    relatora 'Min. Isabel Gallotti', que e do STJ e ocupa outra cadeira. E a consulta
+    0601908-68 (GABINETE STF1) saiu com o relator e o divergente TROCADOS."""
+    import tse_youtube_notion_core as core
+
+    gabinetes = {
+        "0600097-23.2026.6.04.0000": "GABINETE JURISTA 1",
+        "0601908-68.2022.6.00.0000": "GABINETE STF1",
+        "0600960-72.2022.6.02.0000": "GABINETE JURISTA 2",
+        "0601227-59.2026.6.00.0000": "GABINETE STF2",   # fora do mapa: nao corrige
+    }
+    mapa = {
+        "GABINETE JURISTA 1": "Min. Estela Aranha",
+        "GABINETE STF1": "Min. Nunes Marques",
+        "GABINETE JURISTA 2": "Min. Floriano de Azevedo Marques",
+    }
+
+    class _Info:
+        def __init__(self, orgao):
+            self.orgao_julgador = orgao
+            self.numero_completo = ""
+            self.classe_sigla = ""
+
+    monkeypatch.setattr(core, "_carregar_mapa_gabinete", lambda *a, **k: mapa)
+    import cnj_datajud
+    monkeypatch.setattr(cnj_datajud, "lookup_process",
+                        lambda numero, **kw: _Info(gabinetes.get(numero, "")))
+
+    def _row(numero, relator):
+        return PublishPreviewRow(numero_processo=numero, relator=relator,
+                                 data_sessao="2026-08-25", classe_processo="")
+
+    rows = [
+        _row("0600097-23.2026.6.04.0000", "Min. Isabel Gallotti"),   # corrige
+        _row("0601908-68.2022.6.00.0000", "Min. Floriano de Azevedo Marques"),  # corrige
+        _row("0600960-72.2022.6.02.0000", "Min. Floriano de Azevedo Marques"),  # ja certo
+        _row("0601227-59.2026.6.00.0000", "Min. Dias Toffoli"),      # gabinete fora do mapa
+        _row("0600787-63.2026.6.00.0000", "Min. André Mendonça"),    # sem gabinete conhecido
+    ]
+    core.enrich_preview_rows_with_cnj(rows)
+
+    assert rows[0].relator == "Min. Estela Aranha"
+    assert any("divergia do gabinete" in w for w in rows[0].warnings)
+    assert rows[1].relator == "Min. Nunes Marques"
+    assert rows[2].relator == "Min. Floriano de Azevedo Marques"
+    assert not any("divergia do gabinete" in w for w in rows[2].warnings), "nao avisa quando ja bate"
+    assert rows[3].relator == "Min. Dias Toffoli", "gabinete em transicao/ruidoso nao corrige"
+    assert rows[4].relator == "Min. André Mendonça"
+
+
+def test_relator_vazio_e_preenchido_pelo_gabinete_sem_aviso(monkeypatch):
+    import tse_youtube_notion_core as core
+
+    class _Info:
+        orgao_julgador = "GABINETE STF1"
+        numero_completo = ""
+        classe_sigla = ""
+
+    monkeypatch.setattr(core, "_carregar_mapa_gabinete",
+                        lambda *a, **k: {"GABINETE STF1": "Min. Nunes Marques"})
+    import cnj_datajud
+    monkeypatch.setattr(cnj_datajud, "lookup_process", lambda numero, **kw: _Info())
+    row = PublishPreviewRow(numero_processo="0601908-68.2022.6.00.0000", relator="",
+                            data_sessao="2026-08-25", classe_processo="")
+    core.enrich_preview_rows_with_cnj([row])
+    assert row.relator == "Min. Nunes Marques"
+    assert not any("divergia do gabinete" in w for w in row.warnings), "preencher vazio nao e divergencia"
+
+
+_MEMBROS_FICTICIOS = {
+    "Min. Nunes Marques", "Min. Antônio Carlos Ferreira", "Min. Ricardo Villas Bôas Cueva",
+    "Min. André Mendonça", "Min. Estela Aranha", "Min. Floriano de Azevedo Marques",
+    "Min. Dias Toffoli", "Min. Isabel Gallotti",
+}
+
+
+def _rows_sessao_25_08(monkeypatch, membros=None):
+    import tse_youtube_notion_core as core
+    monkeypatch.setattr(core, "_MEMBROS_CACHE",
+                        _MEMBROS_FICTICIOS if membros is None else membros, raising=False)
+    comp = ["Min. Floriano de Azevedo Marques", "Min. Nunes Marques", "Min. André Mendonça",
+            "Min. Alexandre de Moraes", "Min. Isabel Gallotti"]
+    def _r(numero, relator, vista=""):
+        return PublishPreviewRow(numero_processo=numero, relator=relator, pedido_vista=vista,
+                                 composicao=list(comp), data_sessao="2026-08-25", classe_processo="")
+    return [
+        _r("0600787-63.2026.6.00.0000", "Min. André Mendonça"),
+        _r("0600786-78.2026.6.00.0000", "Min. Estela Aranha"),
+        _r("0601908-68.2022.6.00.0000", "Min. Nunes Marques", "Min. Dias Toffoli"),
+        _r("0601227-59.2026.6.00.0000", "Min. Dias Toffoli"),
+    ]
+
+
+def test_composicao_recebe_quem_atuou_na_sessao(monkeypatch):
+    """Regressao de 25/08/2026: a composicao saiu com 5 nomes SEM Estela Aranha (relatora de
+    dois processos) e SEM Dias Toffoli (relator de um e autor da vista em outro). O reparo
+    existia, mas so rodava quando a lista passava de 7 nomes."""
+    rows = _rows_sessao_25_08(monkeypatch)
+    consolidate_rows_composicao(rows)
+    for row in rows:
+        assert "Min. Estela Aranha" in row.composicao
+        assert "Min. Dias Toffoli" in row.composicao
+    assert any("nao trazia quem atuou na sessao" in w for w in rows[0].warnings)
+
+
+def test_composicao_perde_nome_que_nunca_relatou(monkeypatch):
+    """'Min. Alexandre de Moraes': ZERO relatorias em 13 meses contra 10 aparicoes nesta
+    coluna. Isabel Gallotti FICA — tem relatorias na base, e nao atuar numa sessao nao
+    prova ausencia."""
+    rows = _rows_sessao_25_08(monkeypatch)
+    consolidate_rows_composicao(rows)
+    assert "Min. Alexandre de Moraes" not in rows[0].composicao
+    assert "Min. Isabel Gallotti" in rows[0].composicao
+    assert any("sem nenhuma relatoria na base" in w for w in rows[0].warnings)
+
+
+def test_composicao_nao_remove_ninguem_sem_apuracao_confiavel(monkeypatch):
+    """Falso positivo aqui APAGA ministro legitimo: sem apuracao (rede caida, base nova),
+    a remocao fica desligada e so a inclusao por atuacao roda."""
+    for membros in (set(), {"Min. Nunes Marques", "Min. André Mendonça"}):
+        rows = _rows_sessao_25_08(monkeypatch, membros=membros)
+        consolidate_rows_composicao(rows)
+        assert "Min. Alexandre de Moraes" in rows[0].composicao
+        assert "Min. Estela Aranha" in rows[0].composicao, "a inclusao por atuacao nao depende disso"
+
+
+def test_composicao_nunca_remove_quem_atuou_na_propria_sessao(monkeypatch):
+    """Blindagem: mesmo fora do conjunto de membros, quem relatou na sessao nao pode sair."""
+    membros = _MEMBROS_FICTICIOS - {"Min. Dias Toffoli"}
+    rows = _rows_sessao_25_08(monkeypatch, membros=membros)
+    consolidate_rows_composicao(rows)
+    assert "Min. Dias Toffoli" in rows[0].composicao

@@ -365,6 +365,14 @@ TRANSCRIPT_SCAN_MAX_CHARS = int(os.getenv("TRANSCRIPT_SCAN_MAX_CHARS") or "4000"
 TRANSCRIPT_SCAN_OVERLAP_SNIPPETS = int(os.getenv("TRANSCRIPT_SCAN_OVERLAP_SNIPPETS") or "1")
 TRANSCRIPT_SCAN_FAIL_FAST_CONSECUTIVE_ERRORS = int(os.getenv("TRANSCRIPT_SCAN_FAIL_FAST_CONSECUTIVE_ERRORS") or "2")
 TRANSCRIPT_DETAIL_PADDING_SECONDS = int(os.getenv("TRANSCRIPT_DETAIL_PADDING_SECONDS") or "45")
+# Folga de CAUDA da janela no caminho por VIDEO. O recorte enviado ao Gemini era o
+# end_seconds cru do scan, sem folga nenhuma -- so o caminho por transcricao tinha os 45 s
+# acima. A proclamacao/anuncio de vista mora depois do ultimo voto e cai fora por poucos
+# segundos: na sessao de 25/08/2026 o bloco do RO 0600960-72 terminava em 4465 s e o
+# Presidente anunciou o pedido de vista do Min. Andre Mendonca em 4470 s -- 5 s adiante.
+# O caso saiu "Unanime"/"Desprovido" no Notion. A extensao nunca invade o bloco seguinte
+# (para nao misturar julgamentos) nem encurta a janela original.
+VIDEO_DETAIL_TAIL_PADDING_SECONDS = int(os.getenv("VIDEO_DETAIL_TAIL_PADDING_SECONDS") or "60")
 TRANSCRIPT_DETAIL_MAX_CHARS = int(os.getenv("TRANSCRIPT_DETAIL_MAX_CHARS") or "6000")
 REFINE_START_LOOKBACK_SECONDS = int(os.getenv("REFINE_START_LOOKBACK_SECONDS") or "90")
 REFINE_START_LOOKAHEAD_SECONDS = int(os.getenv("REFINE_START_LOOKAHEAD_SECONDS") or "90")
@@ -513,6 +521,8 @@ Nesta primeira etapa, sua função é segmentar a sessão:
 - estimar o timestamp final quando possível;
 - marcar explicitamente blocos que devam ser ignorados, especialmente o julgamento em lista ao final da sessão.
 
+ATENÇÃO — "julgamento em lista" NÃO é "lista tríplice". "Julgamento em lista" é o bloco de processos julgados de uma vez em bloco, em regra ao final da sessão ("chamo a julgamento as listas desta pauta"): esse SIM deve ser ignorado. "Lista tríplice" é a formação da lista de três advogados/juristas para uma vaga de membro de TRE: é um JULGAMENTO NORMAL e deve ser extraído como qualquer outro, nunca ignorado nem tratado como bloco cerimonial ou administrativo.
+
 Se houver julgamento conjunto, mantenha um único bloco para o trecho conjunto, mas liste os números de processo percebidos.
 
 Sobre a composição: o TSE julga em colegiado de até 7 ministros (3 oriundos do STF, 2 do STJ e 2 juristas/advogados da classe). Liste cada ministro presente pelo nome, no formato "Min. <Nome>". Pode haver 6 nomes em caso de ausência, ou substitutos. NÃO inclua ministros citados apenas como autores de votos ou precedentes de outros processos, nem partes, advogados ou procuradores. A composição costuma ser lida uma única vez na abertura da sessão e vale para todos os julgamentos daquela mesma sessão.
@@ -530,6 +540,8 @@ Nesta etapa, sua função é segmentar a sessão:
 - estimar o timestamp final quando possível;
 - marcar explicitamente blocos que devam ser ignorados, especialmente julgamento em lista, leitura de ata ou trechos meramente cerimoniais/administrativos.
 
+ATENÇÃO — "julgamento em lista" NÃO é "lista tríplice". "Julgamento em lista" é o bloco de processos julgados de uma vez em bloco, em regra ao final da sessão ("chamo a julgamento as listas desta pauta"): esse SIM deve ser ignorado. "Lista tríplice" é a formação da lista de três advogados/juristas para uma vaga de membro de TRE: é um JULGAMENTO NORMAL e deve ser extraído como qualquer outro, nunca ignorado nem tratado como bloco cerimonial ou administrativo.
+
 Se houver julgamento conjunto, mantenha um único bloco para o trecho conjunto, mas liste os números de processo percebidos.
 
 Sobre a composição: o TSE julga em colegiado de até 7 ministros (3 oriundos do STF, 2 do STJ e 2 juristas/advogados da classe). Liste cada ministro presente pelo nome, no formato "Min. <Nome>". Pode haver 6 nomes em caso de ausência, ou substitutos. NÃO inclua ministros citados apenas como autores de votos ou precedentes de outros processos, nem partes, advogados ou procuradores. A composição costuma ser lida uma única vez na abertura da sessão e vale para todos os julgamentos daquela mesma sessão.
@@ -541,7 +553,7 @@ Você é um juiz eleitoral incumbido de analisar tecnicamente o conteúdo de uma
 FONTE:
 - Use exclusivamente o conteúdo do próprio vídeo.
 - Se a informação não estiver no vídeo, deixe o campo vazio.
-- Ignore totalmente julgamento em lista ao final da sessão.
+- Ignore totalmente julgamento em lista ao final da sessão (o bloco de processos julgados de uma vez). Isso NÃO alcança a lista tríplice: formação de lista tríplice para vaga de TRE é julgamento normal e deve ser extraída integralmente.
 
 TAREFA:
 - Analise apenas o julgamento delimitado pelo trecho de vídeo fornecido.
@@ -565,6 +577,9 @@ ORIENTAÇÕES OBRIGATÓRIAS POR CAMPO:
 - `classe_processo`: leia a classe processual exatamente como aparece na autuação/cabeçalho exibido na tela e no pregão do caso (ex.: "AgR-AREspe nº 0601309-60"). Capture a classe COMPLETA, preservando os prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED), antes da classe-base. Não reduza um "AgR-AREspe" a "AREspe" nem um "ED-REspe" a "REspe". Se houver agravo regimental sendo julgado pelo colegiado contra decisão monocrática, a classe é a forma com AgRg-. Se a tela não exibir a classe com clareza, deixe o campo vazio em vez de adivinhar a classe-base.
 - `origem`: informe o MUNICÍPIO de origem do processo no formato "Cidade/UF" (ex.: "Santo Antônio do Tauá/PA"), tal como citado no caso. Não preencha origem com o tribunal ("Tribunal Regional Eleitoral do Pará", "TRE-PA") nem com a capital do estado quando o município específico aparecer no vídeo; o nome do tribunal de origem pertence a outro contexto, não à coluna origem.
 - `resultado_final`: registre SEMPRE o desfecho objetivo proclamado para este processo, conforme a classe. Recurso (REspe/AREspe/RO/AgRg-*/RHC/RMS): "Provido", "Desprovido", "Provido em parte", "Não conhecido"/"Não conhecida", "Prejudicado". Consulta: "Aprovada" (consulta respondida). Lista tríplice formada/encaminhada: "Aprovada". Prestação de contas: "Aprovada"/"Aprovada com ressalvas"/"Rejeitada". Registro (RPP/RCand/DRAP): "Deferido"/"Indeferido". Representação/AIJE: "Procedente"/"Procedente em parte"/"Improcedente". Use o gênero correto (recurso=masculino; consulta/contas=feminino). Se o julgamento foi suspenso por pedido de vista, use "Suspenso por vista". Não deixe vazio quando o presidente proclamar o resultado.
+- `pedido_vista`: nomeie o ministro que PEDIU VISTA, no formato "Min. <Nome>". Atenção ao pedido de vista ANTECIPADO: é comum o relator ou o presidente ANUNCIAR que outro ministro antecipará a vista ("o Ministro X antecipa o pedido de vista"). Quem pede vista é o ministro NOMEADO, nunca quem anuncia. Se ninguém pediu vista, deixe o campo vazio.
+- QUEM FALA NÃO É QUEM DECIDE. Antes de atribuir a alguém uma divergência, um voto-vista ou um pedido de vista, confira o nome dito no julgamento: o presidente conduz a sessão e anuncia atos de outros ministros o tempo todo, e o relator resume votos alheios. Nunca deduza o autor da divergência a partir de quem está com a palavra. Se não der para identificar o ministro com segurança, escreva "houve divergência" sem nome em vez de atribuí-la a quem falava.
+- COERÊNCIA entre `pedido_vista`, `analise_do_conteudo_juridico`, `raciocinio_juridico` e `punchline`: quem pediu vista e quem divergiu podem ser pessoas diferentes — não funda os dois papéis num nome só. Se `pedido_vista` ficou vazio, não afirme em prosa quem pediu vista; se o julgamento foi suspenso por vista, a prosa não pode descrevê-lo como decidido.
 - `votacao`: registre como o colegiado votou — "Unânime" (decidido sem divergência; ninguém vencido), "Por maioria" (houve voto vencido/divergência aberta/"X votos a Y") ou "Suspenso" (julgamento suspenso por pedido de vista e ainda NÃO decidido). COERÊNCIA com o resultado: se o resultado for um desfecho definitivo, a votação é "Unânime" ou "Por maioria" — nunca "Suspenso". A simples menção a um pedido de vista anterior não torna a votação "Suspenso" se o caso foi efetivamente julgado.
 """
 
@@ -575,7 +590,7 @@ FONTE:
 - Use apenas a transcrição do vídeo fornecida no prompt.
 - Não use qualquer fonte externa.
 - Se a informação não estiver claramente na transcrição, deixe o campo vazio.
-- Ignore totalmente julgamento em lista ao final da sessão.
+- Ignore totalmente julgamento em lista ao final da sessão (o bloco de processos julgados de uma vez). Isso NÃO alcança a lista tríplice: formação de lista tríplice para vaga de TRE é julgamento normal e deve ser extraída integralmente.
 
 TAREFA:
 - Analise apenas o julgamento delimitado pelos timestamps e pela transcrição fornecidos.
@@ -586,6 +601,9 @@ TAREFA:
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 - `classe_processo`: capture a classe COMPLETA como anunciada/transcrita, preservando prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED). Não reduza "AgR-AREspe" a "AREspe". Se a transcrição não trouxer a classe com clareza, deixe vazio.
 - `origem`: informe o MUNICÍPIO no formato "Cidade/UF" como citado no caso, não o tribunal (TRE) nem a capital quando o município específico aparecer.
+- `pedido_vista`: nomeie o ministro que PEDIU VISTA, no formato "Min. <Nome>". Atenção ao pedido de vista ANTECIPADO: é comum o relator ou o presidente ANUNCIAR que outro ministro antecipará a vista ("o Ministro X antecipa o pedido de vista"). Quem pede vista é o ministro NOMEADO, nunca quem anuncia. Se ninguém pediu vista, deixe o campo vazio.
+- QUEM FALA NÃO É QUEM DECIDE. Antes de atribuir a alguém uma divergência, um voto-vista ou um pedido de vista, confira o nome dito no julgamento: o presidente conduz a sessão e anuncia atos de outros ministros o tempo todo, e o relator resume votos alheios. Nunca deduza o autor da divergência a partir de quem está com a palavra. Se não der para identificar o ministro com segurança, escreva "houve divergência" sem nome em vez de atribuí-la a quem falava.
+- COERÊNCIA entre `pedido_vista`, `analise_do_conteudo_juridico`, `raciocinio_juridico` e `punchline`: quem pediu vista e quem divergiu podem ser pessoas diferentes — não funda os dois papéis num nome só. Se `pedido_vista` ficou vazio, não afirme em prosa quem pediu vista; se o julgamento foi suspenso por vista, a prosa não pode descrevê-lo como decidido.
 """
 
 NEWS_ENRICHMENT_SYSTEM_PROMPT = """
@@ -2602,6 +2620,86 @@ def enrich_preview_rows_with_youtube_chapters(
     return rows
 
 
+def _carregar_mapa_gabinete(lookup_process, session, *, logger=None) -> dict[str, str]:
+    """Mapa {gabinete: ministro} para validar o relator; {} quando indisponivel.
+
+    Reapura da propria base de sessoes quando o cache vence (ver gabinete_relator.py).
+    Qualquer falha devolve {} -- sem mapa, nada e corrigido, que e o comportamento seguro.
+    """
+    try:
+        from gabinete_relator import JANELA_MESES, apurar_mapa, carregar_mapa
+    except Exception as exc:  # noqa: BLE001 - modulo opcional
+        if logger:
+            logger.debug("gabinete->relator indisponivel: %s", exc)
+        return {}
+
+    def apurador():
+        import datetime as _dt
+
+        corte = (_dt.date.today() - _dt.timedelta(days=30 * JANELA_MESES)).isoformat()
+        client = NotionSessoesClient(get_notion_api_key())
+        paginas_notion = client.query_data_source({
+            "and": [
+                {"property": "data_sessao", "date": {"on_or_after": corte}},
+                {"property": "relator", "select": {"is_not_empty": True}},
+            ]
+        })
+        registros = []
+        for page in paginas_notion:
+            props = page.get("properties", {}) or {}
+            numero = "".join(
+                bloco.get("plain_text", "")
+                for bloco in (props.get("numero_processo", {}).get("rich_text") or [])
+            )
+            relator = ((props.get("relator", {}) or {}).get("select") or {}).get("name") or ""
+            if numero and relator:
+                registros.append({"numero": numero, "relator": relator})
+        return apurar_mapa(registros, lookup_process, session=session, logger=logger)
+
+    try:
+        return carregar_mapa(apurador, logger=logger)
+    except Exception as exc:  # noqa: BLE001
+        if logger:
+            logger.warning("gabinete->relator: %s; seguindo sem o mapa.", exc)
+        return {}
+
+
+def _repair_cnj_year(numero: str, lookup_process, session, *, tribunal: str = "",
+                     janela: int = 6) -> Optional[str]:
+    """Corrige o ANO de um CNJ de 20 digitos cujo DV (mod 97) reprova.
+
+    Mantem nucleo, DV, segmento, TR e zona; varre os anos vizinhos e aceita SO o caso em que
+    exatamente UM ano faz o DV fechar E o DataJud confirma o processo. Duas provas
+    independentes -- sem qualquer uma delas devolve None e o numero fica como esta (nucleo
+    corrompido nao tem conserto aqui; o aviso de DV leva o caso para a vistoria).
+    """
+    from cnj_datajud import format_cnj_number
+
+    digitos = re.sub(r"\D", "", str(numero or ""))
+    if len(digitos) != 20:
+        return None
+    ano_atual = int(digitos[9:13])
+    candidatos: list[str] = []
+    for delta in range(-janela, janela + 1):
+        if delta == 0:
+            continue
+        ano = ano_atual + delta
+        if not 1990 <= ano <= 2100:
+            continue
+        tentativa = format_cnj_number(f"{digitos[:9]}{ano:04d}{digitos[13:]}")
+        if tentativa and cnj_check_digit_is_valid(tentativa) is True:
+            candidatos.append(tentativa)
+    if len(candidatos) != 1:
+        return None
+    try:
+        if lookup_process(candidatos[0], tribunal=tribunal, session=session):
+            return candidatos[0]
+    except Exception:  # pragma: no cover - rede
+        return None
+    return None
+
+
+
 def enrich_preview_rows_with_cnj(
     rows: list["PublishPreviewRow"],
     notion_schema: Optional["NotionDataSourceSchema"] = None,
@@ -2621,6 +2719,7 @@ def enrich_preview_rows_with_cnj(
         import requests
 
         from cnj_datajud import format_cnj_number, lookup_process
+        from gabinete_relator import relator_do_gabinete
     except Exception as exc:  # pragma: no cover - dependência opcional
         if logger:
             logger.warning("CNJ DataJud indisponível: %s", exc)
@@ -2636,7 +2735,27 @@ def enrich_preview_rows_with_cnj(
     session = requests.Session()
     applied_num = 0
     applied_classe = 0
+    applied_ano = 0
+    applied_relator = 0
+    mapa_gabinete = _carregar_mapa_gabinete(lookup_process, session, logger=logger)
     for row in rows:
+        # REPARO DE ANO (26/08/2026). O bloco abaixo so COMPLETA numero curto; numero de 20
+        # digitos com o ANO errado passava direto -- a CTA 0601908-68 da sessao de 25/08/2026
+        # saiu ".2023" quando os autos sao ".2022". O ano nao e um palpite: mantendo nucleo+DV,
+        # o modulo 97 fecha para UM unico ano, e so se aplica a correcao quando o DataJud
+        # tambem confirma o processo. Duas provas independentes; sem qualquer das duas, o
+        # numero fica como esta e o aviso de DV leva o caso para a vistoria.
+        if cnj_check_digit_is_valid(row.numero_processo) is False:
+            reparado = _repair_cnj_year(row.numero_processo, lookup_process, session,
+                                        tribunal=row.tribunal)
+            if reparado:
+                if logger:
+                    logger.info("CNJ DataJud: ano corrigido %s -> %s (DV mod 97 + confirmacao "
+                                "no DataJud).", row.numero_processo, reparado)
+                row.numero_processo = reparado
+                row.add_warning(
+                    f"ano do CNJ corrigido para {reparado} (DV mod 97 + DataJud) — conferir na vistoria.")
+                applied_ano += 1
         try:
             info = lookup_process(
                 row.numero_processo,
@@ -2657,14 +2776,40 @@ def enrich_preview_rows_with_cnj(
             if formatted and formatted != row.numero_processo:
                 row.numero_processo = formatted
                 applied_num += 1
+        # RELATOR pelo GABINETE (26/08/2026). O orgao julgador do DataJud e a CADEIRA do
+        # relator -- dado oficial, imune ao ruido do audio. O relator extraido do video nao e:
+        # quando o nome nao e dito com clareza, o modelo pega um da lista de "Composição da
+        # sessão" que o proprio prompt injeta no bloco, e essa lista sai de uma votacao entre
+        # chunks cujo corte tem faixa de empate tecnico. No mesmo julgamento (lista triplice do
+        # TRE-AM, janela identica) tres rodadas devolveram tres relatores diferentes.
+        # So corrige com gabinete UNANIME na base e amostra minima (ver gabinete_relator.py):
+        # gabinete em transicao de ocupante nao entra no mapa.
+        esperado = relator_do_gabinete(mapa_gabinete, getattr(info, "orgao_julgador", "") or "")
+        if esperado:
+            atual = normalize_ministro_name(str(row.relator or ""))
+            if not atual:
+                row.relator = esperado
+                applied_relator += 1
+            elif normalize_ministro_name(esperado) != atual:
+                if logger:
+                    logger.info("Relator corrigido pelo gabinete (%s): %s -> %s [%s]",
+                                getattr(info, "orgao_julgador", ""), row.relator, esperado,
+                                row.numero_processo)
+                row.add_warning(
+                    f"relator '{row.relator}' divergia do gabinete {getattr(info, 'orgao_julgador', '')} "
+                    f"do DataJud; gravado '{esperado}' — conferir na vistoria.")
+                row.relator = esperado
+                applied_relator += 1
+
         sigla = info.classe_sigla
         if sigla and (valid_classes is None or sigla in valid_classes):
             current = str(row.classe_processo or "")
             if (not current or current == "PA") and sigla != current and not classe_is_specificity_downgrade(current, sigla):
                 row.classe_processo = sigla
                 applied_classe += 1
-    if logger and (applied_num or applied_classe):
-        logger.info("CNJ DataJud: numero completado em %s, classe preenchida em %s.", applied_num, applied_classe)
+    if logger and (applied_num or applied_classe or applied_ano or applied_relator):
+        logger.info("CNJ DataJud: numero completado em %s, classe preenchida em %s, ano corrigido em %s, "
+                    "relator pelo gabinete em %s.", applied_num, applied_classe, applied_ano, applied_relator)
     return rows
 
 
@@ -3671,6 +3816,19 @@ def detect_rito_events(snippets: list[TranscriptSnippet]) -> list[RitoEvent]:
                 matched[kind] = found.group(0).strip()
         if not matched:
             continue
+        # "Chamo a julgamento as listas tríplices" NÃO é o bloco de julgamento em lista:
+        # é o apregoamento de julgamentos válidos (formação de lista de três nomes para
+        # vaga de TRE). Sem esta ressalva o evento "lista" nasce, engole o apregoamento
+        # logo abaixo e o passo 2 de refine_session_windows_with_rito desliga as janelas —
+        # o mesmo desfecho que, no caminho SEM transcrição, matou as listas tríplices de
+        # Maceió/AL e Florianópolis/SC em 25/08/2026. `normalized` já vem sem acentos.
+        if "lista" in matched and re.search(r"\btriplice", normalized):
+            chamada = matched.pop("lista")
+            # chamar/apregoar listas tríplices É apregoamento. O padrão de apregoamento pede
+            # artigo no singular ("apregoo o feito"), então "apregoo ... as listas tríplices"
+            # não casa sozinho e o trecho ficaria sem evento algum — sem apregoamento, o passo 1
+            # do refine não resgata a janela.
+            matched.setdefault("apregoamento", chamada)
         # Chamada das listas não é apregoamento individual; abertura da sessão
         # administrativa não é a abertura genérica da sessão.
         if "lista" in matched:
@@ -4272,6 +4430,18 @@ def _normalize_session_window_payload(payload: dict[str, Any]) -> dict[str, Any]
             "razao_para_ignorar": "ignore_reason",
             "motivo_para_ignorar": "ignore_reason",
             "motivo": "ignore_reason",
+            # 26/08/2026 — o motivo escrito pelo modelo e a informacao que distingue "julgamento
+            # em lista" (ignorar) de bloco que so parece cerimonial. Sem estes aliases ele chegava
+            # VAZIO e o codigo carimbava "Bloco cerimonial ou administrativo sem julgamento" por
+            # cima: foi assim que as listas triplices de 25/08/2026 morreram sem deixar rastro do
+            # porque. O bloco 4590-4662 do mesmo video trazia motivo_ignore="Julgamento em lista".
+            "motivo_ignore": "ignore_reason",
+            "motivo_do_ignore": "ignore_reason",
+            "razao_ignore": "ignore_reason",
+            "razao": "ignore_reason",
+            "explicacao_ignore": "ignore_reason",
+            "explicacao": "ignore_reason",
+            "justificativa": "ignore_reason",
         },
     )
     numbers = normalized.get("mentioned_process_numbers")
@@ -4329,11 +4499,70 @@ def _normalize_judgment_bundle_payload(payload: dict[str, Any]) -> dict[str, Any
                 "resultado_do_julgamento": "resultado_final",
                 "lista_triplice": "indicados_lista_triplice",
                 "indicados": "indicados_lista_triplice",
+                # 26/08/2026 — o DETAIL_SYSTEM_PROMPT pede os campos pelos nomes NATURAIS
+                # ("pedido de vista", "pontos processuais", "efeitos praticos", "UF"...) e o
+                # modelo devolve exatamente esses. Sem alias, `_rename_payload_keys` nao acha o
+                # canonico e o valor e descartado em silencio: uma varredura dos 460 pares
+                # raw_detail/02_judgment do acervo achou 50 pedidos de vista COM o nome do
+                # ministro jogados fora (o 0601908-68 da sessao de 25/08/2026 virou "(ministro
+                # nao identificado)" no Notion tendo "Min. Nunes Marques" no raw), 155 UF,
+                # 120 efeitos, 101 pontos processuais, 78 resolucoes e 8 listas de indicados.
+                # Mesma classe de bug que "comissao_presente" causou na composicao (ver o mapa
+                # de _normalize_session_extraction_payload, logo abaixo).
+                "pedido_de_vista": "pedido_vista",
+                "pedido_de_vista_ministro": "pedido_vista",
+                "ministro_pedido_vista": "pedido_vista",
+                "ministro_do_pedido_de_vista": "pedido_vista",
+                "vista": "pedido_vista",
+                "UF": "uf",
+                "sigla_uf": "uf",
+                "pontos_processuais": "pontos_processuais_relevantes",
+                "pontos_processuais_relevantes_do_caso": "pontos_processuais_relevantes",
+                "efeitos_praticos": "efeitos_e_providencias_praticas",
+                "efeitos_práticos": "efeitos_e_providencias_praticas",
+                "efeitos_e_providencias": "efeitos_e_providencias_praticas",
+                "providencias_praticas": "efeitos_e_providencias_praticas",
+                "resolucoes": "resolucoes_citadas",
+                "resoluções": "resolucoes_citadas",
+                "resolucoes_mencionadas": "resolucoes_citadas",
+                "indicados_em_lista_triplice": "indicados_lista_triplice",
+                "indicados_da_lista_triplice": "indicados_lista_triplice",
             },
         )
+        # jurisprudencia_citada/legislacao NAO sao apelidos: o prompt pede os quatro campos e o
+        # modelo costuma preencher os dois lados com conteudo DIFERENTE (no raw_detail_07 de
+        # 25/08/2026 veio jurisprudencia_citada="ADI 5274 (STF)" ao lado de precedentes_citados=
+        # "RO 0600384-25"). Renomear faria o alias perder para o canonico e sumir com metade do
+        # dado -- aqui os dois sao costurados, sem repetir o que ja estiver escrito.
+        for origem, destino in (
+            ("jurisprudencia_citada", "precedentes_citados"),
+            ("jurisprudência_citada", "precedentes_citados"),
+            ("legislacao", "fundamentacao_normativa"),
+            ("legislação", "fundamentacao_normativa"),
+        ):
+            extra = normalize_model_text(normalized_item.get(origem))
+            if not extra:
+                continue
+            atual = normalize_model_text(normalized_item.get(destino))
+            if not atual:
+                normalized_item[destino] = extra
+            elif fold_text_for_match(extra) not in fold_text_for_match(atual):
+                normalized_item[destino] = f"{atual.rstrip('. ')}. {extra}"
+
         for field_name in ("partes", "advogados", "composicao", "indicados_lista_triplice"):
             value = normalized_item.get(field_name)
             normalized_item[field_name] = parse_multi_value_text(value)
+        # `pedido_vista` guarda NOME DE MINISTRO. O modelo as vezes responde a pergunta
+        # ("houve pedido de vista?") em vez de nomear quem pediu -- ha "Sim" gravado assim
+        # nos artefatos. Melhor vazio (o auto-reparo de apply_rag_consistency_checks tenta
+        # garimpar o nome no texto) do que "Sim" virando uma opcao nova no select do Notion.
+        vista_bruta = normalize_model_text(normalized_item.get("pedido_vista"))
+        if fold_text_for_match(vista_bruta) in {
+            "sim", "nao", "true", "false", "s", "n", "na", "n/a", "none", "null",
+            "houve", "nenhum", "nenhuma", "sem pedido de vista", "nao houve",
+        }:
+            normalized_item["pedido_vista"] = ""
+
         for field_name in (
             "data_sessao",
             "eleicao",
@@ -4382,6 +4611,9 @@ def _normalize_session_extraction_payload(payload: dict[str, Any]) -> dict[str, 
             "composicao_presente": "composicao",
             "composição_presente": "composicao",
             "ministros_presentes": "composicao",
+            "composicao_ministros": "composicao",
+            "composição_ministros": "composicao",
+            "ministros": "composicao",
             "colegiado": "composicao",
             "julgamentos": "judgments",
             "blocos": "judgments",
@@ -4975,7 +5207,7 @@ Retorne:
 - números de processo mencionados no bloco;
 - se deve ser ignorado e por quê.
 
-Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivalente.
+Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivalente. Não confunda com LISTA TRÍPLICE (formação de lista de três nomes para vaga de TRE), que é julgamento normal: nunca marque should_ignore=true nela. Sempre que marcar should_ignore=true, escreva o motivo em ignore_reason.
 """
             try:
                 chunk_result = self._call_gemini_text(
@@ -5195,7 +5427,7 @@ Retorne:
 - se deve ser ignorado e por quê.
 
 Se um bloco atravessar a fronteira da janela, ainda assim devolva o timestamp absoluto que conseguir identificar.
-Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equivalente.
+Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equivalente. Não confunda com LISTA TRÍPLICE (formação de lista de três nomes para vaga de TRE), que é julgamento normal: nunca marque should_ignore=true nela. Sempre que marcar should_ignore=true, escreva o motivo em ignore_reason.
 """
             try:
                 chunk_result = self._call_gemini(
@@ -5335,6 +5567,16 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                 judgment.mentioned_process_numbers = dedupe_preserve_order(
                     canonicalize_numero_processo(number) for number in judgment.mentioned_process_numbers
                 )
+                if self._should_rescue_ignored_window(judgment):
+                    self.logger.info(
+                        "Bloco '%s' (t=%s) veio marcado para ignorar sem motivo, mas tem processo "
+                        "apregoado (%s) e nenhum indicio de julgamento em lista — resgatado.",
+                        judgment.title_hint or "sem titulo",
+                        judgment.start_seconds,
+                        ", ".join(judgment.mentioned_process_numbers),
+                    )
+                    judgment.should_ignore = False
+                    judgment.ignore_reason = ""
                 if self._should_force_ignore_window(judgment):
                     judgment.should_ignore = True
                     if not judgment.ignore_reason:
@@ -5404,6 +5646,45 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
         return min(
             counts,
             key=lambda value: (-counts[value], first_seen[value]),
+        )
+
+    @staticmethod
+    def _should_rescue_ignored_window(window: SessionWindow) -> bool:
+        """O modelo marcou should_ignore SEM motivo num bloco que tem processo apregoado?
+
+        Sessao de 25/08/2026: as listas triplices de Maceio/AL e Florianopolis/SC vieram do
+        scan com should_ignore=true e ignore_reason VAZIO -- foi o codigo que carimbou
+        "Bloco cerimonial ou administrativo sem julgamento" e as matou. A causa e linguistica:
+        o prompt manda ignorar "julgamento em LISTA" e o modelo estende isso a "LISTA
+        triplice". A lista triplice de Manaus so escapou porque um outro chunk discordou e o
+        _coalesce_windows a resgatou pelo voto de minoria; as duas sem discordancia morreram.
+
+        Resgata apenas quando ha numero de processo apregoado E nenhum indicio, no texto do
+        bloco, de julgamento em lista ou de ato cerimonial. Um motivo escrito pelo modelo e
+        respeitado: quem sabe por que esta ignorando nao e desautorizado aqui.
+        """
+        if not window.should_ignore:
+            return False
+        if not window.mentioned_process_numbers:
+            return False
+        if normalize_model_text(window.ignore_reason):
+            return False
+        texto = fold_text_for_match(window.title_hint)
+        if not texto:
+            return True
+        marcadores_lista = ("julgamento em lista", "julgamentos em lista", "em lista",
+                            "listas desta pauta", "lista de julgamento", "lista 1", "lista 2")
+        if any(m in texto for m in marcadores_lista) and "triplice" not in texto:
+            return False
+        return not GeminiSessionExtractor._should_force_ignore_window(
+            SessionWindow(
+                title_hint=window.title_hint,
+                start_seconds=window.start_seconds,
+                end_seconds=window.end_seconds,
+                mentioned_process_numbers=[],
+                should_ignore=False,
+                ignore_reason="",
+            )
         )
 
     @staticmethod
@@ -5503,6 +5784,30 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                 return True
         return False
 
+    @staticmethod
+    def _detail_end_seconds(session: SessionExtraction, window: SessionWindow) -> int | None:
+        """Fim do recorte de video do bloco, com folga de cauda ate a proclamacao.
+
+        O scan fecha a janela no ultimo voto; a proclamacao ("proclamo o resultado")
+        e o anuncio de vista vem depois e ficavam FORA do recorte enviado ao Gemini.
+        Estende ate VIDEO_DETAIL_TAIL_PADDING_SECONDS, com dois limites: nunca alcanca
+        o inicio do proximo bloco (misturaria dois julgamentos) e nunca encurta a janela
+        original. Devolve None quando o scan nao deu fim (o recorte segue ate o fim do video).
+        """
+        if window.end_seconds is None:
+            return None
+        fim = coerce_seconds(window.end_seconds)
+        limite = fim + VIDEO_DETAIL_TAIL_PADDING_SECONDS
+        proximos = [
+            coerce_seconds(outra.start_seconds)
+            for outra in session.judgments
+            if outra is not window and outra.start_seconds is not None
+            and coerce_seconds(outra.start_seconds) > fim
+        ]
+        if proximos:
+            limite = min(limite, min(proximos))
+        return max(fim, limite)
+
     def _extract_judgment_bundle(
         self,
         youtube_url: str,
@@ -5530,7 +5835,7 @@ Contexto global:
         Regras:
 - Retorne um item por processo julgado.
 - Se for julgamento conjunto, duplique as informações comuns em cada item.
-- Se o bloco for apenas julgamento em lista, marque should_ignore=true e explique.
+- Se o bloco for apenas julgamento em lista (processos julgados em bloco), marque should_ignore=true e explique. Lista tríplice não é julgamento em lista: extraia normalmente.
 - Seja fiel ao vídeo e deixe em branco o que não estiver explícito.
 - Exceção quanto à composição: preencha o campo composicao de CADA item com a lista de ministros indicada em "Composição da sessão" acima (os que participaram deste julgamento), no formato "Min. <Nome>", mesmo que o trecho não a repita. Só altere se o trecho mostrar entrada, saída, ausência ou substituição de ministro para ESTE processo. Nunca deixe composicao vazia quando a composição da sessão for conhecida.
 """
@@ -5541,7 +5846,7 @@ Contexto global:
                 response_model=JudgmentBundleExtraction,
                 system_prompt=DETAIL_SYSTEM_PROMPT,
                 start_seconds=refined_start_seconds,
-                end_seconds=window.end_seconds,
+                end_seconds=self._detail_end_seconds(session, window),
                 artifact_name=f"raw_detail_{index:02d}.txt",
             )
         except Exception as exc:
@@ -5607,7 +5912,7 @@ Transcrição com timestamps absolutos:
 Regras:
 - Retorne um item por processo julgado.
 - Se for julgamento conjunto, duplique as informações comuns em cada item.
-- Se o trecho for apenas julgamento em lista, marque should_ignore=true e explique.
+- Se o trecho for apenas julgamento em lista (processos julgados em bloco), marque should_ignore=true e explique. Lista tríplice não é julgamento em lista: extraia normalmente.
 - Seja fiel apenas ao que estiver explicitamente transcrito.
 - Exceção quanto à composição: preencha o campo composicao de CADA item com a lista de ministros indicada em "Composição da sessão" acima (os que participaram deste julgamento), no formato "Min. <Nome>", mesmo que a transcrição do trecho não a repita. Só altere se a transcrição mostrar entrada, saída, ausência ou substituição de ministro para ESTE processo. Nunca deixe composicao vazia quando a composição da sessão for conhecida.
 """
@@ -7654,6 +7959,30 @@ def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
             row.add_warning(
                 "resultado 'Suspenso por vista' sem ministro da vista identificado — "
                 "publicado com lacuna; conferir na vistoria.")
+    # Espelho da checagem acima: desfecho DEFINITIVO cuja prosa anuncia vista PEDIDA NESTE
+    # julgamento. Em 25/08/2026 o RO 0600960-72 saiu "Unânime"/"Desprovido" porque o anúncio da
+    # vista do Min. André Mendonça (t=4470) caía 5 s fora da janela do scan; o recorte agora tem
+    # folga de cauda (VIDEO_DETAIL_TAIL_PADDING_SECONDS), e este aviso é a segunda barreira para
+    # quando ainda assim escapar. Padrões restritos de propósito: "após o voto-vista do Ministro
+    # X" e "renovado o pedido de vista" descrevem sessão ANTERIOR e um caso retomado hoje é
+    # legitimamente definitivo — esses não podem disparar.
+    if row.resultado and row.resultado != "Suspenso por vista" and normalize_model_text(row.votacao) not in {"Suspenso", ""}:
+        prosa = " ".join(filter(None, [
+            row.analise_do_conteudo_juridico, row.raciocinio_juridico, row.punchline]))
+        anuncio_de_vista = re.search(
+            r"(?i)(?:pediu vista|pede vista|pedido de vista d[oae]\s|antecip\w+ o pedido de vista"
+            r"|antecip\w+ a vista|julgamento (?:foi )?suspenso (?:por|ap[óo]s) (?:o )?(?:pedido de )?vista"
+            r"|suspens[ãa]o do julgamento (?:por|ap[óo]s) (?:o )?pedido de vista)",
+            prosa)
+        retomada = re.search(
+            r"(?i)\b(?:voto[- ]vista|ap[óo]s o voto[- ]vista|retomad\w+ o julgamento"
+            r"|prosseguimento do julgamento|em sess[ãa]o anterior|na sess[ãa]o de)\b", prosa)
+        if anuncio_de_vista and not retomada:
+            row.add_warning(
+                f"resultado '{row.resultado}' com votação '{row.votacao}', mas o texto extraído "
+                f"anuncia pedido de vista neste julgamento ('{anuncio_de_vista.group(0)}') — "
+                "conferir na vistoria se o caso foi mesmo concluído."
+            )
     allowed = resultado_allowed_for_classe(row.classe_processo)
     if allowed is not None and row.resultado and row.resultado not in allowed:
         row.add_warning(
@@ -7943,9 +8272,45 @@ def _looks_like_non_judgment_item(row: PublishPreviewRow) -> bool:
     return False
 
 
+def _membros_por_relatoria(notion_client=None) -> set[str]:
+    """Ministros com relatoria na base (janela de gabinete_relator); set() se indisponivel.
+
+    Cache proprio de processo: a consolidacao roda uma vez por lote, mas a funcao e barata
+    de chamar e cara de executar (uma query ao Notion). set() vazio desliga a remocao --
+    e o comportamento seguro, porque falso positivo aqui APAGA ministro legitimo.
+    """
+    global _MEMBROS_CACHE
+    if _MEMBROS_CACHE is not None:
+        return _MEMBROS_CACHE
+    _MEMBROS_CACHE = set()
+    try:
+        import datetime as _dt
+
+        from gabinete_relator import JANELA_MESES, apurar_membros
+
+        client = notion_client or NotionSessoesClient(get_notion_api_key())
+        corte = (_dt.date.today() - _dt.timedelta(days=30 * JANELA_MESES)).isoformat()
+        paginas = client.query_data_source({"and": [
+            {"property": "data_sessao", "date": {"on_or_after": corte}},
+            {"property": "relator", "select": {"is_not_empty": True}},
+        ]})
+        _MEMBROS_CACHE = apurar_membros([
+            {"relator": (((p.get("properties", {}) or {}).get("relator") or {}).get("select") or {}).get("name") or ""}
+            for p in paginas
+        ])
+    except Exception:  # noqa: BLE001 - sem rede/base, segue sem remover ninguem
+        _MEMBROS_CACHE = set()
+    return _MEMBROS_CACHE
+
+
+_MEMBROS_CACHE: Optional[set[str]] = None
+
+
+
 def consolidate_rows_composicao(
     rows: list[PublishPreviewRow],
     notion_schema: Optional[NotionDataSourceSchema] = None,
+    notion_client: Optional["NotionSessoesClient"] = None,
 ) -> None:
     """Sanitiza a composicao extraída: normaliza, deduplica, restringe ao elenco
     conhecido e, quando a lista exceder o plenário (7), substitui pelo conjunto de
@@ -7969,12 +8334,41 @@ def consolidate_rows_composicao(
         if prop is not None and prop.options:
             allowed = set(prop.options)
 
+    # Quem NUNCA relatou na base nao integra a Corte: em 26/08/2026 "Min. Alexandre de
+    # Moraes" tinha ZERO relatorias em 13 meses e ~290 julgamentos, contra 10 aparicoes
+    # nesta coluna. Vazio quando a apuracao nao e confiavel -- ai nada e removido.
+    from gabinete_relator import nao_e_membro
+
+    membros = _membros_por_relatoria(notion_client)
+
     for row in rows:
         comp: list[str] = []
         for name in row.composicao:
             canonical = normalize_ministro_name(name)
             if canonical and canonical not in comp:
                 comp.append(canonical)
+
+        # 1) QUEM ATUOU ESTAVA LA. Relator e autor do pedido de vista sao presenca provada;
+        #    faltar na composicao e contradicao interna da propria linha. Ate 26/08/2026 este
+        #    reparo so rodava quando a lista passava de 7 nomes, entao a sessao de 25/08 saiu
+        #    com 5 nomes SEM Estela Aranha (relatora de dois processos) e SEM Dias Toffoli
+        #    (relator de um e autor da vista em outro).
+        ausentes = [m for m in participantes if m not in comp]
+        if ausentes:
+            comp.extend(ausentes)
+            row.add_warning(
+                "composicao nao trazia quem atuou na sessao (" + ", ".join(ausentes) +
+                "); incluidos por relatoria/pedido de vista.")
+
+        # 2) Nome sem nenhuma relatoria na base sai -- mas nunca um participante desta sessao.
+        if membros:
+            forasteiros = [m for m in comp
+                           if m not in participantes and nao_e_membro(membros, m)]
+            if forasteiros:
+                comp = [m for m in comp if m not in forasteiros]
+                row.add_warning(
+                    "composicao com nome sem nenhuma relatoria na base (removido): " +
+                    ", ".join(forasteiros) + " — conferir pela ata ou pelo acordao no DJe.")
         # Lista plausível (<=7) fica intacta: um nome legítimo ainda sem opção no
         # Notion não pode ser descartado (o aviso de "opções novas" já denuncia).
         # O saneamento agressivo é só para as listas-salada (>7), que misturam
@@ -8093,7 +8487,7 @@ def build_preview_rows(
                     row.action = "update"
             rows.append(row)
 
-    consolidate_rows_composicao(rows, notion_schema)
+    consolidate_rows_composicao(rows, notion_schema, notion_client)
     deduped_rows = _dedupe_preview_rows(rows, youtube_url)
     for index, row in enumerate(deduped_rows, start=1):
         row.tipo_registro = f"Julgamento {index}"

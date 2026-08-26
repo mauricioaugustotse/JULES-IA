@@ -118,7 +118,22 @@ class BatchOptions:
     # Relations no Notion (mesmo processo dentro do DJe + DJe <-> sessoes), rodadas
     # ao final da pos-publicacao. Incremental e idempotente: le a base, compara e
     # so grava o que falta. Vive em ProjetoConversor, como o tse_coletor acima.
-    atualizar_relations: bool = True
+    # DESLIGADO por padrao desde 26/08/2026. A promessa de "2 s quando nada mudou" nao se
+    # cumpre NESTA GUI, e nao por causa de sujeira: dje_etapas.relations_precisa_rodar tem dois
+    # portoes NESTA ORDEM (dje_etapas.py:391) -- primeiro o TETO DE IDADE, que dispara sozinho
+    # quando o ultimo sucesso passa de relations_max_idade_horas (20 h) e nem consulta o
+    # --se-sujo; so depois (dje_etapas.py:394) a comparacao de sujeira. Em 26/08/2026 o portao
+    # que abriu foi o teto ("ultimo sucesso ha 137 h"). Numa GUI usada a cada sessao do TSE o
+    # teto de 20 h estoura praticamente sempre, entao a etapa cobra o preco cheio (15,8 min so
+    # na 'interna' naquele dia, mais a 'cross' que o usuario interrompeu).
+    # E, mesmo sem o teto, o segundo portao tambem abriria: quem suja e a INGESTAO do DJe
+    # (ingerir_dje, logo acima nesta mesma pos-publicacao), nao a publicacao das sessoes --
+    # geracao_paginas() so enxerga o lote pelo batch_summary/vistoria, escritos DEPOIS.
+    # Quem religa as bases por padrao e a GUI irma "DJE Relatorios Semanais" (checkbox
+    # "Atualizar relations ao final", que segue marcado la). Marque no Avancado quando quiser.
+    # Este default tambem vale para run_batch_videos.py (CLI); reprocess_videos.py e
+    # republish_missing_days.py ja passavam False explicitamente.
+    atualizar_relations: bool = False
     relations_script: str = r"C:\Users\mauri\ProjetoConversor\relations_manutencao.py"
     # Etapas do freio: com --se-sujo, "ligado por padrao" nao significa 50 min por lote.
     # `temas` NAO entra aqui. Ela liga a base temas <-> base DJe e nao enxerga a base de
@@ -996,9 +1011,14 @@ class BatchGuiApp:
         self.acervo_l1_var = tk.StringVar(value="Acervo do TSE: consultando...")
         self.acervo_l2_var = tk.StringVar(value="")
         self.etapas_var = tk.StringVar(value="Etapas do DJe: consultando...")
-        # LIGADAS por padrao desde 19/08/2026. O que tornou isso viavel foi o freio --se-sujo do
-        # relations_manutencao: sem mudanca na base, a etapa custa 2 segundos em vez de ~50 min.
-        self.atualizar_relations_var = tk.BooleanVar(value=True)   # pos-publicacao: relations no Notion
+        # 19/08/2026 ligou as duas por padrao apostando no freio --se-sujo do relations_manutencao.
+        # A aposta valeu para a ingestao do DJe, nao para as relations: o freio tem um TETO DE
+        # IDADE que roda ANTES da checagem de sujeira (dje_etapas.py:391) e dispara sozinho aos
+        # 20 h -- numa GUI usada a cada sessao ele estoura sempre. Ver o comentario em
+        # BatchOptions.atualizar_relations. Desde 26/08/2026 relations sai DESMARCADA aqui; quem a
+        # mantem marcada por padrao e a GUI irma "DJE Relatorios Semanais" ("Atualizar relations
+        # ao final"), semanal, onde o teto de 20 h e justamente o comportamento desejado.
+        self.atualizar_relations_var = tk.BooleanVar(value=False)  # pos-publicacao: relations no Notion
         self.ingerir_dje_var = tk.BooleanVar(value=True)           # popular a base DJe do Notion
         # Confronto com a base de sessoes alcancando as paginas criadas neste lote. Marcar a caixa
         # do "Avancado" troca "pendente" por "forcar" (reprocessa tudo o que esta na pasta).
@@ -1240,23 +1260,29 @@ class BatchGuiApp:
         tip(
             ttk.Checkbutton(adv, text="Pular a coleta do TSE nesta rodada",
                             variable=self.pular_tse_var),
-            "Normalmente o acervo do TSE é atualizado sozinho antes do primeiro vídeo — é o que a faixa "
-            "'Acervo do TSE', no alto da janela, mostra.\nMarque para NÃO abrir o Edge nesta rodada, por "
-            "exemplo quando você acabou de coletar pelo botão da faixa.",
+            "Antes do primeiro vídeo, o lote baixa sozinho do portal do TSE as decisões publicadas "
+            "desde a última coleta. Quem mostra o estado dessa coleta é o quadro 'Acervo do TSE', "
+            "logo abaixo do título desta janela.\n\nMarque esta caixa para NÃO abrir o Edge nesta "
+            "rodada — por exemplo quando você acabou de clicar em 'Coletar do TSE agora', o botão "
+            "à direita daquele quadro, e o acervo já está em dia.",
         ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
 
         ttk.Separator(adv, orient="horizontal").grid(row=5, column=0, columnspan=4,
                                                      sticky="ew", pady=8)
-        ttk.Label(adv, text="Etapas de manutenção das bases (ligadas por padrão):",
+        ttk.Label(adv, text="Etapas de manutenção das bases (rodam depois de publicar):",
                   style="Muted.TLabel").grid(row=6, column=0, columnspan=4, sticky=tk.W)
 
         tip(
             ttk.Checkbutton(adv, text="Atualizar relations no Notion (pós-publicação)",
                             variable=self.atualizar_relations_var),
             "Ao final da pós-publicação, religa as páginas do mesmo processo no Notion — dentro da base "
-            "DJe e entre DJe ↔ sessões (inclui as sessões publicadas por este lote).\nIncremental e com "
-            "freio: só roda de fato se nasceram páginas ou entraram decisões desde a última passada — "
-            "quando não mudou nada, custa 2 segundos em vez de ~2 h.\n\nA base de TEMAS não entra aqui: "
+            "DJe e entre DJe ↔ sessões (inclui as sessões publicadas por este lote).\n\nVEM DESMARCADA: "
+            "existe um freio, mas ele tem um teto de idade que dispara sozinho quando a última "
+            "passada passou de 20 h — numa janela usada a cada sessão do TSE isso acontece "
+            "quase sempre, e aí a etapa cobra o preço cheio (de ~1 h a ~2 h; em 26/08/2026 "
+            "foram 15,8 min só na primeira das duas metades).\nQuem religa as bases por "
+            "padrão é a GUI 'DJE Relatórios Semanais' ('Atualizar relations ao final'), semanal, "
+            "onde esse teto é justamente o que se quer. Marque aqui só se precisar dos vínculos hoje mesmo.\n\nA base de TEMAS não entra aqui: "
             "ela não enxerga as sessões, então publicar vídeo não lhe dá trabalho nenhum. Ela roda no "
             "atalho 'Atualizar base Temas (TSE)', que é o gatilho de verdade.",
         ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
