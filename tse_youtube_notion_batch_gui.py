@@ -281,12 +281,17 @@ class Tooltip:
     """Balão de ajuda: aparece ~0,5s depois que o mouse pousa no widget.
 
     Singleton visual: só UM balão na tela por vez (mostrar um fecha o anterior —
-    widgets aninhados não empilham balões) e autoexpira após alguns segundos
-    para nunca ficar órfão sobre a interface.
+    widgets aninhados não empilham balões) e fica aberto ENQUANTO o ponteiro
+    estiver sobre o widget: as dicas do painel "Avançado" têm vários parágrafos,
+    e o antigo prazo fixo de 8s fechava o balão no meio da leitura.
+
+    A proteção contra balão órfão que aquele prazo dava virou o vigia _watch(),
+    que cobre os casos em que o <Leave> pode nunca chegar: widget destruído, aba
+    trocada, janela minimizada ou aplicação mandada para segundo plano.
     """
 
     _active: "Tooltip | None" = None
-    AUTO_HIDE_MS = 8000
+    WATCH_MS = 250
 
     def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 500, wraplength: int = 440) -> None:
         self.widget = widget
@@ -295,7 +300,7 @@ class Tooltip:
         self.wraplength = wraplength
         self._tip: tk.Toplevel | None = None
         self._after_id: str | None = None
-        self._expire_id: str | None = None
+        self._watch_id: str | None = None
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
@@ -345,16 +350,40 @@ class Tooltip:
         x = max(x, 8)
         y = max(y, 8)
         tip_window.wm_geometry(f"+{x}+{y}")
-        self._expire_id = self.widget.after(self.AUTO_HIDE_MS, self._hide)
+        self._watch_id = self.widget.after(self.WATCH_MS, self._watch)
+
+    def _pointer_inside(self) -> bool:
+        """O ponteiro segue sobre o widget, com a janela à vista e em primeiro plano?"""
+        w = self.widget
+        try:
+            if not w.winfo_exists() or not w.winfo_viewable():
+                return False
+            if w.focus_displayof() is None:  # app foi para segundo plano (Alt+Tab)
+                return False
+            x0, y0 = w.winfo_rootx(), w.winfo_rooty()
+            px, py = w.winfo_pointerx(), w.winfo_pointery()
+            return x0 <= px < x0 + w.winfo_width() and y0 <= py < y0 + w.winfo_height()
+        except Exception:
+            return False
+
+    def _watch(self) -> None:
+        """Mantém o balão enquanto o mouse estiver em cima; fecha assim que ele sair."""
+        self._watch_id = None
+        if not self._tip:
+            return
+        if not self._pointer_inside():
+            self._hide()
+            return
+        self._watch_id = self.widget.after(self.WATCH_MS, self._watch)
 
     def _hide(self, _event=None) -> None:
         self._cancel()
-        if self._expire_id:
+        if self._watch_id:
             try:
-                self.widget.after_cancel(self._expire_id)
+                self.widget.after_cancel(self._watch_id)
             except Exception:
                 pass
-            self._expire_id = None
+            self._watch_id = None
         if self._tip:
             self._tip.destroy()
             self._tip = None
