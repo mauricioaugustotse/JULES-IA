@@ -5372,7 +5372,13 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                 )
                 continue
             if extracted_chunks:
-                return self._merge_session_chunks(extracted_chunks)
+                merged = self._merge_session_chunks(extracted_chunks)
+                self._preencher_vaos_com_processos_orfaos(
+                    merged,
+                    getattr(self, "_processos_orfaos_do_scan", []),
+                    duration_seconds=duration_seconds,
+                )
+                return merged
         if not getattr(self, "allow_transcript_fallback", True):
             # Salvaguarda: não rebaixa para transcrição (registros rasos). Falha para que
             # o vídeo seja reprocessado por vídeo quando o Gemini conseguir baixá-lo.
@@ -5410,6 +5416,7 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
         extracted_chunks: list[SessionExtraction] = []
         consecutive_failures_without_success = 0
         blocos_descartados_no_plano = 0
+        self._processos_orfaos_do_scan: list[tuple[str, int, int]] = []
         for chunk_index, (start_seconds, end_seconds) in enumerate(windows, start=1):
             prompt = f"""
 Analise apenas o trecho da sessão delimitado por esta janela.
@@ -5487,6 +5494,15 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                 duration_seconds=duration_seconds,
             )
             blocos_descartados_no_plano += sanitize_report["blocos_descartados"]
+            # O numero descartado nao se perde: o chunk so viu o recorte [start, end], entao
+            # se ele nomeia um processo, o processo esta ali. Guarda para
+            # `_preencher_vaos_com_processos_orfaos` decidir depois, com a sessao montada,
+            # se sobrou vao para ele. Chunk com assinatura de degeneracao nao entra: ali o
+            # proprio numero costuma ser fabricado.
+            if not degeneration["suspeito"]:
+                for descartado in sanitize_report.get("descartados", []):
+                    for numero in descartado.get("mentioned_process_numbers", []):
+                        self._processos_orfaos_do_scan.append((numero, start_seconds, end_seconds))
             if sanitize_report["blocos_descartados"]:
                 self.logger.warning(
                     "Scan %s/%s (%ss-%ss): descartados %s de %s blocos fora da janela%s.",
@@ -5544,6 +5560,105 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                 "janela pedida (degeneração do modelo). Escalando para o próximo plano."
             )
         return extracted_chunks
+
+    @staticmethod
+    def _chave_de_processo(numero: str) -> str:
+        """Chave de comparacao de numero de processo, imune ao zero a esquerda.
+
+        `canonicalize_numero_processo` devolve "600535-60" e "0600535-60" como valores
+        DIFERENTES, e comparar por ela criaria a linha fantasma que a revisao de 27/08/2026
+        mediu: o mesmo julgamento entrando duas vezes por causa de um zero. O nucleo
+        eleitoral tem 7 digitos + 2 de DV, entao zerar a esquerda ate 9 iguala as grafias.
+        """
+        digitos = re.sub(r"\D", "", canonicalize_numero_processo(numero) or "")
+        if not digitos:
+            return ""
+        return digitos[:9].rjust(9, "0") if len(digitos) <= 9 else digitos[:9]
+
+    def _preencher_vaos_com_processos_orfaos(
+        self,
+        session: SessionExtraction,
+        orfaos: list[tuple[str, int, int]],
+        duration_seconds: int | None = None,
+        vao_minimo: int = 90,
+    ) -> int:
+        """Cria janela no VAO da sessao para processo que o scan nomeou e ninguem cobriu.
+
+        A guarda `sanitize_scan_chunk_windows` descarta o bloco cujo timestamp cai fora da
+        janela do chunk -- e faz bem, porque timestamp distante e a assinatura da
+        degeneracao. Mas o descarte leva junto o CONTEUDO: em 27/08/2026 o chunk da janela
+        810-1110 s nomeou a Lista Triplice 0600826-60 situando-a em 1500 s; o julgamento
+        estava em 840-1110 s, nenhum outro chunk o viu, e ele sumiu da sessao.
+
+        Aqui a informacao descartada volta pela porta segura. NADA que ja exista e tocado --
+        nem timestamp, nem numero, nem ordem: so se cria janela no espaco LIVRE da janela
+        daquele chunk, e apenas para processo que sobrou orfao. A alternativa tentada antes
+        (reancorar o bloco na janela do chunk) foi descartada numa revisao adversarial que
+        mediu o estrago em videos reais: o bloco reancorado puxava o inicio de julgamentos
+        VERDADEIROS pelo min() do `_coalesce_windows` (o 0600504-40 de 19/08 ia de 1608 s
+        para 270 s, triplicando o recorte enviado ao Gemini) e criava linhas duplicadas
+        quando a grafia do numero variava.
+
+        `orfaos`: [(numero, janela_inicio, janela_fim)] -- o numero descartado e a janela do
+        chunk que o nomeou, que e onde ele de fato esta.
+        """
+        if not orfaos:
+            return 0
+        cobertos = {
+            self._chave_de_processo(numero)
+            for window in session.judgments
+            for numero in window.mentioned_process_numbers
+        }
+        cobertos.discard("")
+        ocupados = sorted(
+            (coerce_seconds(w.start_seconds),
+             coerce_seconds(w.end_seconds) if w.end_seconds is not None else coerce_seconds(w.start_seconds))
+            for w in session.judgments
+            if w.start_seconds is not None
+        )
+        criadas = 0
+        for numero, janela_ini, janela_fim in orfaos:
+            chave = self._chave_de_processo(numero)
+            if not chave or chave in cobertos:
+                continue
+            limite_ini, limite_fim = coerce_seconds(janela_ini), coerce_seconds(janela_fim)
+            if duration_seconds:
+                limite_fim = min(limite_fim, coerce_seconds(duration_seconds))
+            # MAIOR trecho livre dentro da janela do chunk (nao encurta: pula o ocupado)
+            melhor = (0, 0)
+            cursor = limite_ini
+            for ini_ocupado, fim_ocupado in ocupados + [(limite_fim, limite_fim)]:
+                if ini_ocupado >= limite_fim:
+                    ini_ocupado = limite_fim
+                if ini_ocupado > cursor and ini_ocupado - cursor > melhor[1] - melhor[0]:
+                    melhor = (cursor, min(ini_ocupado, limite_fim))
+                cursor = max(cursor, fim_ocupado)
+                if cursor >= limite_fim:
+                    break
+            if melhor[1] - melhor[0] < vao_minimo:
+                self.logger.info(
+                    "Processo %s ficou sem janela propria, mas o trecho do chunk que o nomeou "
+                    "ja esta ocupado por outros julgamentos — sem vao para criar.", numero)
+                continue
+            cobertos.add(chave)
+            ocupados = sorted(ocupados + [melhor])
+            session.judgments.append(
+                SessionWindow(
+                    title_hint=numero,
+                    start_seconds=melhor[0],
+                    end_seconds=melhor[1],
+                    mentioned_process_numbers=[numero],
+                    should_ignore=False,
+                )
+            )
+            criadas += 1
+            self.logger.info(
+                "Vao %ss-%ss preenchido com o processo %s, que o scan nomeou e nenhum bloco "
+                "cobria (o timestamp devolvido pelo modelo caia fora da janela do chunk).",
+                melhor[0], melhor[1], numero)
+        if criadas:
+            session.judgments.sort(key=lambda item: (item.start_seconds, item.title_hint))
+        return criadas
 
     def _merge_session_chunks(self, chunks: list[SessionExtraction]) -> SessionExtraction:
         merged = SessionExtraction(data_sessao="", composicao=[], judgments=[])

@@ -5581,3 +5581,78 @@ def test_entre_leituras_validas_ganha_a_mais_repetida_e_no_empate_a_mais_cedo():
     assert sorted(_merge([_ABERTURA, outra, outra])) == sorted(normalize_composition_list(outra))
     # empate -> a que aparece antes (mais perto da abertura)
     assert sorted(_merge([_ABERTURA, outra])) == sorted(normalize_composition_list(_ABERTURA))
+
+
+def _win(titulo, inicio, fim, numeros=()):
+    return SessionWindow(title_hint=titulo, start_seconds=inicio, end_seconds=fim,
+                         mentioned_process_numbers=list(numeros))
+
+
+def _sessao(*windows):
+    return SessionExtraction(data_sessao="", composicao=[], judgments=list(windows))
+
+
+def _extrator():
+    import logging
+    ex = GeminiSessionExtractor.__new__(GeminiSessionExtractor)
+    ex.logger = logging.getLogger("test_vaos")
+    return ex
+
+
+def test_vao_recebe_o_processo_que_o_scan_nomeou_e_ninguem_cobriu():
+    """Regressao de 27/08/2026: o chunk da janela 810-1110s nomeou a Lista Triplice
+    0600826-60 situando-a em 1500s. O julgamento estava em 840-1110s, nenhum outro chunk o
+    viu, e a guarda de janela o descartou — a lista sumiu da sessao."""
+    ex = _extrator()
+    sessao = _sessao(_win("abertura", 817, 840, ["0600000-00"]),
+                     _win("0601171-60", 1110, 1178, ["0601171-60"]),
+                     _win("0600604-92", 1195, 1438, ["0600604-92"]))
+    criadas = ex._preencher_vaos_com_processos_orfaos(
+        sessao, [("060082660", 810, 1110)], duration_seconds=5820)
+    assert criadas == 1
+    nova = next(w for w in sessao.judgments if "82660" in w.title_hint)
+    assert (nova.start_seconds, nova.end_seconds) == (840, 1110), "o vao livre da janela do chunk"
+    assert sessao.judgments[0].start_seconds == 817, "nada do que ja existia foi tocado"
+
+
+def test_orfao_nao_desloca_nem_duplica_julgamento_ja_coberto():
+    """Dano medido na revisao adversarial de 27/08/2026 sobre o video de 19/08: reancorar o
+    bloco levava o 0600504-40 de 1608s para 270s pelo min() do _coalesce_windows,
+    triplicando o recorte enviado ao Gemini. Preencher vao nao pode fazer isso."""
+    ex = _extrator()
+    sessao = _sessao(_win("0600504-40", 1608, 2234, ["0600504-40"]))
+    ex._preencher_vaos_com_processos_orfaos(
+        sessao, [("0600504-40", 810, 1110)] * 9, duration_seconds=3694)
+    assert len(sessao.judgments) == 1
+    assert (sessao.judgments[0].start_seconds, sessao.judgments[0].end_seconds) == (1608, 2234)
+
+
+def test_zero_a_esquerda_nao_gera_linha_fantasma():
+    """Outro dano medido: '600535-60' e '0600535-60' sao o MESMO processo, mas
+    canonicalize_numero_processo os devolve diferentes — comparar por ela duplicava a linha."""
+    ex = _extrator()
+    sessao = _sessao(_win("0600535-60", 900, 1200, ["0600535-60"]))
+    ex._preencher_vaos_com_processos_orfaos(
+        sessao, [("600535-60", 300, 900)], duration_seconds=4000)
+    assert len(sessao.judgments) == 1
+    assert GeminiSessionExtractor._chave_de_processo("600535-60") ==            GeminiSessionExtractor._chave_de_processo("0600535-60")
+
+
+def test_numero_nao_canonizavel_e_janela_cheia_nao_criam_nada():
+    ex = _extrator()
+    sessao = _sessao(_win("x", 0, 100, []))
+    ex._preencher_vaos_com_processos_orfaos(
+        sessao, [("06001614-74.2026.6.00.0000", 810, 1110)], duration_seconds=5820)
+    assert len(sessao.judgments) == 1, "numero que canoniza para vazio nao vira janela"
+
+    cheia = _sessao(_win("cheio", 800, 1120, ["0600111-11"]))
+    ex._preencher_vaos_com_processos_orfaos(
+        cheia, [("0600999-99", 810, 1110)], duration_seconds=5820)
+    assert len(cheia.judgments) == 1, "sem espaco livre nao se inventa janela"
+
+
+def test_sem_orfaos_a_sessao_fica_intacta():
+    ex = _extrator()
+    sessao = _sessao(_win("a", 100, 200, ["0600001-11"]))
+    assert ex._preencher_vaos_com_processos_orfaos(sessao, [], duration_seconds=3000) == 0
+    assert len(sessao.judgments) == 1
