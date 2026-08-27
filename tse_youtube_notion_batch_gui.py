@@ -1037,6 +1037,8 @@ class BatchGuiApp:
         # de controle e o override, no painel Avancado.
         self.pular_tse_var = tk.BooleanVar(value=False)
         self.show_advanced_var = tk.BooleanVar(value=False)
+        # altura da janela antes de abrir o Avançado, para devolvê-la intacta ao fechar
+        self._altura_sem_avancado: int | None = None
         self.acervo_l1_var = tk.StringVar(value="Acervo do TSE: consultando...")
         self.acervo_l2_var = tk.StringVar(value="")
         self.etapas_var = tk.StringVar(value="Etapas do DJe: consultando...")
@@ -1171,10 +1173,79 @@ class BatchGuiApp:
 
         self.notebook = ttk.Notebook(main)
         self.notebook.pack(fill=tk.BOTH, expand=True)
-        process_tab = ttk.Frame(self.notebook, padding=10)
+
+        # A aba "Processar lote" ROLA. Com o painel "Avançado" aberto o conteúdo pede
+        # ~850px e a área útil da aba é ~490px numa tela de 864px (1080 com escala 125%).
+        # Sem rolagem o grid repartia a falta entre as linhas com weight e o resultado
+        # era o "3 · Execução" reduzido a 9px, com os botões encavalados, e o log fora
+        # da janela. Enquanto o conteúdo COUBER, o frame interno recebe a altura do
+        # canvas e nada muda — tabela e log seguem esticando com a janela; só quando não
+        # couber ele assume o tamanho natural e a barra aparece.
+        process_host = ttk.Frame(self.notebook)
+        process_host.columnconfigure(0, weight=1)
+        process_host.rowconfigure(0, weight=1)
+        self._process_canvas = tk.Canvas(process_host, highlightthickness=0, borderwidth=0)
+        self._process_canvas.grid(row=0, column=0, sticky="nsew")
+        self._process_vbar = ttk.Scrollbar(process_host, orient=tk.VERTICAL,
+                                           command=self._process_canvas.yview)
+        self._process_canvas.configure(yscrollcommand=self._process_vbar.set)
+        process_tab = ttk.Frame(self._process_canvas, padding=10)
+        self._process_win = self._process_canvas.create_window(
+            (0, 0), window=process_tab, anchor="nw")
+
         vistoria_tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(process_tab, text="  Processar lote  ")
+        self.notebook.add(process_host, text="  Processar lote  ")
         self.notebook.add(vistoria_tab, text="  5 · Fila de vistoria  ")
+
+        _scroll_estado = {"w": -1, "h": -1}
+
+        def _ajusta_scroll(_event: Any = None) -> None:
+            """Redimensiona o frame interno e mostra a barra só quando faz falta.
+
+            NÃO usa o tamanho natural do conteúdo como piso: mesmo com o Avançado
+            fechado ele pede ~600px para ~490px de aba, e este layout sempre contou com
+            a compressão da tabela e do log pelos weights para caber. Usar o natural
+            faria a barra aparecer o tempo todo. O piso é o quanto ainda dá para
+            comprimir sem estragar (_folga_compressivel), e só o que passa disso rola.
+            """
+            cv, bar = self._process_canvas, self._process_vbar
+            larg, alt = cv.winfo_width(), cv.winfo_height()
+            if larg <= 1 or alt <= 1:  # ainda não mapeado
+                return
+            minimo = process_tab.winfo_reqheight() - self._folga_compressivel()
+            alvo = max(minimo, alt)
+            # só reconfigura quando muda de fato: itemconfigure dispara <Configure> e
+            # sem esta guarda os dois binds se realimentariam em laço
+            if (larg, alvo) != (_scroll_estado["w"], _scroll_estado["h"]):
+                _scroll_estado.update(w=larg, h=alvo)
+                cv.itemconfigure(self._process_win, width=larg, height=alvo)
+                cv.configure(scrollregion=(0, 0, larg, alvo))
+            precisa = alvo > alt
+            if precisa and not bar.winfo_ismapped():
+                bar.grid(row=0, column=1, sticky="ns")
+            elif not precisa and bar.winfo_ismapped():
+                bar.grid_remove()
+                cv.yview_moveto(0)
+
+        self._ajusta_scroll_aba = _ajusta_scroll
+        self._process_canvas.bind("<Configure>", _ajusta_scroll)
+        process_tab.bind("<Configure>", _ajusta_scroll)
+
+        def _roda_do_mouse(event: Any) -> None:
+            """Roda rola a ABA — menos sobre a tabela e o log, que rolam sozinhos."""
+            if not self._process_vbar.winfo_ismapped():
+                return
+            proprios = (getattr(self, "tree", None), getattr(self, "output_text", None))
+            w = getattr(event, "widget", None)
+            while w is not None and not isinstance(w, str):
+                if w in proprios:
+                    return
+                if w is process_tab:
+                    self._process_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                    return
+                w = getattr(w, "master", None)
+
+        self.root.bind_all("<MouseWheel>", _roda_do_mouse, add="+")
         self.vistoria_tab_index = 1
         tip(
             ttk.Progressbar(statusbar, variable=self.progress_var, maximum=100, mode="determinate", length=300),
@@ -1335,17 +1406,51 @@ class BatchGuiApp:
         tip(
             ttk.Checkbutton(adv, text="Pular o confronto com a base de sessões",
                             variable=self.pular_sessoes_var),
-            "Não roda o confronto dos CSVs do DJe com a base de sessões nesta rodada.\n\n"
-            "Marque só quando o watcher automático (tarefa WatchDJe_Notion) estiver ativo E você "
-            "não tiver publicado páginas novas — porque o watcher contínuo não alcança páginas "
-            "criadas depois da passada dele.",
+            "O QUE É O CONFRONTO: depois de publicar, o lote cruza os CSVs que o coletor baixou "
+            "do DJe com as páginas da base de SESSÕES, casando pelo número CNJ do processo, e "
+            "copia para elas o que o vídeo não diz — partes, advogados e afins. É esta etapa que "
+            "tira as páginas recém-publicadas do estado 'sem partes'.\n\n"
+            "DESMARCADA (padrão, recomendado): o lote confronta os CSVs pendentes e ALCANÇA as "
+            "páginas que ele mesmo acabou de criar nesta rodada.\n\n"
+            "MARCADA: pula a etapa hoje. As páginas deste lote ficam sem partes/advogados até "
+            "alguém confrontar depois, e o contador 'sessões: N a confrontar' — no quadro "
+            "'Acervo do TSE', no alto da janela — continua acusando a pendência.\n\n"
+            "QUANDO MARCAR: só quando o watcher automático (tarefa WatchDJe_Notion) estiver ativo "
+            "E você não tiver publicado nada nesta rodada. O watcher contínuo não enxerga páginas "
+            "criadas depois da passada dele — foi assim que, em 19/08/2026, seis páginas saíram "
+            "com as partes vazias.",
         ).grid(row=8, column=2, columnspan=2, sticky=tk.W, padx=(14, 0), pady=(6, 0))
 
         def _toggle_advanced(*_args: Any) -> None:
-            if self.show_advanced_var.get():
+            """Abre/fecha o Avançado.
+
+            Quem garante que o painel não espreme mais o "3 · Execução" é a rolagem da
+            aba (ver o canvas na montagem do notebook). Ainda assim a janela CRESCE pela
+            altura do painel quando há folga na tela: rolar é o último recurso, não o
+            primeiro — em tela grande o painel cabe e a barra nem aparece.
+
+            Ao fechar devolve a altura EXATA de antes, em vez de subtrair a do painel:
+            na abertura ela pode ter esbarrado na borda da tela e não crescido tudo o que
+            o painel pediu, e aí subtrair encolhia a janela a cada ciclo (754 -> 640).
+            """
+            mostrar = bool(self.show_advanced_var.get())
+            if mostrar:
+                self.root.update_idletasks()
+                self._altura_sem_avancado = self.root.winfo_height()
                 self.adv_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
             else:
                 self.adv_frame.grid_remove()
+            self.root.update_idletasks()
+            if self.root.state() != "zoomed":  # maximizada: quem manda na altura é o Windows
+                if mostrar:
+                    alvo = min(self.root.winfo_height() + self.adv_frame.winfo_reqheight() + 8,
+                               self.root.winfo_screenheight() - 110)
+                else:
+                    alvo = self._altura_sem_avancado or self.root.winfo_height()
+                self.root.geometry(
+                    f"{self.root.winfo_width()}x{max(self.root.minsize()[1], alvo)}")
+                self.root.update_idletasks()
+            self._ajusta_scroll_aba()
 
         self.show_advanced_var.trace_add("write", _toggle_advanced)
 
@@ -1437,6 +1542,22 @@ class BatchGuiApp:
         scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.output_text.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.output_text.configure(yscrollcommand=scroll.set)
+
+        # Pisos das duas linhas elásticas. O grid reparte a falta de altura entre as
+        # linhas com weight, e sem piso o "3 · Execução" era comprimido a 9px (botões
+        # encavalados) e o log sumia. Com piso, o grid comprime só até aqui e o que
+        # ainda faltar vira rolagem da aba. Medidos em runtime: dependem da fonte e da
+        # escala do Windows.
+        process_tab.update_idletasks()
+        self._exec_frame = exec_frame
+        self._log_frame = log_frame
+        self._piso_exec = actions.winfo_reqheight() + 110  # botões + rótulo + ~3 linhas
+        self._piso_log = 60                                # ~2 linhas de log
+        # +8 = o pady=(8, 0) com que cada um entra no grid; o minsize vale para a LINHA,
+        # então sem somá-lo o frame ficaria esses 8px abaixo do piso pretendido.
+        process_tab.rowconfigure(3, weight=3, minsize=self._piso_exec + 8)
+        process_tab.rowconfigure(4, weight=1, minsize=self._piso_log + 8)
+        self._ajusta_scroll_aba()
 
         # ================= ABA 2 — FILA DE VISTORIA =================
         vistoria_tab.columnconfigure(0, weight=1)
@@ -1813,6 +1934,22 @@ class BatchGuiApp:
         clicar "Processar lote" com o Edge do coletor aberto, e as duas rodadas se atropelavam.
         """
         return bool((self.worker and self.worker.is_alive()) or self._threads_avulsas > 0)
+
+    # ------------------------------------------------------ rolagem da aba do lote
+    def _folga_compressivel(self) -> int:
+        """Quanto a aba "Processar lote" ainda pode encolher sem estragar.
+
+        É a soma do que a tabela de vídeos e o log conseguem ceder antes de baterem no
+        piso de cada um. Serve de desconto sobre o tamanho natural do conteúdo: só o que
+        sobra depois dessa compressão é que vira rolagem, e por isso a barra não aparece
+        no estado normal (Avançado fechado), onde o layout sempre coube comprimido.
+        """
+        total = 0
+        for frame, piso in ((getattr(self, "_exec_frame", None), getattr(self, "_piso_exec", 0)),
+                            (getattr(self, "_log_frame", None), getattr(self, "_piso_log", 0))):
+            if frame is not None and piso:
+                total += max(0, frame.winfo_reqheight() - piso)
+        return total
 
     # ------------------------------------------------------ faixa: acervo do TSE
     def _atualizar_faixa_acervo(self) -> None:
