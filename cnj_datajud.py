@@ -183,6 +183,20 @@ def _build_process(source: dict[str, Any], alias: str) -> CnjProcess:
     )
 
 
+_TR_BY_UF = {
+    "AC": "01", "AL": "02", "AP": "03", "AM": "04", "BA": "05", "CE": "06", "DF": "07", "ES": "08",
+    "GO": "09", "MA": "10", "MT": "11", "MS": "12", "MG": "13", "PA": "14", "PB": "15", "PR": "16",
+    "PE": "17", "PI": "18", "RJ": "19", "RN": "20", "RS": "21", "RO": "22", "RR": "23", "SC": "24",
+    "SE": "25", "SP": "26", "TO": "27",
+}
+
+
+def _tr_code_for(tribunal: str) -> str:
+    """'TRE-BA' -> '05' (codigo do TR no CNJ eleitoral); '' para TSE/vazio."""
+    match = re.search(r"TRE[-/ ]?([A-Za-z]{2})", str(tribunal or ""), flags=re.IGNORECASE)
+    return _TR_BY_UF.get(match.group(1).upper(), "") if match else ""
+
+
 def lookup_process(
     numero_display: str,
     tribunal: str = "",
@@ -205,6 +219,15 @@ def lookup_process(
         sources = [h.get("_source", {}) for h in hits if h.get("_source")]
         if not sources:
             continue
+        # 03/09/2026: prefixo 0600016-24 com varios anos/UFs e o ANO informado e o da sessao
+        # (2026), nao o dos autos (2023) -- o filtro por ano zerava, o lookup devolvia None e o
+        # grounding chutava o sufixo. O TR do tribunal informado e prova melhor: entre os
+        # candidatos, ficam so os daquela UF.
+        tr = _tr_code_for(tribunal)
+        if tr and len(digits) < 20:
+            same_tr = [s for s in sources if str(s.get("numeroProcesso", ""))[14:16] == tr]
+            if same_tr:
+                sources = same_tr
         # desambigua por ano (posições 9..12 do numeroProcesso) quando houver
         if year and len(digits) < 20:
             same_year = [s for s in sources if str(s.get("numeroProcesso", ""))[9:13] == year]

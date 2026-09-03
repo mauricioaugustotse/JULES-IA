@@ -3078,7 +3078,7 @@ def test_process_metadata_enricher_still_grounds_when_cnj_is_incomplete(tmp_path
         eleicao="2024",
         origem="",
         tribunal="TSE",
-        numero_processo="0600001-01",
+        numero_processo="0600001-87",
         youtube_link="https://www.youtube.com/watch?v=abc123&t=10",
         relator="Min. Cármen Lúcia",
         resultado="Aprovada",
@@ -3089,9 +3089,9 @@ def test_process_metadata_enricher_still_grounds_when_cnj_is_incomplete(tmp_path
     enricher.artifact_store = RunArtifacts(tmp_path)
 
     def fake_call_grounded_json(*, prompt, response_model, artifact_name):
-        assert "0600001-01" in prompt
+        assert "0600001-87" in prompt
         return core.ProcessMetadataResult(
-            full_numero_processo="0600001-01.2024.6.00.0000",
+            full_numero_processo="0600001-87.2024.6.00.0000",
             origem="Brasília/DF",
             is_judged_process=True,
         )
@@ -3100,7 +3100,7 @@ def test_process_metadata_enricher_still_grounds_when_cnj_is_incomplete(tmp_path
 
     enriched = enricher.enrich_rows([row])
 
-    assert enriched[0].numero_processo == "0600001-01.2024.6.00.0000"
+    assert enriched[0].numero_processo == "0600001-87.2024.6.00.0000"
     assert enriched[0].origem == "Brasília/DF"
 
 
@@ -5853,3 +5853,123 @@ def test_numero_fragmento_que_e_precedente_do_proprio_item_e_descartado():
                           precedentes_citados="REspe 0600001-11", **base), schema)
     assert not row3.errors
     assert not any("consta dos precedentes" in w for w in row3.warnings)
+
+
+# ---------------------------------------------------------------------------------------
+# Sessao de 03/09/2026 (lhIHILM4J5g): leitura da pauta virou linha; sufixo de CNJ chutado
+# ---------------------------------------------------------------------------------------
+
+def _row_evento_de_pauta(**kw):
+    base = dict(numero_processo="0600015-13", relator="Min. Floriano de Azevedo Marques",
+                data_sessao="2026-09-03", classe_processo="REspe",
+                composicao=list(_ELENCO_VIGENTE),
+                tema="Anúncio de prosseguimento de julgamento de recurso especial eleitoral",
+                punchline="O presidente anunciou o prosseguimento do julgamento do recurso especial "
+                          "eleitoral, sem deliberação de mérito nesta assentada.",
+                analise_do_conteudo_juridico="Leitura da pauta pelo presidente.")
+    base.update(kw)
+    return PublishPreviewRow(**base)
+
+
+def test_votacao_sozinha_nao_cria_linha():
+    """O bloco de 11 s em que o presidente leu a pauta saiu com votacao 'Suspenso' e nada mais —
+    e a votacao sozinha bastava para criar a linha."""
+    import tse_youtube_notion_core as core
+    row = core.validate_preview_row(_row_evento_de_pauta(tema="Fraude à cota de gênero", votacao="Suspenso"), make_schema())
+    disposicao, motivos = core.assess_row_publishability(row)
+    assert disposicao == "blocked" and any("Resultado/votação insuficientes" in m for m in motivos)
+    com_resultado = core.validate_preview_row(
+        _row_evento_de_pauta(tema="Fraude à cota de gênero", resultado="Desprovido", votacao="Unânime"), make_schema())
+    assert core.assess_row_publishability(com_resultado)[0] == "publish"
+    com_vista = core.validate_preview_row(
+        _row_evento_de_pauta(tema="Fraude à cota de gênero", votacao="Suspenso", pedido_vista="Min. Dias Toffoli"), make_schema())
+    assert core.assess_row_publishability(com_vista)[0] == "publish"
+
+
+def test_evento_de_pauta_e_descartado_sem_consumir_numero():
+    import tse_youtube_notion_core as core
+    schema = make_schema()
+    row = core.validate_preview_row(_row_evento_de_pauta(votacao="Suspenso"), schema)
+    assert any("evento de pauta" in e for e in row.errors)
+    assert core.assess_row_publishability(row)[0] == "skipped"
+    row = core.validate_preview_row(row, schema)
+    assert sum("evento de pauta" in e for e in row.errors) == 1, "revalidar nao duplica"
+    inclusao = core.validate_preview_row(
+        _row_evento_de_pauta(tema="Inclusão de processo em pauta de julgamento futuro"), schema)
+    assert core.assess_row_publishability(inclusao)[0] == "skipped"
+    # com desfecho real, o tema-anuncio nao descarta (o julgamento existiu)
+    julgado = core.validate_preview_row(_row_evento_de_pauta(resultado="Desprovido", votacao="Por maioria"), schema)
+    assert not any("evento de pauta" in e for e in julgado.errors)
+
+
+def test_reparo_de_ano_exige_classe_e_uf_compativeis(monkeypatch):
+    """'0600015-13.2026.6.00.0000' (leitura errada de 0601513-76, sufixo inventado) fechou o DV
+    em 2020 e o DataJud confirmou — uma Acao Rescisoria de 2020, nao julgada naquele dia."""
+    import cnj_datajud
+    import tse_youtube_notion_core as core
+    from cnj_datajud import CnjProcess
+
+    def fake_lookup(numero, tribunal="", year="", session=None):
+        digits = "".join(c for c in str(numero) if c.isdigit())
+        if digits == "06000151320206000000":
+            return CnjProcess(numero_completo="0600015-13.2020.6.00.0000", classe_sigla="AR",
+                              orgao_julgador="GABINETE JURISTA 2")
+        return None
+
+    monkeypatch.setattr(cnj_datajud, "lookup_process", fake_lookup)
+    monkeypatch.setattr(core, "_carregar_mapa_gabinete", lambda *a, **k: {"GABINETE JURISTA 2": "Min. Floriano de Azevedo Marques"})
+    respe =PublishPreviewRow(numero_processo="0600015-13.2026.6.00.0000", classe_processo="REspe",
+                              relator="", data_sessao="2026-09-03")
+    core.enrich_preview_rows_with_cnj([respe])
+    assert respe.numero_processo == "0600015-13.2026.6.00.0000", "classe REspe x AR: sem reparo"
+    assert respe.relator == "", "e sem relator do gabinete de outro processo"
+    mesma_classe = PublishPreviewRow(numero_processo="0600015-13.2026.6.00.0000", classe_processo="AR",
+                                     relator="", data_sessao="2026-09-03")
+    core.enrich_preview_rows_with_cnj([mesma_classe])
+    assert mesma_classe.numero_processo == "0600015-13.2020.6.00.0000", "mesma classe: repara como antes"
+    outra_uf = PublishPreviewRow(numero_processo="0600015-13.2026.6.00.0000", classe_processo="AR",
+                                 tribunal="TRE-BA", relator="", data_sessao="2026-09-03")
+    core.enrich_preview_rows_with_cnj([outra_uf])
+    assert outra_uf.numero_processo == "0600015-13.2020.6.00.0000", "TR 00 (TSE) nao contradiz tribunal informado"
+    assert core.classes_sao_compativeis("REspe", "AREspe") and core.classes_sao_compativeis("RO", "AgRg-RO")
+    assert core.classes_sao_compativeis("", "AR") and core.classes_sao_compativeis("PA", "AR")
+    assert not core.classes_sao_compativeis("REspe", "AR")
+
+
+def test_lookup_process_desambigua_pelo_tr_do_tribunal(monkeypatch):
+    """0600016-24 (Camacari/BA, autos de 2023): o ano da sessao (2026) nao casava com nenhum
+    hit e o lookup devolvia None; o grounding entao chutou '.2022.6.05.0000'."""
+    import cnj_datajud
+
+    hits = [
+        {"_source": {"numeroProcesso": "06000162420236050171", "classe": {"nome": "Recurso Especial Eleitoral"}}},
+        {"_source": {"numeroProcesso": "06000162420226190001", "classe": {"nome": "Recurso Especial Eleitoral"}}},
+    ]
+    monkeypatch.setattr(cnj_datajud, "_search", lambda alias, body, session=None: list(hits))
+    achado = cnj_datajud.lookup_process("0600016-24", tribunal="TRE-BA", year="2026")
+    assert achado is not None and achado.numero_completo == "06000162420236050171"
+    assert cnj_datajud.lookup_process("0600016-24", tribunal="", year="2026") is None, "sem UF, ambiguo"
+    assert cnj_datajud._tr_code_for("TRE-BA") == "05" and cnj_datajud._tr_code_for("TSE") == ""
+
+
+def test_grounding_nao_troca_numero_curto_por_completo_com_dv_invalido(tmp_path):
+    """O grounding completou 0600016-24 como 0600016-24.2022.6.05.0000 (DV reprovado); o oficial
+    era 0600016-24.2023.6.05.0171."""
+    import tse_youtube_notion_core as core
+    enricher = object.__new__(GeminiProcessMetadataEnricher)
+    enricher.artifact_store = RunArtifacts(tmp_path)
+    enricher.logger = logging.getLogger("test_grounding_dv")
+
+    def fake_call(*, prompt, response_model, artifact_name):
+        return core.ProcessMetadataResult(full_numero_processo="0600016-24.2022.6.05.0000",
+                                          origem="Camaçari/BA", is_judged_process=True,
+                                          rationale="ok", confidence="alta")
+
+    enricher._call_grounded_json = fake_call
+    row = PublishPreviewRow(numero_processo="0600016-24", classe_processo="REspe", tribunal="TRE-BA",
+                            relator="Min. Estela Aranha", data_sessao="2026-09-03",
+                            tema="Violência política de gênero", resultado="Desprovido", votacao="Por maioria")
+    out = enricher.enrich_rows([row])[0]
+    assert out.numero_processo == "0600016-24", "sufixo chutado com DV invalido nao substitui o curto"
+    assert any("reprova no DV" in w for w in out.warnings)
+    assert out.origem == "Camaçari/BA"

@@ -439,6 +439,7 @@ RECOMPUTED_ERROR_PATTERNS = (
     re.compile(r"^Tema/título vazio\.$", re.IGNORECASE),
     re.compile(r"^resultado 'Suspenso por vista' sem pedido_vista", re.IGNORECASE),
     re.compile(r"^Número do processo \(fragmento lido do vídeo\) aparece como precedente citado", re.IGNORECASE),
+    re.compile(r"^Item é evento de pauta", re.IGNORECASE),
 )
 RECOMPUTED_WARNING_PATTERNS = (
     re.compile(r"^(?:classe_processo|tipo_registro|eleicao|origem|relator|pedido_vista|resultado|votacao) fora das opções do Notion;", re.IGNORECASE),
@@ -2666,8 +2667,27 @@ def _carregar_mapa_gabinete(lookup_process, session, *, logger=None) -> dict[str
         return {}
 
 
+def _classe_base_para_comparacao(classe: str) -> str:
+    """Ultimo segmento da classe canonica ('ED-AgRg-AREspe' -> 'arespe'); '' se vazia/generica."""
+    canon = normalize_classe_processo(str(classe or "")) or str(classe or "")
+    base = normalize_class_text(canon.split("-")[-1])
+    return "" if base in ("", "pa", "processo administrativo") else base
+
+
+def classes_sao_compativeis(classe_video: str, classe_datajud: str) -> bool:
+    """False so quando as duas classes existem e nem uma e sufixo da outra (REspe x AR).
+
+    'REspe' x 'AREspe' e 'RO' x 'AgRg-RO' passam (o audio perde o prefixo do recurso
+    interno); 'REspe' x 'AR' (Acao Rescisoria) reprova -- foi o par de 03/09/2026.
+    """
+    a, b = _classe_base_para_comparacao(classe_video), _classe_base_para_comparacao(classe_datajud)
+    if not a or not b:
+        return True
+    return a == b or a.endswith(b) or b.endswith(a)
+
+
 def _repair_cnj_year(numero: str, lookup_process, session, *, tribunal: str = "",
-                     janela: int = 6) -> Optional[str]:
+                     janela: int = 6, classe: str = "") -> Optional[str]:
     """Corrige o ANO de um CNJ de 20 digitos cujo DV (mod 97) reprova.
 
     Mantem nucleo, DV, segmento, TR e zona; varre os anos vizinhos e aceita SO o caso em que
@@ -2693,12 +2713,26 @@ def _repair_cnj_year(numero: str, lookup_process, session, *, tribunal: str = ""
             candidatos.append(tentativa)
     if len(candidatos) != 1:
         return None
+    # 03/09/2026: "0600015-13.2026.6.00.0000" (leitura errada de 0601513-76 com sufixo
+    # inventado pelo detalhe) fechou o DV em 2020 e o DataJud "confirmou" -- uma Acao
+    # Rescisoria de 2020 com o mesmo nucleo, que nao foi julgada naquele dia. As duas provas
+    # vinham do mesmo sufixo fabricado. O achado tem de ser da MESMA classe do video e, se o
+    # video deu o tribunal, da mesma UF; senao o numero fica como esta e vai para a vistoria.
     try:
-        if lookup_process(candidatos[0], tribunal=tribunal, session=session):
-            return candidatos[0]
+        info = lookup_process(candidatos[0], tribunal=tribunal, session=session)
     except Exception:  # pragma: no cover - rede
         return None
-    return None
+    if not info:
+        return None
+    if not classes_sao_compativeis(classe, getattr(info, "classe_sigla", "") or ""):
+        return None
+    digitos_ok = re.sub(r"\D", "", candidatos[0])
+    uf_tribunal = re.search(r"TRE[-/ ]?([A-Z]{2})", str(tribunal or "").upper())
+    if uf_tribunal and digitos_ok[13] == "6":
+        uf_numero = CNJ_ELECTORAL_UF_BY_CODE.get(digitos_ok[14:16], "")
+        if uf_numero and uf_numero != uf_tribunal.group(1):
+            return None
+    return candidatos[0]
 
 
 
@@ -2764,7 +2798,7 @@ def enrich_preview_rows_with_cnj(
         # numero fica como esta e o aviso de DV leva o caso para a vistoria.
         if cnj_check_digit_is_valid(row.numero_processo) is False:
             reparado = _repair_cnj_year(row.numero_processo, lookup_process, session,
-                                        tribunal=row.tribunal)
+                                        tribunal=row.tribunal, classe=row.classe_processo)
             if reparado:
                 if logger:
                     logger.info("CNJ DataJud: ano corrigido %s -> %s (DV mod 97 + confirmacao "
@@ -7100,7 +7134,17 @@ class GeminiProcessMetadataEnricher:
                 enriched_rows.append(candidate)
                 continue
             if response.full_numero_processo and not has_full_cnj:
-                candidate.numero_processo = response.full_numero_processo
+                # 03/09/2026: o grounding "completou" 0600016-24 (Camacari/BA, autos de 2023,
+                # zona 0171) como 0600016-24.2022.6.05.0000 -- sufixo chutado, DV reprovado.
+                # Numero curto ainda tem conserto (DataJud por prefixo/TR, vistoria); numero
+                # inteiro errado parece certo para todo mundo. Sem DV valido, fica o curto.
+                if cnj_check_digit_is_valid(response.full_numero_processo) is False:
+                    candidate.add_warning(
+                        f"número completo sugerido pelo grounding ('{response.full_numero_processo}') "
+                        f"reprova no DV (mod 97); mantido o número curto '{candidate.numero_processo}' "
+                        "— conferir na vistoria.")
+                else:
+                    candidate.numero_processo = response.full_numero_processo
             if response.origem:
                 candidate.origem = response.origem
             if needs_triplice_partes:
@@ -8192,6 +8236,14 @@ def _extract_vista_minister(texto: str, composicao: list[str]) -> str:
     return ""
 
 
+_EVENTO_DE_PAUTA_RE = re.compile(
+    r"^(?:an[uú]ncio|leitura|inclus[aã]o)\b.*\bpauta\b"
+    r"|\bpauta de julgamento futuro\b"
+    r"|\bprosseguimento d[eo] julgamento\b",
+    re.IGNORECASE,
+)
+
+
 def numero_processo_e_fragmento(row: "PublishPreviewRow", minimo_digitos: int = 8) -> bool:
     """O numero, COMO SAIU DO VIDEO, tem menos digitos que um nucleo eleitoral (NNNNNNN-DD)?
 
@@ -8283,6 +8335,14 @@ def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
                 row.add_warning(
                     f"CNJ indica UF {uf}; " + " e ".join(divergencias) + " divergem — conferir na vistoria."
                 )
+    # 03/09/2026: o presidente LE a pauta ("prosseguimento do julgamento do REspe...",
+    # "incluo em pauta...") e o detalhe devolve um "julgamento" cujo tema e o proprio anuncio.
+    # Sem resultado nem pedido de vista, e evento de pauta: erro que assess_row_publishability
+    # descarta (skipped, sem consumir numero de julgamento; a vistoria recebe o item).
+    tema_norm = normalize_model_text(row.tema)
+    if tema_norm and _EVENTO_DE_PAUTA_RE.search(tema_norm) and not row.resultado and not row.pedido_vista:
+        row.add_error(
+            "Item é evento de pauta (anúncio/leitura/inclusão em pauta), não julgamento — descartado.")
     # O proprio item diz que o seu numero e precedente citado (01/09/2026, "AREsp 42183"):
     # com numero que veio como FRAGMENTO do video, e trecho de voto tomado por julgamento --
     # erro com "precedente citado" no texto, que assess_row_publishability descarta (skipped,
@@ -8561,6 +8621,8 @@ def assess_row_publishability(row: PublishPreviewRow) -> tuple[str, list[str]]:
     error_texts = [normalize_model_text(error).lower() for error in row.errors if normalize_model_text(error)]
     if error_texts and all("precedente citado" in error for error in error_texts):
         return "skipped", ["Item descartado: identificado como precedente citado, não como processo julgado."]
+    if error_texts and all("evento de pauta" in error for error in error_texts):
+        return "skipped", ["Item descartado: evento de pauta (anúncio/leitura/inclusão), não processo julgado."]
 
     signal_fields = [
         row.numero_processo,
@@ -8589,7 +8651,11 @@ def assess_row_publishability(row: PublishPreviewRow) -> tuple[str, list[str]]:
         # YouTube com timestamp (unica por julgamento) em find_existing_row.
         if not row.data_sessao:
             create_issues.append("Data da sessão ausente para criação.")
-        if not (row.resultado or row.votacao or row.pedido_vista):
+        # 03/09/2026 (lhIHILM4J5g): um bloco de 11 s em que o presidente so LEU a pauta virou
+        # linha com votacao "Suspenso" e mais nada -- a votacao sozinha satisfazia esta guarda,
+        # e o numero mal ouvido ainda ganhou ano e relator de OUTRO processo no DataJud.
+        # Sem desfecho (resultado) nem pedido de vista nao ha julgamento a registrar.
+        if not (row.resultado or row.pedido_vista):
             create_issues.append("Resultado/votação insuficientes para criação.")
         if not (row.relator or row.composicao):
             create_issues.append("Relator/composição insuficientes para criação.")
