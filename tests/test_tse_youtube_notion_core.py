@@ -5656,3 +5656,200 @@ def test_sem_orfaos_a_sessao_fica_intacta():
     sessao = _sessao(_win("a", 100, 200, ["0600001-11"]))
     assert ex._preencher_vaos_com_processos_orfaos(sessao, [], duration_seconds=3000) == 0
     assert len(sessao.judgments) == 1
+
+
+# ---------------------------------------------------------------------------------------
+# Sessao de 01/09/2026 (BelBrFw2uuE): precedente citado no meio do voto virou linha
+# ---------------------------------------------------------------------------------------
+
+def _win_scan(titulo, inicio, fim, numeros, janela):
+    w = _win(titulo, inicio, fim, numeros)
+    w.scan_window = list(janela)
+    return w
+
+
+def _chunks_do_ro_de_01_09(com_janela=True):
+    """Os chunks 30-34 do lote 20260902_114354, como o modelo devolveu: o RO 0602212-13 em
+    todos, e no chunk da janela 8370-8670 so o precedente que a defesa citava naquele minuto,
+    rotulando a janela inteira."""
+    j = (lambda a, b: (a, b)) if com_janela else (lambda a, b: None)
+
+    def w(titulo, ini, fim, numeros, janela):
+        win = _win(titulo, ini, fim, numeros)
+        win.scan_window = list(janela) if janela else None
+        return win
+
+    return [
+        SessionExtraction(judgments=[w("060221213", 7830, 8130, ["060221213"], j(7830, 8130))]),
+        SessionExtraction(judgments=[w("RO 0602212-13.2022.6.02.0000", 8100, 8400,
+                                       ["RO 0602212-13.2022.6.02.0000"], j(8100, 8400))]),
+        SessionExtraction(judgments=[w("AREsp 42183", 8370, 8670, ["AREsp 42183"], j(8370, 8670))]),
+        SessionExtraction(judgments=[w("RO 0602212-13", 8640, 8940, ["RO 0602212-13"], j(8640, 8940))]),
+        SessionExtraction(judgments=[
+            w("RO - 060221213 / MACEIÓ - AL", 8910, 9210, ["RO - 060221213 / MACEIÓ - AL"], j(8910, 9210)),
+            w("AREspE 060033329", 9186, 9210, ["AREspE 060033329"], j(8910, 9210)),
+        ]),
+    ]
+
+
+def test_fragmento_de_janela_inteira_ensanduichado_pelo_mesmo_processo_e_absorvido():
+    """Regressao de 01/09/2026: o "AREsp 42183" (precedente citado no voto do RO) virou bloco
+    proprio, foi detalhado como julgamento, o DataJud o completou para um AREspe de Rondonia
+    de 2016 e a linha foi publicada — e o RO ficou cortado em 8400 s, sem a proclamacao."""
+    ex = _extrator()
+    merged = ex._merge_session_chunks(_chunks_do_ro_de_01_09())
+    numeros = [tuple(w.mentioned_process_numbers) for w in merged.judgments]
+    assert ("0000421-83",) not in numeros, "precedente citado no voto nao vira julgamento"
+    ro = next(w for w in merged.judgments if w.mentioned_process_numbers == ["0602212-13"])
+    assert (ro.start_seconds, ro.end_seconds) == (7830, 9210), "o RO segue inteiro ate a proclamacao"
+    assert ("0600333-29",) in numeros, "bloco curto de outro processo no fim da sessao fica"
+    assert ex._fragmentos_sanduiche[0]["mentioned_process_numbers"] == ["0000421-83"]
+    assert ex._fragmentos_sanduiche[0]["absorvido_por"] == ["0602212-13"]
+
+
+def test_sem_scan_window_nada_e_absorvido():
+    """Artifacts antigos nao trazem a janela do chunk: a guarda fica desligada, sem inventar."""
+    ex = _extrator()
+    merged = ex._merge_session_chunks(_chunks_do_ro_de_01_09(com_janela=False))
+    numeros = [tuple(w.mentioned_process_numbers) for w in merged.judgments]
+    assert ("0000421-83",) in numeros
+    assert ex._fragmentos_sanduiche == []
+
+
+def test_bloco_curto_no_meio_de_outro_julgamento_nao_e_absorvido():
+    """Retirada de pauta / item em mesa anunciado no meio de um voto e evento real: fica."""
+    ex = _extrator()
+    chunks = [
+        SessionExtraction(judgments=[_win_scan("A", 1000, 1300, ["0600001-11"], (1000, 1300))]),
+        SessionExtraction(judgments=[
+            _win_scan("A", 1270, 1400, ["0600001-11"], (1270, 1570)),
+            _win_scan("retirado de pauta B", 1400, 1440, ["0600002-22"], (1270, 1570)),
+            _win_scan("A", 1440, 1570, ["0600001-11"], (1270, 1570)),
+        ]),
+    ]
+    merged = ex._merge_session_chunks(chunks)
+    assert ("0600002-22",) in [tuple(w.mentioned_process_numbers) for w in merged.judgments]
+    assert ex._fragmentos_sanduiche == []
+
+
+def test_janela_inteira_vista_por_dois_chunks_nao_e_absorvida():
+    """Processo que outro chunk tambem ouviu e julgamento, ainda que um chunk o devolva como a
+    janela inteira e o processo anterior reapareca depois."""
+    ex = _extrator()
+    chunks = [
+        SessionExtraction(judgments=[_win_scan("A", 1000, 1300, ["0600001-11"], (1000, 1300))]),
+        SessionExtraction(judgments=[_win_scan("B", 1270, 1570, ["0600002-22"], (1270, 1570))]),
+        SessionExtraction(judgments=[
+            _win_scan("B", 1540, 1600, ["0600002-22"], (1540, 1840)),
+            _win_scan("A de novo", 1600, 1840, ["0600001-11"], (1540, 1840)),
+        ]),
+    ]
+    merged = ex._merge_session_chunks(chunks)
+    assert ("0600002-22",) in [tuple(w.mentioned_process_numbers) for w in merged.judgments]
+    assert ex._fragmentos_sanduiche == []
+
+
+_DECORADA_2022 = ["Min. Alexandre de Moraes", "Min. Cármen Lúcia", "Min. Nunes Marques",
+                  "Min. Raul Araújo", "Min. Isabel Gallotti",
+                  "Min. Floriano de Azevedo Marques", "Min. André Ramos Tavares"]
+
+
+def test_leitura_valida_que_veio_com_a_data_vence_a_decorada_repetida():
+    """01/09/2026: a abertura (chunk 06, com a data lida na mesma janela) perdeu por 1 x 2 para
+    a composicao de 2022-2024 decorada pelo modelo, identica em dois chunks e tambem 3+2+2."""
+    import tse_youtube_notion_core as core
+    assert is_regimentally_valid_composicao(core.normalize_composition_list(_DECORADA_2022))
+    ex = _extrator()
+    chunks = [
+        SessionExtraction(data_sessao="01/09/2026", composicao=list(_ABERTURA), judgments=[]),
+        SessionExtraction(data_sessao="", composicao=list(_DECORADA_2022), judgments=[]),
+        SessionExtraction(data_sessao="", composicao=list(_DECORADA_2022), judgments=[]),
+    ]
+    comp = ex._merge_session_chunks(chunks).composicao
+    assert sorted(comp) == sorted(core.normalize_composition_list(_ABERTURA))
+    # sem data em nenhum chunk, vale a votacao de sempre (mais repetida)
+    chunks[0].data_sessao = ""
+    comp = ex._merge_session_chunks(chunks).composicao
+    assert sorted(comp) == sorted(core.normalize_composition_list(_DECORADA_2022))
+
+
+def test_relator_sem_relatoria_recente_nao_entra_na_composicao(monkeypatch):
+    """01/09/2026: 'Min. Sérgio Banhos' e 'Min. Raul Araújo' (fora da Corte ha anos) vieram
+    como relatores de itens lidos errado e foram somados ao colegiado de todas as linhas."""
+    rows = _rows_sessao_25_08(monkeypatch)
+    rows.append(PublishPreviewRow(numero_processo="0000421-83", relator="Min. Sérgio Banhos",
+                                  composicao=list(_COMP_EXTRAIDA), data_sessao="2026-08-25",
+                                  classe_processo=""))
+    consolidate_rows_composicao(rows)
+    for row in rows:
+        assert "Min. Sérgio Banhos" not in row.composicao
+        assert sorted(row.composicao) == sorted(_ELENCO_VIGENTE)
+    assert any("sem relatoria recente" in w for w in rows[0].warnings)
+    # quem tem relatoria na base segue entrando (substituto/convocado de verdade)
+    elenco = [m for m in _ELENCO_VIGENTE if m != "Min. Dias Toffoli"] + ["Min. Isabel Gallotti"]
+    rows = _rows_sessao_25_08(monkeypatch, elenco=elenco)
+    consolidate_rows_composicao(rows)
+    assert "Min. Dias Toffoli" in rows[0].composicao
+
+
+def test_datajud_nao_completa_fragmento_lido_do_video(monkeypatch):
+    """'AREsp 42183' canoniza para '0000421-83' (9 digitos) e a busca por prefixo do DataJud
+    devolvia um AREspe de Rondonia de 2016 — completando o numero e trocando o relator."""
+    import cnj_datajud
+    import tse_youtube_notion_core as core
+    from cnj_datajud import CnjProcess
+
+    chamadas = []
+
+    def fake_lookup(numero, tribunal="", year="", session=None):
+        chamadas.append(numero)
+        return CnjProcess(numero_completo="0000421-83.2016.6.22.0009", classe_sigla="AREspe",
+                          orgao_julgador="GABINETE JURISTA 2")
+
+    monkeypatch.setattr(cnj_datajud, "lookup_process", fake_lookup)
+    monkeypatch.setattr(core, "_carregar_mapa_gabinete",
+                        lambda *a, **k: {"GABINETE JURISTA 2": "Min. Floriano de Azevedo Marques"})
+    fragmento = PublishPreviewRow(numero_processo="0000421-83", numero_origem_video="AREsp 42183",
+                                  relator="Min. Sérgio Banhos", classe_processo="AREspe",
+                                  data_sessao="2026-09-01")
+    inteiro = PublishPreviewRow(numero_processo="0000421-83", numero_origem_video="0000421-83",
+                                relator="", classe_processo="", data_sessao="2026-09-01")
+    core.enrich_preview_rows_with_cnj([fragmento, inteiro])
+    assert fragmento.numero_processo == "0000421-83", "fragmento nao se completa por prefixo"
+    assert fragmento.relator == "Min. Sérgio Banhos", "gabinete de OUTRO processo nao corrige relator"
+    assert any("fragmento" in w for w in fragmento.warnings)
+    assert inteiro.numero_processo == "0000421-83.2016.6.22.0009", "numero dito inteiro segue completando"
+    assert inteiro.relator == "Min. Floriano de Azevedo Marques"
+    assert chamadas == ["0000421-83"]
+
+
+def test_numero_fragmento_que_e_precedente_do_proprio_item_e_descartado():
+    """O item 'AREsp 42183' trazia precedentes_citados = 'AREsp 42183': o proprio modelo dizia
+    que era precedente. Fragmento + autocitacao = trecho de voto, nao julgamento (skipped)."""
+    import tse_youtube_notion_core as core
+    schema = make_schema()
+    base = dict(relator="Min. Dias Toffoli", data_sessao="2026-09-01", resultado="Desprovido",
+                votacao="Unânime", tema="Abuso de poder econômico e conduta vedada",
+                punchline="A defesa questiona a configuração de abuso de poder econômico em razão "
+                          "da suposta ausência de gravidade e de vínculo entre os envolvidos.",
+                analise_do_conteudo_juridico="Recurso discute abuso de poder econômico.")
+    row = core.validate_preview_row(
+        PublishPreviewRow(numero_processo="AREsp 42183", numero_origem_video="AREsp 42183",
+                          precedentes_citados="AREsp 42183", **base), schema)
+    assert any("precedente citado" in e for e in row.errors)
+    assert core.assess_row_publishability(row)[0] == "skipped"
+    # revalidar nao duplica o erro
+    row = core.validate_preview_row(row, schema)
+    assert sum("precedente citado" in e for e in row.errors) == 1
+    # numero completo que consta dos precedentes (embargos citando o acordao do mesmo feito): so aviso
+    row2 = core.validate_preview_row(
+        PublishPreviewRow(numero_processo="0602212-13.2022.6.02.0000",
+                          precedentes_citados="AgR-RO 0602212-13, REspe 0600001-11", **base), schema)
+    assert not row2.errors
+    assert any("consta dos precedentes" in w for w in row2.warnings)
+    # sem autocitacao, nada
+    row3 = core.validate_preview_row(
+        PublishPreviewRow(numero_processo="AREsp 42183", numero_origem_video="AREsp 42183",
+                          precedentes_citados="REspe 0600001-11", **base), schema)
+    assert not row3.errors
+    assert not any("consta dos precedentes" in w for w in row3.warnings)

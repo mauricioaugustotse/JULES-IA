@@ -438,6 +438,7 @@ RECOMPUTED_ERROR_PATTERNS = (
     re.compile(r"^Valor inválido para ", re.IGNORECASE),
     re.compile(r"^Tema/título vazio\.$", re.IGNORECASE),
     re.compile(r"^resultado 'Suspenso por vista' sem pedido_vista", re.IGNORECASE),
+    re.compile(r"^Número do processo \(fragmento lido do vídeo\) aparece como precedente citado", re.IGNORECASE),
 )
 RECOMPUTED_WARNING_PATTERNS = (
     re.compile(r"^(?:classe_processo|tipo_registro|eleicao|origem|relator|pedido_vista|resultado|votacao) fora das opções do Notion;", re.IGNORECASE),
@@ -454,6 +455,7 @@ RECOMPUTED_WARNING_PATTERNS = (
     re.compile(r"^noticia_TRE descartada por indisponibilidade da página\.$", re.IGNORECASE),
     re.compile(r"^Número corrigido para os autos originais da instrução", re.IGNORECASE),
     re.compile(r"^Dígito verificador do CNJ reprova", re.IGNORECASE),
+    re.compile(r"^Número do processo consta dos precedentes citados", re.IGNORECASE),
 )
 
 NOTION_PROPERTY_MAP = {
@@ -2739,6 +2741,21 @@ def enrich_preview_rows_with_cnj(
     applied_relator = 0
     mapa_gabinete = _carregar_mapa_gabinete(lookup_process, session, logger=logger)
     for row in rows:
+        # FRAGMENTO (01/09/2026): "AREsp 42183" -- precedente ouvido no meio de um voto --
+        # canoniza para "0000421-83", que tem os 9 digitos exigidos abaixo; a busca por
+        # prefixo do DataJud achou um AREspe de Rondonia de 2016 com esse nucleo, "completou"
+        # o numero e ainda trocou o relator pelo gabinete daquele processo. O zero a esquerda
+        # e palpite da canonizacao, nao leitura: numero com menos de 8 digitos no texto
+        # original nao se completa por prefixo. Fica curto e segue para o gate de grounding.
+        if numero_processo_e_fragmento(row):
+            bruto = row.numero_origem_video or row.numero_processo
+            if logger:
+                logger.info("CNJ DataJud: numero '%s' e fragmento lido do video; nao completado "
+                            "por prefixo.", bruto)
+            row.add_warning(
+                f"número curto lido do vídeo ('{bruto}') não foi completado pelo DataJud: "
+                "fragmento com menos de 8 dígitos, o zero à esquerda é palpite — conferir na vistoria.")
+            continue
         # REPARO DE ANO (26/08/2026). O bloco abaixo so COMPLETA numero curto; numero de 20
         # digitos com o ANO errado passava direto -- a CTA 0601908-68 da sessao de 25/08/2026
         # saiu ".2023" quando os autos sao ".2022". O ano nao e um palpite: mantendo nucleo+DV,
@@ -3712,6 +3729,11 @@ class SessionWindow(BaseModel):
     mentioned_process_numbers: list[str] = Field(default_factory=list)
     should_ignore: bool = False
     ignore_reason: str = ""
+    # Janela [inicio, fim] do CHUNK do scan que devolveu este bloco (carimbada pelo extrator;
+    # None em artifacts antigos e nas janelas criadas pelo rito/vaos). E o que permite
+    # reconhecer o bloco que e "a janela inteira": o modelo nao achou apregoamento e devolveu
+    # o recorte pedido rotulado com o numero que ouviu no meio de um voto (01/09/2026).
+    scan_window: list[int] | None = None
 
 
 class SessionExtraction(BaseModel):
@@ -4286,6 +4308,10 @@ class PublishPreviewRow(BaseModel):
     origem: str = ""
     tribunal: str = ""
     numero_processo: str = ""
+    # Numero COMO SAIU DO VIDEO, antes de canonizar/completar. `canonicalize_numero_processo`
+    # zera a esquerda ("AREsp 42183" -> "0000421-83") e a partir dai o fragmento parece um
+    # nucleo completo para o DataJud e para o gate de grounding (01/09/2026). Nao vai ao Notion.
+    numero_origem_video: str = ""
     youtube_link: str = ""
     relator: str = ""
     pedido_vista: str = ""
@@ -5268,6 +5294,8 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                     f"raw_transcript_response_chunk_{chunk_index:02d}.descartes.json",
                     sanitize_report,
                 )
+            for judgment in kept:
+                judgment.scan_window = [chunk.start_seconds, chunk.end_seconds]
             chunk_result.judgments = kept
 
             extracted_chunks.append(chunk_result)
@@ -5373,6 +5401,9 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                 continue
             if extracted_chunks:
                 merged = self._merge_session_chunks(extracted_chunks)
+                absorvidos = getattr(self, "_fragmentos_sanduiche", None) or []
+                if absorvidos:
+                    self.artifact_store.write_json("01c_fragmentos_sanduiche.json", absorvidos)
                 self._preencher_vaos_com_processos_orfaos(
                     merged,
                     getattr(self, "_processos_orfaos_do_scan", []),
@@ -5530,6 +5561,8 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                     degeneration["passo_constante_segundos"],
                     degeneration["cnj_dv_invalidos"],
                 )
+            for judgment in kept:
+                judgment.scan_window = [start_seconds, end_seconds]
             chunk_result.judgments = kept
 
             extracted_chunks.append(chunk_result)
@@ -5666,12 +5699,14 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
         fallback_dates: list[str] = []
         collected_windows: list[SessionWindow] = []
         composicao_por_chunk: list[list[str]] = []
+        chunks_com_data: list[bool] = []
 
         for chunk in chunks:
             chunk_date = normalize_session_date_to_iso(normalize_model_text(chunk.data_sessao))
             composicao_por_chunk.append(
                 [normalize_model_text(ministro) for ministro in chunk.composicao if normalize_model_text(ministro)]
             )
+            chunks_com_data.append(bool(chunk_date))
             cleaned_chunk_windows: list[SessionWindow] = []
             for judgment in chunk.judgments:
                 judgment.title_hint = normalize_model_text(judgment.title_hint)
@@ -5710,13 +5745,16 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
             merged.data_sessao = self._pick_session_date(preferred_dates)
         elif fallback_dates:
             merged.data_sessao = self._pick_session_date(fallback_dates)
-        merged.composicao = self._vote_composicao(composicao_por_chunk)
+        merged.composicao = self._vote_composicao(composicao_por_chunk, chunks_com_data)
         merged.judgments = self._coalesce_windows(collected_windows)
         merged.judgments.sort(key=lambda item: (item.start_seconds, item.title_hint))
         return merged
 
     @staticmethod
-    def _vote_composicao(composicao_por_chunk: list[list[str]]) -> list[str]:
+    def _vote_composicao(
+        composicao_por_chunk: list[list[str]],
+        chunk_com_data: list[bool] | None = None,
+    ) -> list[str]:
         """Composição por MAIORIA entre os chunks, não por união.
 
         A composição é lida uma vez na abertura e vale para a sessão inteira, mas
@@ -5728,7 +5766,19 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
         `normalize_ministro_name` unifica antes da contagem as grafias que o ASR
         produz para o mesmo ministro (Cássio/Kássio/Kassio Nunes Marques).
         """
-        leituras = [nomes for nomes in composicao_por_chunk if nomes]
+        # 01/09/2026 (BelBrFw2uuE): a leitura da ABERTURA (chunk 06, com a data lida na mesma
+        # janela) perdeu por 1 x 2 para a composicao de 2022-2024 que o modelo tem decorada
+        # (Moraes, Carmen Lucia, Raul Araujo, Gallotti, Ramos Tavares...) -- veio IDENTICA em
+        # dois chunks do meio da sessao e tambem desenha 3+2+2. Quem leu a data leu a
+        # abertura: entre leituras validas, a que veio junto com a data vence a votacao.
+        marcas = list(chunk_com_data or [])
+        marcas += [False] * (len(composicao_por_chunk) - len(marcas))
+        pares = [
+            (nomes, bool(com_data))
+            for nomes, com_data in zip(composicao_por_chunk, marcas)
+            if nomes
+        ]
+        leituras = [nomes for nomes, _ in pares]
         if not leituras:
             return []
 
@@ -5743,7 +5793,8 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
         # empate, a mais cedo no video -- ou seja, a mais proxima da abertura.
         validas: dict[tuple[str, ...], int] = {}
         ordem: dict[tuple[str, ...], int] = {}
-        for indice, nomes in enumerate(leituras):
+        com_data: set[tuple[str, ...]] = set()
+        for indice, (nomes, leu_a_data) in enumerate(pares):
             normalizada = normalize_composition_list(
                 [normalize_ministro_name(nome) for nome in nomes if normalize_ministro_name(nome)]
             )
@@ -5752,8 +5803,11 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
             chave = tuple(normalizada)
             validas[chave] = validas.get(chave, 0) + 1
             ordem.setdefault(chave, indice)
+            if leu_a_data:
+                com_data.add(chave)
         if validas:
-            melhor = min(validas, key=lambda ch: (-validas[ch], ordem[ch]))
+            candidatas = [chave for chave in validas if chave in com_data] or list(validas)
+            melhor = min(candidatas, key=lambda ch: (-validas[ch], ordem[ch]))
             return list(melhor)
 
         votos: dict[str, int] = {}
@@ -5855,7 +5909,109 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
         )
         return any(marker in text for marker in ignore_markers)
 
+    def _absorver_fragmentos_sanduiche(
+        self, windows: list[SessionWindow]
+    ) -> tuple[list[SessionWindow], list[dict[str, Any]]]:
+        """Bloco que e a JANELA INTEIRA do chunk, com processo que so ele viu, ensanduichado
+        pelo MESMO outro processo antes e depois, e fragmento desse julgamento -- nao julgamento.
+
+        Sessao de 01/09/2026 (BelBrFw2uuE): o RO 0602212-13 ocupou 7501-9180 s. O chunk da
+        janela 8370-8670 nao achou apregoamento e devolveu a janela inteira rotulada com o
+        precedente que a defesa citava naquele minuto ("AREsp 42183"); os chunks vizinhos
+        (8100-8400 e 8640-8940) devolveram o RO. Sem esta guarda o fragmento virou bloco
+        proprio, o detalhamento "julgou" o precedente com as partes do RO, o DataJud completou
+        "42183" para um AREspe de Rondonia de 2016 e a linha foi publicada. Pior: com um
+        processo distinto no meio, `_has_intervening_distinct_process_window` DESCARTOU os
+        blocos seguintes do RO e o julgamento real ficou cortado em 8400 s -- a proclamacao,
+        em ~9180 s, nunca chegou ao detalhamento (saiu "Suspenso por vista" para um recurso
+        provido por unanimidade).
+
+        Tres condicoes, todas exigidas -- a regra e estreita de proposito, porque bloco CURTO
+        no meio de outro julgamento pode ser retirada de pauta ou item em mesa, e fica:
+          1. o bloco cobre a janela do chunk de ponta a ponta (`scan_window`);
+          2. nenhum outro chunk mencionou o processo (uma unica leitura);
+          3. ha bloco de OUTRO processo terminando onde este comeca e bloco DESSE MESMO outro
+             processo comecando onde este termina (tolerancia = sobreposicao do scan).
+        O bloco absorvido nao some: vai para `01c_fragmentos_sanduiche.json` e para o log.
+        Sem `scan_window` (artifacts antigos) nada e absorvido.
+        """
+        logger = getattr(self, "logger", None) or logging.getLogger(__name__)
+        tolerancia = GLOBAL_SCAN_OVERLAP_SECONDS
+        uteis = [w for w in windows if not w.should_ignore and w.mentioned_process_numbers]
+        chaves: dict[int, frozenset[str]] = {}
+        for w in uteis:
+            chaves[id(w)] = frozenset(
+                self._chave_de_processo(numero) for numero in w.mentioned_process_numbers
+            ) - {""}
+        leituras: dict[str, set[Any]] = {}
+        for w in uteis:
+            origem = tuple(w.scan_window) if w.scan_window else ("sem_janela", id(w))
+            for chave in chaves[id(w)]:
+                leituras.setdefault(chave, set()).add(origem)
+
+        mantidos: list[SessionWindow] = []
+        absorvidos: list[dict[str, Any]] = []
+        for w in windows:
+            minhas = chaves.get(id(w), frozenset())
+            if w.should_ignore or not minhas or not w.scan_window or w.end_seconds is None:
+                mantidos.append(w)
+                continue
+            ini, fim = coerce_seconds(w.start_seconds), coerce_seconds(w.end_seconds)
+            janela_ini = coerce_seconds(w.scan_window[0])
+            janela_fim = coerce_seconds(w.scan_window[1])
+            if not (ini <= janela_ini + 5 and fim >= janela_fim - 5):
+                mantidos.append(w)
+                continue
+            if any(len(leituras.get(chave, ())) > 1 for chave in minhas):
+                mantidos.append(w)
+                continue
+            antes = [
+                o for o in uteis
+                if o is not w and chaves[id(o)] and not (chaves[id(o)] & minhas)
+                and o.end_seconds is not None
+                and coerce_seconds(o.start_seconds) < ini
+                and coerce_seconds(o.end_seconds) >= ini - tolerancia
+            ]
+            depois = [
+                o for o in uteis
+                if o is not w and chaves[id(o)] and not (chaves[id(o)] & minhas)
+                and ini < coerce_seconds(o.start_seconds) <= fim + tolerancia
+            ]
+            envolvente = next(
+                (a for a in antes if any(chaves[id(a)] & chaves[id(d)] for d in depois)),
+                None,
+            )
+            if envolvente is None:
+                mantidos.append(w)
+                continue
+            absorvidos.append(
+                {
+                    "title_hint": w.title_hint,
+                    "start_seconds": ini,
+                    "end_seconds": fim,
+                    "scan_window": list(w.scan_window),
+                    "mentioned_process_numbers": list(w.mentioned_process_numbers),
+                    "absorvido_por": list(envolvente.mentioned_process_numbers),
+                    "motivo": (
+                        "bloco e a janela inteira do chunk, processo visto por um unico chunk, "
+                        "mesmo outro processo antes e depois"
+                    ),
+                }
+            )
+            logger.warning(
+                "Bloco '%s' (%ss-%ss) e a janela inteira do chunk e esta ensanduichado por %s "
+                "antes e depois; tratado como fragmento desse julgamento (precedente citado no "
+                "voto), nao como julgamento proprio.",
+                w.title_hint or ", ".join(w.mentioned_process_numbers),
+                ini,
+                fim,
+                ", ".join(envolvente.mentioned_process_numbers),
+            )
+        return mantidos, absorvidos
+
     def _coalesce_windows(self, windows: list[SessionWindow]) -> list[SessionWindow]:
+        windows, absorvidos = self._absorver_fragmentos_sanduiche(windows)
+        self._fragmentos_sanduiche = absorvidos
         merged_windows: list[SessionWindow] = []
         process_index: dict[tuple[str, ...], int] = {}
 
@@ -5871,6 +6027,13 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                     previous_start_seconds=target.start_seconds,
                     candidate_start_seconds=candidate.start_seconds,
                 ):
+                    (getattr(self, "logger", None) or logging.getLogger(__name__)).info(
+                        "Bloco '%s' (t=%s) repete o processo %s depois de outro processo no "
+                        "meio; tratado como citacao — nao fundido nem detalhado.",
+                        candidate.title_hint,
+                        candidate.start_seconds,
+                        ", ".join(process_key),
+                    )
                     continue
                 target.start_seconds = min(target.start_seconds, candidate.start_seconds)
                 end_candidates = [value for value in [target.end_seconds, candidate.end_seconds] if value is not None]
@@ -6878,7 +7041,11 @@ class GeminiProcessMetadataEnricher:
             # vídeo nem na API do CNJ; buscar via grounding quando 'partes' está vazio, mesmo
             # que o número CNJ já esteja completo (o gate normal pularia o item).
             needs_triplice_partes = _row_is_lista_triplice(row) and not row.partes
-            if not needs_triplice_partes:
+            # 01/09/2026: item cujo PROPRIO numero consta dos precedentes citados e suspeito de
+            # ser fragmento de voto; o gate roda mesmo com CNJ completo e origem, para o
+            # grounding dizer se e processo julgado ou citacao.
+            suspeito_de_precedente = numero_consta_dos_precedentes(row)
+            if not needs_triplice_partes and not suspeito_de_precedente:
                 if has_full_cnj and has_origem:
                     enriched_rows.append(row)
                     continue
@@ -6903,6 +7070,12 @@ class GeminiProcessMetadataEnricher:
                     "os nomes completos das pessoas que compõem a lista (em regra três advogados/"
                     "advogadas), conforme fonte oficial (DJe, TSE/TRE/TJ) ou imprensa jurídica; se "
                     "não localizar com segurança, devolva lista vazia.\n"
+                )
+            if suspeito_de_precedente:
+                prompt += (
+                    "ATENÇÃO: o próprio item lista este número entre os precedentes citados; "
+                    "verifique se ele foi de fato JULGADO nesta sessão ou se é apenas precedente "
+                    "citado dentro do julgamento de outro processo (is_judged_process=false).\n"
                 )
             prompt += f"\nContexto:\n{context}"
             candidate = row.model_copy(deep=True)
@@ -8019,6 +8192,39 @@ def _extract_vista_minister(texto: str, composicao: list[str]) -> str:
     return ""
 
 
+def numero_processo_e_fragmento(row: "PublishPreviewRow", minimo_digitos: int = 8) -> bool:
+    """O numero, COMO SAIU DO VIDEO, tem menos digitos que um nucleo eleitoral (NNNNNNN-DD)?
+
+    `canonicalize_numero_processo` zera a esquerda ("AREsp 42183" -> "0000421-83") e, a partir
+    dai, o numero parece completo para todo mundo -- foi assim que o DataJud casou o zero-pad
+    com um AREspe de Rondonia de 2016 em 01/09/2026. So o texto original denuncia o fragmento.
+    Aceita 8 digitos (nucleo 06xxxxx dito sem o zero inicial) e reprova menos que isso. Linha
+    sem `numero_origem_video` (artifacts antigos, testes, scripts) usa o proprio numero.
+    """
+    bruto = str(getattr(row, "numero_origem_video", "") or "") or str(row.numero_processo or "")
+    digitos = re.sub(r"\D", "", bruto)
+    return 0 < len(digitos) < minimo_digitos
+
+
+def numero_consta_dos_precedentes(row: "PublishPreviewRow") -> bool:
+    """O proprio item lista o seu numero entre os precedentes citados.
+
+    Assinatura do fragmento de voto tomado por julgamento: em 01/09/2026 o item "AREsp 42183"
+    trazia precedentes_citados = "AREsp 42183" e o raciocinio dizia "citando precedente do
+    TSE (AREsp 42183)". Compara pelo nucleo (imune ao zero a esquerda e a classe na frente).
+    """
+    chave = GeminiSessionExtractor._chave_de_processo(str(row.numero_processo or ""))
+    if not chave:
+        return False
+    texto = str(row.precedentes_citados or "")
+    if not texto.strip():
+        return False
+    for trecho in re.findall(r"\d[\d.\-/ ]{3,}\d", texto):
+        if GeminiSessionExtractor._chave_de_processo(trecho) == chave:
+            return True
+    return False
+
+
 def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
     """Checagens determinísticas de coerência para a base servir de RAG.
 
@@ -8077,6 +8283,20 @@ def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
                 row.add_warning(
                     f"CNJ indica UF {uf}; " + " e ".join(divergencias) + " divergem — conferir na vistoria."
                 )
+    # O proprio item diz que o seu numero e precedente citado (01/09/2026, "AREsp 42183"):
+    # com numero que veio como FRAGMENTO do video, e trecho de voto tomado por julgamento --
+    # erro com "precedente citado" no texto, que assess_row_publishability descarta (skipped,
+    # sem consumir numero de julgamento; a fila de vistoria recebe o item). Com numero
+    # completo, so aviso: embargos e agravos citam legitimamente o acordao do mesmo processo.
+    if numero_consta_dos_precedentes(row):
+        if numero_processo_e_fragmento(row):
+            row.add_error(
+                "Número do processo (fragmento lido do vídeo) aparece como precedente citado no "
+                "próprio item — trecho de voto tomado por julgamento, não processo julgado.")
+        else:
+            row.add_warning(
+                "Número do processo consta dos precedentes citados do próprio item — conferir se "
+                "o bloco não é citação dentro de outro julgamento.")
     if row.resultado == "Suspenso por vista" and not row.pedido_vista:
         # AUTO-REPARO antes de bloquear (20/08/2026): a inconsistencia e da EXTRACAO, nao
         # do julgamento — o 0600870-47 (Medina/MG, sessao 18/08) foi extraido completo e
@@ -8545,6 +8765,19 @@ def consolidate_rows_composicao(
             comp = list(elenco)
             # substituto/convocado: atuou, logo estava, mesmo fora do elenco titular
             fora_do_elenco = [m for m in participantes if m not in comp]
+            # 01/09/2026: "Min. Sergio Banhos" e "Min. Raul Araujo" -- fora da Corte ha anos --
+            # vieram como relatores de dois itens lidos errado (um deles nem era julgamento) e,
+            # por "terem atuado", foram somados ao colegiado de TODAS as linhas da sessao (9
+            # nomes). Substituto/convocado de verdade tem relatoria na base dentro da janela
+            # de gabinete_relator; quem nao tem nenhuma nao e presenca provada, e leitura
+            # errada do video -- fica fora da composicao e vai para a vistoria.
+            sem_relatoria = [m for m in fora_do_elenco if membros and nao_e_membro(membros, m)]
+            fora_do_elenco = [m for m in fora_do_elenco if m not in sem_relatoria]
+            if sem_relatoria:
+                row.add_warning(
+                    "relator/pedido de vista fora do colegiado e sem relatoria recente na base ("
+                    + ", ".join(sem_relatoria) + "); nao incluido na composicao — provavel "
+                    "leitura errada do video, conferir na vistoria.")
             if fora_do_elenco:
                 comp.extend(fora_do_elenco)
                 row.add_warning(
@@ -8640,6 +8873,7 @@ def build_preview_rows(
                 origem=origem.strip(),
                 tribunal=(item.tre or normalize_tre("", item.uf)).strip(),
                 numero_processo=item.numero_processo.strip(),
+                numero_origem_video=item.numero_processo.strip(),
                 youtube_link=youtube_link,
                 relator=(item.relator.strip() or derived_relator),
                 pedido_vista=(item.pedido_vista.strip() or derived_pedido_vista),
