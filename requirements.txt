@@ -6,3 +6,6 @@ pydantic>=2.9.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 youtube-transcript-api>=1.2.4
+# 28 arquivos em tests/ e nenhum jeito de roda-los num .venv-win recriado do zero
+# (mesmo defeito achado no requirements-global do ProjetoConversor em 08/09/2026).
+pytest>=9.0.0
