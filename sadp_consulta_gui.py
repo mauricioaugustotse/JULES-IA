@@ -213,9 +213,12 @@ class SadpConsultaApp:
         self.filtro_termo = ""
         root.title("Consulta SADP — TSE (Acompanhamento Processual)")
         root.minsize(880, 480)
+        # handle do lote de partes/advogados, lido pela trava de fechamento
+        self._thr_detalhes: "threading.Thread | None" = None
         self._build_ui()
         # depois do _build_ui: a janela e dimensionada pelo que os widgets pedem
         _abrir_centralizado(root, 1180, 680)
+        root.protocol("WM_DELETE_WINDOW", self._ao_fechar)
 
     # ---------------------------------------------------------------- UI
     def _build_ui(self) -> None:
@@ -405,7 +408,9 @@ class SadpConsultaApp:
         self.var_status.set(f"{len(results)} resultado(s). Carregando partes/advogados…")
         # carrega primeiro as linhas do melhor palpite, depois as demais
         ordem = sorted(self.rows.keys(), key=lambda i: 0 if i in self.match_iids else 1)
-        threading.Thread(target=self._load_detalhes, args=(seq, ordem), daemon=True).start()
+        self._thr_detalhes = threading.Thread(target=self._load_detalhes,
+                                              args=(seq, ordem), daemon=True)
+        self._thr_detalhes.start()
 
     # --------------------------------------------------- detalhes (async)
     def _load_detalhes(self, seq: int, iids: list[str]) -> None:
@@ -777,6 +782,21 @@ class SadpConsultaApp:
                 self.menu.tk_popup(evt.x_root, evt.y_root)
             finally:
                 self.menu.grab_release()
+
+    def _ao_fechar(self) -> None:
+        """So pergunta quando o LOTE de partes/advogados esta em curso. A busca em si
+        leva segundos e nada aqui e gravado — pedir confirmacao por causa dela seria
+        atrito puro. O lote, sim, custa uma rodada inteira de requests ao SADP."""
+        thr = self._thr_detalhes
+        if thr is not None and thr.is_alive() and not messagebox.askyesno(
+                "Fechar durante a carga?",
+                "As partes e advogados dos resultados ainda estao sendo carregados. "
+                "Fechar agora interrompe essa carga.\n\n"
+                "Nada e gravado em lugar nenhum: o custo e ter de consultar o SADP "
+                "outra vez, do zero, na proxima abertura.\n\n"
+                "Fechar mesmo assim?"):
+            return
+        self.root.destroy()
 
 
 def main() -> None:
