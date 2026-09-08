@@ -2,4 +2,27 @@
 set -euo pipefail
 
 hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd "$hook_dir/.." && pwd)"
+
 "$hook_dir/prevent-secrets.sh" push
+
+# Guarda do espelho, apontada para ESTE repositorio. O motor mora no
+# ProjetoConversor (um so, para nao haver tres copias da mesma regra divergindo) e
+# aceita --raiz. Enquanto ele olhava uma raiz fixa, o CamaraDosDeputados acumulou
+# cinco testes que pulavam em silencio, de modulos que nunca existiram - achado do
+# PC-espelho em 08/09/2026.
+motor="$HOME/ProjetoConversor/tools/espelho_dependencias.py"
+if [ -f "$motor" ]; then
+  py=""
+  for cand in "$LOCALAPPDATA/Programs/Python/Python313/python.exe" python py python3; do
+    if command -v "$cand" >/dev/null 2>&1 || [ -x "$cand" ]; then py="$cand"; break; fi
+  done
+  if [ -n "$py" ]; then
+    if ! "$py" "$motor" --raiz "$repo_dir"; then
+      echo ""
+      echo "push abortado: ha modulo de producao fora do git, ou teste que pula em silencio."
+      echo "Para pular esta checagem uma vez: git push --no-verify"
+      exit 1
+    fi
+  fi
+fi
