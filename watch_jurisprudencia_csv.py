@@ -15,6 +15,9 @@ Seguranca:
   - A escrita do pipeline e page-value multi_select (cria etiquetas com seguranca);
     NUNCA faz PATCH em options/schema do data_source.
   - Idempotente: so grava colunas que mudaram; arquivo ja processado nao repete (hash).
+  - Dois PCs: o `applied` local e unido ao plantao do OneDrive (espelho_plantao, no
+    ProjetoConversor); um CSV que o OUTRO PC ja confrontou nao se repete aqui.
+    --sem-plantao desliga a consulta (diagnostico: volta ao "so local").
 
 Uso:
   python watch_jurisprudencia_csv.py                         # vigia a pasta do projeto, dry-run
@@ -55,6 +58,26 @@ try:
     import dje_etapas  # type: ignore
 except Exception:  # noqa: BLE001
     dje_etapas = None  # type: ignore
+# 12/09/2026 -- plantao: o estado de execucao compartilhado entre os dois PCs pelo OneDrive
+# (espelho_plantao, stdlib puro, raiz do ProjetoConversor). O `applied` deste _watch_state.json
+# e local e git-ignorado, entao o outro PC nao o enxerga e acredita que nada foi feito: em
+# 09-11/09/2026 isso custou a reimportacao de 2.426 decisoes e nove relatorios regerados com
+# OpenAI+Gemini. A partir daqui a leitura e "local UNIAO plantao" -- o local continua sendo a
+# fonte deste PC; o plantao e a projecao compartilhada. Import tolerante, como o do ledger:
+# sem o modulo (ou com --sem-plantao) o watcher e exatamente o de antes.
+try:
+    if str(PROJETO_CONVERSOR) not in sys.path:
+        sys.path.append(str(PROJETO_CONVERSOR))
+    import espelho_plantao as plantao  # type: ignore
+except Exception:  # noqa: BLE001
+    plantao = None  # type: ignore
+# Fluxo do plantao onde `dje_etapas.marcar("sessoes_enrich")` publica (contrato de 12/09/2026):
+# {sha256: {"quando": ISO UTC, "por": "watcher", "geracao": carimbo de paginas do confronto}}.
+FLUXO_PLANTAO = "dje_sessoes"
+_PLANTAO_LIGADO = True             # --sem-plantao desliga consulta e publicacao (diagnostico)
+PLANTAO_CACHE_SECS = 30.0          # a uniao e relida no maximo a cada 30 s (o poll continuo e de 3 s)
+_PLANTAO_CACHE: dict = {"em": 0.0, "regs": None}
+_PULADOS_LOGADOS: set[str] = set()  # "ja confrontado pelo outro PC" sai UMA vez por hash, nao a cada poll
 
 
 def _geracao_agora() -> str | None:
@@ -74,17 +97,148 @@ def _marcar_no_ledger(hashes: list[str], geracao: str | None = None) -> None:
     confronto?". Sem ele, o hash em `applied` dizia apenas "ja passou por aqui um dia" -- e foi
     por isso que as 6 paginas de 19/08/2026 ficaram sem partes: o delta constava aplicado desde
     as 09:57, e elas nasceram as 11:23.
+
+    12/09/2026: o carimbo tambem precisa chegar ao OUTRO PC, senao ele refaz o confronto (o
+    incidente de 09-11/09/2026). `dje_etapas.marcar` publica no plantao por conta propria; aqui
+    so se confere que o registro deste host existe -- e, se o ledger nao estiver importavel (ou
+    falhar), o watcher publica direto. Publicar e acessorio: nunca derruba o fluxo.
     """
-    if not dje_etapas or not hashes:
+    if not hashes:
+        return
+    if dje_etapas:
+        try:
+            dje_etapas.marcar("sessoes_enrich", hashes=hashes, por="watcher", geracao=geracao)
+        except Exception as exc:  # noqa: BLE001
+            log(f"  (aviso: nao consegui registrar no ledger: {exc})")
+    _publicar_no_plantao(hashes, geracao)
+
+
+def _publicar_no_plantao(hashes: list[str], geracao: str | None) -> None:
+    """Garante no plantao o registro DESTE host para cada hash (fluxo `dje_sessoes`).
+
+    Confia que `dje_etapas.marcar` ja publicou, mas confere: so escreve o que falta ou o que esta
+    com geracao mais velha que a desta passada (um CSV refeito por --alcancar-novas precisa
+    avancar o carimbo, senao o outro PC o ve atrasado e repete o confronto). Sem OneDrive,
+    `publicar` devolve None e avisa; nada e levantado.
+    """
+    if plantao is None or not _PLANTAO_LIGADO or not hashes:
         return
     try:
-        dje_etapas.marcar("sessoes_enrich", hashes=hashes, por="watcher", geracao=geracao)
+        ger = _iso_utc(geracao or "")
+        proprios = plantao.proprio(FLUXO_PLANTAO)
+        faltam = [h for h in hashes
+                  if h not in proprios or _iso_utc((proprios.get(h) or {}).get("geracao") or "") < ger]
+        if not faltam:
+            return
+        agora = plantao.agora_iso()
+        novos: dict[str, dict] = {}
+        for h in faltam:
+            # Funde no registro que o ledger possa ter escrito (mesmo host, mesma chave): so
+            # avanca quando/por/geracao, sem apagar campos extras que ele tenha publicado.
+            reg = dict(proprios.get(h) or {})
+            reg.update({"quando": agora, "por": "watcher", "geracao": ger})
+            novos[h] = reg
+        plantao.publicar(FLUXO_PLANTAO, novos)
+        _PLANTAO_CACHE["regs"] = None      # a proxima consulta rele a uniao
     except Exception as exc:  # noqa: BLE001
-        log(f"  (aviso: nao consegui registrar no ledger: {exc})")
+        log(f"  (aviso: nao consegui publicar no plantao: {exc})")
 
 
-def _hashes_desatualizados(watch_dir: Path) -> set[str]:
-    """Hashes de CSVs ja aplicados que precisam de nova passada porque nasceram paginas depois."""
+def _plantao_confrontados() -> dict[str, dict]:
+    """sha256 -> registro de `dje_sessoes` na UNIAO dos hosts (este PC incluido); {} se desligado.
+
+    Cada registro traz `_host` e `_publicado_em` (quem confrontou e quando publicou). Cache de
+    PLANTAO_CACHE_SECS: no modo continuo o scan roda a cada 3 s e nao ha por que reler o OneDrive
+    a cada poll -- e a leitura so acontece quando algum CSV NAO consta no estado local.
+    """
+    if plantao is None or not _PLANTAO_LIGADO:
+        return {}
+    agora = time.monotonic()
+    regs = _PLANTAO_CACHE["regs"]
+    if regs is not None and agora - _PLANTAO_CACHE["em"] < PLANTAO_CACHE_SECS:
+        return regs
+    try:
+        regs = plantao.uniao(FLUXO_PLANTAO)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  (aviso: nao consegui ler o plantao: {exc})")
+        regs = {}
+    _PLANTAO_CACHE.update(em=agora, regs=regs)
+    return regs
+
+
+def _confrontado_no_plantao(h: str, forcados: set[str] | None = None) -> dict | None:
+    """Registro do plantao que faz `h` contar como aplicado, ou None.
+
+    E a parte "UNIAO plantao" da decisao de `already_done`: o `applied` local continua mandando e
+    isto so acrescenta o que o OUTRO PC ja confrontou. `forcados` fura este bloqueio exatamente
+    como fura o `applied` local (--force, --force-hash, --alcancar-novas).
+    """
+    if forcados and h in forcados:
+        return None
+    return _plantao_confrontados().get(h)
+
+
+def _iso_utc(valor) -> str:
+    """Normaliza um carimbo para UTC antes de comparar (a regra do ledger; sem ele, cru)."""
+    if dje_etapas:
+        try:
+            return dje_etapas._iso_utc(valor)
+        except Exception:  # noqa: BLE001
+            pass
+    return str(valor or "")
+
+
+def _plantao_desatualizado(reg: dict, ger_atual: str) -> bool:
+    """Mesma regra de `dje_etapas.estado_csv`: aplicado, mas nasceram paginas depois."""
+    if not ger_atual:
+        return False
+    return _iso_utc(reg.get("geracao") or "") < ger_atual
+
+
+def _fmt_quando(iso: str) -> str:
+    """ISO UTC -> hora local 'dd/mm/aaaa HH:MM' (cru se nao parsear)."""
+    try:
+        d = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if d.tzinfo is not None:
+            d = d.astimezone()
+        return d.strftime("%d/%m/%Y %H:%M")
+    except Exception:  # noqa: BLE001
+        return iso or "?"
+
+
+def _log_pulado_plantao(h: str, nome: str, reg: dict) -> None:
+    """'CSV X ja confrontado pelo <host> em <quando>; pulado' -- uma vez por hash por processo."""
+    if h in _PULADOS_LOGADOS:
+        return
+    _PULADOS_LOGADOS.add(h)
+    host = str(reg.get("_host") or "?")
+    quando = _fmt_quando(str(reg.get("quando") or reg.get("_publicado_em") or ""))
+    log(f"CSV {nome} ja confrontado pelo {host} em {quando}; pulado (plantao). "
+        f"Para refazer neste PC: --once --force-hash {h}")
+
+
+def _plantao_situacao() -> str:
+    """Uma linha para o log de partida: o watcher enxerga o outro PC ou nao?"""
+    if plantao is None:
+        return "indisponivel (espelho_plantao nao importavel; so o estado local conta)"
+    if not _PLANTAO_LIGADO:
+        return "desligado por --sem-plantao (so o estado local conta)"
+    try:
+        return f"{plantao.resumo(FLUXO_PLANTAO)} [este PC: {plantao.HOST}]"
+    except Exception as exc:  # noqa: BLE001
+        return f"erro ao consultar ({exc})"
+
+
+def _hashes_desatualizados(watch_dir: Path, state: dict | None = None) -> set[str]:
+    """Hashes de CSVs ja aplicados que precisam de nova passada porque nasceram paginas depois.
+
+    "Ja aplicados" = local UNIAO plantao (12/09/2026). Um CSV que so o OUTRO PC confrontou, com
+    geracao anterior a atual, volta a ser candidato exatamente como um `applied` local atrasado;
+    e um CSV que o outro PC confrontou DEPOIS de nascerem as paginas que este PC conhece deixa de
+    ser pendencia mesmo que o ledger local o ache atrasado -- aquele confronto ja alcancou essas
+    paginas (a base de sessoes e uma so). Sem o ledger nao existe "geracao atual", e a regra nao
+    se aplica a ninguem.
+    """
     if not dje_etapas:
         return set()
     try:
@@ -95,10 +249,32 @@ def _hashes_desatualizados(watch_dir: Path) -> set[str]:
             h = dje_etapas.sha256(p)
             if h in aplicados:      # so os JA aplicados; os ineditos o fluxo normal pega
                 alvo.add(h)
-        return alvo
     except Exception as exc:  # noqa: BLE001
         log(f"  (aviso: nao consegui consultar o ledger: {exc})")
         return set()
+    regs = _plantao_confrontados()
+    if not regs:
+        return alvo
+    ger = _geracao_agora() or ""
+    try:
+        for p in sorted(watch_dir.glob("*.csv")):
+            try:
+                h = sha256_cached(p, state) if state is not None else sha256_of(p)
+            except OSError:
+                continue
+            reg = regs.get(h)
+            if reg is None:
+                continue
+            if _plantao_desatualizado(reg, ger):
+                if h not in aplicados:  # os locais atrasados ja entraram pelo ledger
+                    alvo.add(h)
+            else:
+                alvo.discard(h)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  (aviso: nao consegui cruzar o plantao com a pasta: {exc})")
+    return alvo
+
+
 REPORTS_DIR = SCRIPT_DIR / "artifacts" / "jurisprudencia_partes_advogados"
 PIPELINE = SCRIPT_DIR / "fill_partes_advogados_from_jurisprudencia.py"
 PIPELINE_COMP = SCRIPT_DIR / "fill_composicao_from_jurisprudencia.py"  # composicao oficial do acordao
@@ -695,6 +871,13 @@ def scan_once(watch_dir: Path, sizes: dict, state: dict, args, forcados: set[str
             continue
         if already_done(h, state, args.apply, forcados):
             continue
+        # 12/09/2026 -- local UNIAO plantao: o OUTRO PC ja confrontou este CSV? Entao o trabalho
+        # nao se repete (incidente de 09-11/09/2026). So chega aqui o que nao consta no estado
+        # local, entao no regime normal o OneDrive nem e lido.
+        reg = _confrontado_no_plantao(h, forcados)
+        if reg is not None:
+            _log_pulado_plantao(h, p.name, reg)
+            continue
         ok, why = sniff_is_tse_csv(p)
         if not ok:
             if h not in state["skip"]:
@@ -730,8 +913,14 @@ def main() -> int:
     ap.add_argument("--alcancar-novas", action="store_true",
                     help="Reprocessa os CSVs cujo confronto ficou para tras de paginas novas "
                          "(consulta o ledger dje_etapas). E o modo que as GUIs usam. Exige --once.")
+    ap.add_argument("--sem-plantao", action="store_true",
+                    help="Nao consulta nem publica o plantao (estado compartilhado dos dois PCs pelo "
+                         "OneDrive). So para diagnostico: volta ao comportamento 'so local'.")
     args = ap.parse_args()
     _setup_logging(args.log_file)
+    global _PLANTAO_LIGADO
+    if args.sem_plantao:
+        _PLANTAO_LIGADO = False
 
     # Reprocessar em modo CONTINUO seria um loop: a cada poll de 5 s o mesmo CSV voltaria a ser
     # aplicado, para sempre. Estas flags so fazem sentido numa passada unica.
@@ -760,6 +949,7 @@ def main() -> int:
     log(f"Vigiando: {watch_dir}")
     log(f"Acervo permanente: {PERM_DIR}")
     log(f"Modo: {'APLICAR no Notion' if args.apply else 'DRY-RUN (nada escrito)'} | poll={args.poll_secs}s")
+    log(f"Plantao: {_plantao_situacao()}")
 
     # No modo --once, considera tudo 'estavel' de imediato (sem esperar 2 polls).
     sizes: dict = {}
@@ -782,7 +972,7 @@ def main() -> int:
             forcados.update(args.force_hash)
             log(f"--force-hash: {len(args.force_hash)} hash(es) forcado(s).")
         if args.alcancar_novas:
-            novos = _hashes_desatualizados(watch_dir)
+            novos = _hashes_desatualizados(watch_dir, state)
             forcados.update(novos)
             log(f"--alcancar-novas: {len(novos)} CSV(s) com confronto atrasado em relacao as "
                 f"paginas ja criadas.")
