@@ -20,6 +20,7 @@ from tse_normalization import (
     normalize_votacao,
     normalize_youtube_link,
     remove_mpe_from_partes,
+    resultado_allowed_for_classe,
 )
 
 
@@ -84,6 +85,10 @@ def test_normalize_resultado_final_normalizes_suspenso_por_vista():
     assert normalize_resultado_final("suspenso mas julgado depois") == "Suspenso mas julgado depois"
     assert normalize_votacao("Suspenso*") == "Suspenso*"
     assert normalize_resultado_final("Consulta respondida nos termos do voto do relator.") == "Aprovada"
+
+
+def test_ordinary_appeal_accepts_unfinished_session_outcome():
+    assert "Suspenso" in resultado_allowed_for_classe("RO")
 
 
 def test_normalize_ministro_and_pedido_vista_names():

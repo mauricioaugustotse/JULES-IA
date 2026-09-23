@@ -3034,7 +3034,8 @@ def test_process_metadata_enricher_reuses_cached_artifact(tmp_path):
     enricher = object.__new__(GeminiProcessMetadataEnricher)
     enricher.artifact_store = artifact_store
 
-    enriched = enricher.enrich_rows([PublishPreviewRow()])
+    input_row = cached_row.model_copy(update={"numero_processo": "0600001-01", "origem": ""})
+    enriched = enricher.enrich_rows([input_row])
 
     assert enriched[0].numero_processo == cached_row.numero_processo
     assert enriched[0].origem == cached_row.origem
@@ -3267,6 +3268,7 @@ def test_process_metadata_enricher_still_blocks_single_chunk_false_positive_when
             full_numero_processo="0600378-65.2020.6.00.0000",
             origem="",
             is_judged_process=False,
+            rationale="O número aparece apenas como precedente citado.",
         )
 
     enricher._call_grounded_json = fake_call_grounded_json
@@ -4012,7 +4014,7 @@ def test_extract_session_windows_uses_fallback_plan_after_primary_fail_fast(tmp_
 
     def fake_call_gemini(**kwargs):
         start_seconds = kwargs["start_seconds"]
-        if start_seconds < 600:
+        if "fallback" not in kwargs["artifact_name"]:
             calls["primary"] += 1
             raise RuntimeError("The read operation timed out")
         calls["fallback"] += 1
@@ -4022,8 +4024,8 @@ def test_extract_session_windows_uses_fallback_plan_after_primary_fail_fast(tmp_
             judgments=[
                 SessionWindow(
                     title_hint="AgR no REspe 0600433-71",
-                    start_seconds=660,
-                    end_seconds=715,
+                    start_seconds=start_seconds + 10,
+                    end_seconds=kwargs["end_seconds"],
                     mentioned_process_numbers=["0600433-71"],
                 )
             ],
@@ -4040,7 +4042,7 @@ def test_extract_session_windows_uses_fallback_plan_after_primary_fail_fast(tmp_
         core.fetch_youtube_duration_seconds = lambda youtube_url: 900
         def fake_chunker(duration_seconds, window_seconds=None, overlap_seconds=None):
             if window_seconds == core.GLOBAL_SCAN_FALLBACK_WINDOW_SECONDS:
-                return [(600, 720), (705, 825)]
+                return [(start, min(start + 120, 900)) for start in range(0, 900, 105)]
             return [(0, 300), (270, 570), (540, 840), (810, 1110)]
         core.chunk_video_windows = fake_chunker
         core.GLOBAL_SCAN_FAIL_FAST_CONSECUTIVE_ERRORS = 3
@@ -5028,7 +5030,7 @@ def test_scan_chunk_degenerado_nao_contamina_as_janelas_da_sessao(tmp_path):
     extractor.artifact_store = RunArtifacts(tmp_path)
 
     def fake_call_gemini(**kwargs):
-        if kwargs["start_seconds"] == 540:
+        if kwargs["start_seconds"] == 540 and "fallback" not in kwargs["artifact_name"]:
             # o loop de repetição: blocos de 100 em 100 muito além da janela
             return SessionExtraction(
                 data_sessao="03/08/2026",
@@ -5048,8 +5050,8 @@ def test_scan_chunk_degenerado_nao_contamina_as_janelas_da_sessao(tmp_path):
             judgments=[
                 SessionWindow(
                     title_hint="AgR no REspe 0600504-40",
-                    start_seconds=300,
-                    end_seconds=560,
+                    start_seconds=kwargs["start_seconds"] + 30,
+                    end_seconds=kwargs["end_seconds"],
                     mentioned_process_numbers=["0600504-40"],
                 )
             ],
@@ -5065,7 +5067,7 @@ def test_scan_chunk_degenerado_nao_contamina_as_janelas_da_sessao(tmp_path):
     try:
         core.fetch_youtube_duration_seconds = lambda youtube_url: 900
         core.chunk_video_windows = (
-            lambda duration_seconds, window_seconds=None, overlap_seconds=None: [(0, 300), (270, 570), (540, 840)]
+            lambda duration_seconds, window_seconds=None, overlap_seconds=None: [(0, 300), (270, 570), (540, 900)]
         )
         merged = extractor._extract_session_windows("https://www.youtube.com/watch?v=abc123")
     finally:
@@ -5181,7 +5183,7 @@ def test_plano_totalmente_descartado_escala_para_o_proximo(tmp_path):
         core.fetch_youtube_duration_seconds = lambda youtube_url: 600
         def fake_chunker(duration_seconds, window_seconds=None, overlap_seconds=None):
             if window_seconds == core.GLOBAL_SCAN_FALLBACK_WINDOW_SECONDS:
-                return [(0, 120), (105, 225)]
+                return [(start, min(start + 120, 600)) for start in range(0, 600, 105)]
             return [(0, 300), (270, 600)]
         core.chunk_video_windows = fake_chunker
         merged = extractor._extract_session_windows("https://www.youtube.com/watch?v=abc123")

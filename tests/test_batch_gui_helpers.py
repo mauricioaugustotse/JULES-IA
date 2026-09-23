@@ -71,6 +71,8 @@ def gui_sem_rede(monkeypatch):
     monkeypatch.setattr(gui, "dedupe_preview_rows", lambda rows, url: rows)
     monkeypatch.setattr(gui, "validate_preview_row", lambda row, schema: row)
     monkeypatch.setattr(gui, "_build_rito_count_check", lambda store, rows: None)
+    monkeypatch.setattr(gui, "ensure_chapter_inventory", lambda *a: {"status": "unavailable"})
+    monkeypatch.setattr(gui, "_queue_monitor_issues", lambda *a: None)
     monkeypatch.setattr(
         gui.vistoria_queue, "collect_video_vistoria_items", lambda *a, **kw: []
     )
@@ -82,7 +84,7 @@ def _rodar(tmp_path, monkeypatch, *, parar: bool):
     monkeypatch.setattr(
         gui,
         "publish_preview_rows",
-        lambda rows, client, schema: chamadas.append(len(rows)) or [],
+        lambda rows, client, schema, **kw: chamadas.append(len(rows)) or [],
     )
     evento = threading.Event()
     if parar:
@@ -130,7 +132,7 @@ def test_chamada_sem_stop_event_segue_publicando(tmp_path, monkeypatch, gui_sem_
     monkeypatch.setattr(
         gui,
         "publish_preview_rows",
-        lambda rows, client, schema: chamadas.append(len(rows)) or [],
+        lambda rows, client, schema, **kw: chamadas.append(len(rows)) or [],
     )
     resumo = gui.process_single_video(
         gui.VideoInput(position=1, video_id="abc", url="https://www.youtube.com/watch?v=abc"),

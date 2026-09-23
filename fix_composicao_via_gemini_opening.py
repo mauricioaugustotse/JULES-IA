@@ -6,6 +6,8 @@ ECONOMIA: clipa so [0, --end-seconds] do video (videoMetadata), --fps baixissimo
 falada), modelo flash-lite, CACHE por video (re-rodar nao re-cobra), --max-videos p/ limitar.
 Casa por sessao (1 video = 1 sessao = 1 data) e so toca paginas onde o relator esta na lista
 extraida (validacao). Aplica via page-value (sem Playwright).
+Preserva a composicao completa de cada processo: a abertura nao identifica votos
+preservados de assentadas anteriores nem substituicoes durante o julgamento.
 
 Uso (sempre medir custo num lote pequeno primeiro):
   python fix_composicao_via_gemini_opening.py --max-videos 3            # dry-run + custo
@@ -15,12 +17,13 @@ Uso (sempre medir custo num lote pequeno primeiro):
 from __future__ import annotations
 
 import argparse, collections, difflib, json, logging, re, time, unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from pydantic import BaseModel
 
 from audit_notion_sessoes_round2 import notion_request_with_retry
+from fix_composicao_from_transcript import preserve_case_composition
 from local_secrets import get_secret
 from tse_normalization import normalize_ministro_name, parse_multi_value_text
 from tse_youtube_notion_core import (DEFAULT_GEMINI_MODEL, DEFAULT_NOTION_DATA_SOURCE_ID,
@@ -152,7 +155,6 @@ def main() -> int:
     # going-forward pega os videos do lote novo (fallback p/ sessao sem transcript) primeiro.
     pend.sort(key=lambda vp: max(((t(p, "data_sessao") or "")[:10]) for p in vp[1]), reverse=True)
     if args.since_days:  # so a JANELA recente (fallback p/ transcript indisponivel); nao re-processa backlog
-        from datetime import datetime, timedelta
         limite = (datetime.now() - timedelta(days=args.since_days)).strftime("%Y-%m-%d")
         pend = [vp for vp in pend if max(((t(p, "data_sessao") or "")[:10]) for p in vp[1]) >= limite]
     if args.max_videos:
@@ -160,7 +162,8 @@ def main() -> int:
     LOGGER.info("videos pendentes a processar: %d (end=%ss fps=%s modelo=%s)", len(pend), args.end_seconds, args.fps, DEFAULT_GEMINI_MODEL)
 
     stats = {"videos": len(pend), "ok": 0, "vazio": 0, "relator_ausente": 0, "multi_sessao": 0,
-             "paginas": 0, "applied": 0, "falhas": 0, "tokens": 0, "chamadas_gemini": 0}
+             "paginas": 0, "applied": 0, "falhas": 0, "tokens": 0, "chamadas_gemini": 0,
+             "preservadas_por_processo": 0}
     detail = []
     for vid, pgs in pend:
         url = f"https://www.youtube.com/watch?v={vid}"  # URL limpa (sem &t=, que quebra o fetch do Gemini)
@@ -203,7 +206,16 @@ def main() -> int:
         rec["status"] = "ok"; rec["present"] = present; stats["ok"] += 1
         built = client._build_property_value(schema, "composicao", present)
         for p in pgs:
-            if parse_multi_value_text(t(p, "composicao")) == present:
+            current = parse_multi_value_text(t(p, "composicao"))
+            if {fold(name) for name in current} == {fold(name) for name in present}:
+                continue
+            if preserve_case_composition(current, t(p, "relator")):
+                stats["preservadas_por_processo"] += 1
+                rec.setdefault("conflitos_por_processo", []).append({
+                    "page_id": p["id"], "numero_processo": t(p, "numero_processo"),
+                    "mantida": current, "abertura": present,
+                    "reason": "Abertura da sessao nao comprova composicao de julgamento com votos preservados.",
+                })
                 continue
             stats["paginas"] += 1
             if args.apply:
@@ -221,7 +233,7 @@ def main() -> int:
     if stats["chamadas_gemini"]:
         LOGGER.info("CUSTO: %d tokens em %d chamadas (~%d tok/video)", stats["tokens"], stats["chamadas_gemini"],
                     stats["tokens"] // max(1, stats["chamadas_gemini"]))
-    return 0
+    return 1 if stats["falhas"] else 0
 
 
 if __name__ == "__main__":

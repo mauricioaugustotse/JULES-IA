@@ -579,7 +579,7 @@ ORIENTAÇÕES OBRIGATÓRIAS POR CAMPO:
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 - `classe_processo`: leia a classe processual exatamente como aparece na autuação/cabeçalho exibido na tela e no pregão do caso (ex.: "AgR-AREspe nº 0601309-60"). Capture a classe COMPLETA, preservando os prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED), antes da classe-base. Não reduza um "AgR-AREspe" a "AREspe" nem um "ED-REspe" a "REspe". Se houver agravo regimental sendo julgado pelo colegiado contra decisão monocrática, a classe é a forma com AgRg-. Se a tela não exibir a classe com clareza, deixe o campo vazio em vez de adivinhar a classe-base.
 - `origem`: informe o MUNICÍPIO de origem do processo no formato "Cidade/UF" (ex.: "Santo Antônio do Tauá/PA"), tal como citado no caso. Não preencha origem com o tribunal ("Tribunal Regional Eleitoral do Pará", "TRE-PA") nem com a capital do estado quando o município específico aparecer no vídeo; o nome do tribunal de origem pertence a outro contexto, não à coluna origem.
-- `resultado_final`: registre SEMPRE o desfecho objetivo proclamado para este processo, conforme a classe. Recurso (REspe/AREspe/RO/AgRg-*/RHC/RMS): "Provido", "Desprovido", "Provido em parte", "Não conhecido"/"Não conhecida", "Prejudicado". Consulta: "Aprovada" (consulta respondida). Lista tríplice formada/encaminhada: "Aprovada". Prestação de contas: "Aprovada"/"Aprovada com ressalvas"/"Rejeitada". Registro (RPP/RCand/DRAP): "Deferido"/"Indeferido". Representação/AIJE: "Procedente"/"Procedente em parte"/"Improcedente". Use o gênero correto (recurso=masculino; consulta/contas=feminino). Se o julgamento foi suspenso por pedido de vista, use "Suspenso por vista". Não deixe vazio quando o presidente proclamar o resultado.
+- `resultado_final`: registre SEMPRE o desfecho objetivo proclamado para este processo, conforme a classe. Recurso (REspe/AREspe/RO/AgRg-*/RHC/RMS): "Provido", "Desprovido", "Provido em parte", "Não conhecido"/"Não conhecida", "Prejudicado". Consulta: "Aprovada" (consulta respondida). Lista tríplice formada/encaminhada: "Aprovada". Lista tríplice devolvida para recomposição, complementação ou correção: "Devolvida"; nunca registre "Aprovada" nesse caso. Prestação de contas: "Aprovada"/"Aprovada com ressalvas"/"Rejeitada". Registro (RPP/RCand/DRAP): "Deferido"/"Indeferido". Representação/AIJE: "Procedente"/"Procedente em parte"/"Improcedente". Use o gênero correto (recurso=masculino; consulta/contas=feminino). Se o julgamento foi suspenso por pedido de vista, use "Suspenso por vista". Não deixe vazio quando o presidente proclamar o resultado.
 - `pedido_vista`: nomeie o ministro que PEDIU VISTA, no formato "Min. <Nome>". Atenção ao pedido de vista ANTECIPADO: é comum o relator ou o presidente ANUNCIAR que outro ministro antecipará a vista ("o Ministro X antecipa o pedido de vista"). Quem pede vista é o ministro NOMEADO, nunca quem anuncia. Se ninguém pediu vista, deixe o campo vazio.
 - QUEM FALA NÃO É QUEM DECIDE. Antes de atribuir a alguém uma divergência, um voto-vista ou um pedido de vista, confira o nome dito no julgamento: o presidente conduz a sessão e anuncia atos de outros ministros o tempo todo, e o relator resume votos alheios. Nunca deduza o autor da divergência a partir de quem está com a palavra. Se não der para identificar o ministro com segurança, escreva "houve divergência" sem nome em vez de atribuí-la a quem falava.
 - COERÊNCIA entre `pedido_vista`, `analise_do_conteudo_juridico`, `raciocinio_juridico` e `punchline`: quem pediu vista e quem divergiu podem ser pessoas diferentes — não funda os dois papéis num nome só. Se `pedido_vista` ficou vazio, não afirme em prosa quem pediu vista; se o julgamento foi suspenso por vista, a prosa não pode descrevê-lo como decidido.
@@ -600,6 +600,7 @@ TAREFA:
 - Se o trecho contiver mais de um processo julgado em conjunto, retorne um item por processo.
 - Não crie item para número de processo citado apenas como precedente, comparação, referência jurisprudencial ou exemplo.
 - Extraia os mesmos campos exigidos na etapa detalhada do vídeo, preservando fidelidade máxima ao conteúdo efetivamente transcrito.
+- `resultado_final`: lista tríplice formada/encaminhada é "Aprovada"; lista devolvida para recomposição, complementação ou correção é "Devolvida", nunca "Aprovada".
 - `tema`: informe uma frase nominal jurídica, específica e indexável, aderente à controvérsia concreta. Nunca use o nome de ministro, relator ou de quem pediu vista como tema: pedido de vista, leitura de voto e proclamação são incidentes da sessão, não a matéria julgada — o tema tem de sair da controvérsia, mesmo quando o vídeo só mostra a proclamação. "Embargos de declaração" e "Agravo regimental" também descrevem o rito, não a matéria: em vez deles, diga sobre O QUE se embargou ou se agravou. Nunca use número do processo, "Processo", "Julgamento", nomes das partes como eixo principal ou apenas a classe processual. Se não houver base suficiente na transcrição, deixe vazio.
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 - `classe_processo`: capture a classe COMPLETA como anunciada/transcrita, preservando prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED). Não reduza "AgR-AREspe" a "AREspe". Se a transcrição não trouxer a classe com clareza, deixe vazio.
@@ -629,7 +630,7 @@ TAREFA:
 - Use exclusivamente o Grounding with Google Search.
 - Complete prioritariamente o número CNJ integral do processo.
 - Só informe a cidade/UF de origem quando ela vier de forma clara junto da mesma evidência relevante para o processo. Não faça busca isolada apenas para preencher origem.
-- Se os resultados indicarem que o número consultado aparece apenas como precedente citado, e não como processo efetivamente julgado na sessão, marque is_judged_process=false.
+- Se os resultados indicarem que o número consultado aparece apenas como precedente citado, e não como processo efetivamente julgado na sessão, marque is_judged_process=false. Se houve retirada de pauta ou adiamento sem julgamento por falta de quórum nesta sessão, também marque false, mas informe expressamente esse motivo em rationale. Não confunda tais situações com precedente citado.
 - Quando o item for uma LISTA TRÍPLICE (formação de lista para vaga de membro/juiz de TRE pela classe de advogado/jurista), pesquise e devolva em indicados_lista_triplice os nomes COMPLETOS das pessoas indicadas na lista (em regra três advogados/advogadas), exatamente como publicados em fonte oficial (DJe, sites do TSE/TRE/TJ) ou imprensa jurídica confiável. Esses nomes são informação pública. Inclua apenas os nomes que você localizar com segurança para o processo específico; se não encontrar, devolva lista vazia (melhor vazio do que nome errado).
 - Não invente número completo, origem, indicados ou classificação do item.
 """
@@ -2573,8 +2574,10 @@ def enrich_preview_rows_with_youtube_chapters(
     logger: Optional[logging.Logger] = None,
 ) -> list["PublishPreviewRow"]:
     """Enriquece os preview rows com os CAPÍTULOS da descrição do vídeo (fonte
-    autoritativa do TSE): define a ``classe_processo`` (preenchendo vazio, corrigindo
-    'PA' e divergências reais — sem rebaixar) e preenche o marcador de tempo do
+    publicada pelo TSE): define a ``classe_processo`` (preenchendo vazio, corrigindo
+    'PA' genérica e divergências reais — sem rebaixar). Uma PA confirmada pelo
+    conteúdo do caso não é substituída por etiqueta conflitante do capítulo.
+    Preenche também o marcador de tempo do
     ``youtube_link`` quando ausente. Faz parte do fluxo principal para que novas
     extrações já saiam corretas sem reparos posteriores."""
     video_id = extract_youtube_video_id(youtube_url)
@@ -2606,7 +2609,20 @@ def enrich_preview_rows_with_youtube_chapters(
         chapter_classe = str(entry.get("classe", "") or "")
         if chapter_classe and (valid_classes is None or chapter_classe in valid_classes):
             current = str(row.classe_processo or "")
-            if (
+            # 15/09/2026: o capítulo do próprio TSE rotulou a requisição de força
+            # federal PA 0600742-04 como LT. PA só é genérica quando não há
+            # conteúdo administrativo independente que confirme essa classe.
+            confirmed_pa_conflict = (
+                normalize_classe_processo(current) == "PA"
+                and chapter_classe != "PA"
+                and infer_classe_from_row_text(row) == "PA"
+            )
+            if confirmed_pa_conflict:
+                row.add_warning(
+                    f"Classe do capítulo ({chapter_classe}) diverge do conteúdo administrativo "
+                    "do caso; mantida PA — conferir na vistoria."
+                )
+            elif (
                 not current
                 or current == "PA"
                 or (current != chapter_classe and not classe_is_specificity_downgrade(current, chapter_classe))
@@ -3621,7 +3637,7 @@ PROCESS_METADATA_EXTRACTION_PROMPT = (
     "Converta o texto pesquisado abaixo em JSON com EXATAMENTE estas chaves:\n"
     "- full_numero_processo: número CNJ completo do processo (string; vazio se não houver)\n"
     "- origem: cidade/UF de origem (string; vazio se não houver)\n"
-    "- is_judged_process: true se trata de processo efetivamente julgado, false se aparece só como precedente citado, null se indefinido\n"
+    "- is_judged_process: true se trata de processo efetivamente julgado, false se aparece só como precedente citado ou se houve retirada/adiamento sem julgamento, null se indefinido; rationale deve distinguir essas situações\n"
     "- indicados_lista_triplice: lista com os nomes completos das pessoas indicadas na lista tríplice (vazia se não for lista tríplice ou não houver nomes)\n"
     "- confidence: alta, media ou baixa\n"
     "- rationale: justificativa curta\n"
@@ -3648,6 +3664,41 @@ def _grounding_rationale_is_inconclusive(rationale: str) -> bool:
     """True quando o grounding só diz que NÃO ACHOU o processo (número incompleto,
     nada indexado, data tida como futura) — o que não é evidência de precedente."""
     return bool(GROUNDING_INCONCLUSIVE_RATIONALE_RE.search(normalize_model_text(rationale or "")))
+
+
+
+def _apply_nonjudgment_metadata_assessment(
+    candidate: "PublishPreviewRow", response: "ProcessMetadataResult", artifact_store: "RunArtifacts",
+) -> None:
+    rationale = normalize_model_text(response.rationale)
+    normalized = normalize_class_text(rationale)
+    no_judgment = re.search(
+        r"retirad[oa][^.;]{0,60}pauta|adiad[oa][^.;]{0,80}(?:quorum|julgamento)|"
+        r"(?:falta|ausencia|sem)[^.;]{0,25}quorum|nao (?:houve|ocorreu) julgamento",
+        normalized,
+    )
+    # Older metadata caches labeled every false response as a precedent. Remove only
+    # that generated message before deriving the reason from the retained response.
+    candidate.errors = [error for error in candidate.errors if error !=
+        "Busca Google indicou que o número consultado aparece como precedente citado, não como processo julgado."]
+    if no_judgment:
+        candidate.add_error(f"Processo sem julgamento na sessão: {rationale}")
+    elif _row_has_strong_local_judgment_evidence(candidate, artifact_store):
+        candidate.add_warning(
+            "Grounding negou o julgamento, mas o próprio vídeo traz prova local forte do julgamento; mantendo item."
+        )
+    elif _grounding_rationale_is_inconclusive(rationale):
+        candidate.add_warning(
+            "Grounding não localizou o processo (número incompleto/data tida como futura); item mantido para vistoria."
+        )
+    elif re.search(r"precedente|referencia jurisprudencial|apenas[^.;]{0,40}citad", normalized):
+        candidate.add_error(
+            "Busca Google indicou que o número consultado aparece como precedente citado, não como processo julgado."
+        )
+    else:
+        candidate.add_error(
+            "Grounding informou ausência de julgamento sem esclarecer o motivo; revisão necessária."
+        )
 
 
 def _row_has_strong_local_judgment_evidence(row: "PublishPreviewRow", artifact_store: "RunArtifacts") -> bool:
@@ -3721,11 +3772,11 @@ def require_youtube_transcript_api():
 
 
 def resolve_gemini_model(client: Any, requested_model: str) -> str:
-    return DEFAULT_GEMINI_MODEL
+    return (requested_model or "").strip().removeprefix("models/") or DEFAULT_GEMINI_MODEL
 
 
 def build_gemini_model_candidates(client: Any, requested_model: str) -> list[str]:
-    return [DEFAULT_GEMINI_MODEL]
+    return [resolve_gemini_model(client, requested_model)]
 
 
 def extract_retry_delay_seconds(exc: Exception) -> float:
@@ -3866,10 +3917,12 @@ def detect_rito_events(snippets: list[TranscriptSnippet]) -> list[RitoEvent]:
         if not normalized:
             continue
         matched: dict[str, str] = {}
+        matched_positions: dict[str, tuple[int, int]] = {}
         for kind, pattern in RITO_EVENT_PATTERNS:
             found = pattern.search(normalized)
             if found:
                 matched[kind] = found.group(0).strip()
+                matched_positions[kind] = (found.start(), found.end())
         if not matched:
             continue
         # "Chamo a julgamento as listas tríplices" NÃO é o bloco de julgamento em lista:
@@ -3885,15 +3938,22 @@ def detect_rito_events(snippets: list[TranscriptSnippet]) -> list[RitoEvent]:
             # não casa sozinho e o trecho ficaria sem evento algum — sem apregoamento, o passo 1
             # do refine não resgata a janela.
             matched.setdefault("apregoamento", chamada)
+            matched_positions.setdefault("apregoamento", matched_positions["lista"])
         # Chamada das listas não é apregoamento individual; abertura da sessão
         # administrativa não é a abertura genérica da sessão.
         if "lista" in matched:
             matched.pop("apregoamento", None)
         if "admin_open" in matched or "admin_close" in matched:
             matched.pop("sessao_open", None)
-        start_seconds = int(snippet.start_seconds)
-        end_seconds = int((nxt or snippet).end_seconds)
         for kind, text in matched.items():
+            # O par sobreposto pode conter a chamada SO no segundo snippet.
+            # Datá-la pelo primeiro cria duas chamadas quando ha uma pausa longa
+            # entre as legendas (15/09: 1528s + 1549s para a mesma frase).
+            current_length = len(normalize_class_text(snippet.text))
+            match_start, match_end = matched_positions[kind]
+            starts_in_next = nxt is not None and match_start > current_length
+            start_seconds = int(nxt.start_seconds if starts_in_next else snippet.start_seconds)
+            end_seconds = int((nxt if nxt is not None and match_end > current_length else snippet).end_seconds)
             last = last_by_kind.get(kind)
             if last is not None and start_seconds - last < RITO_EVENT_DEDUPE_SECONDS:
                 continue
@@ -4475,6 +4535,11 @@ def _normalize_session_window_payload(payload: dict[str, Any]) -> dict[str, Any]
             "nome_bloco": "title_hint",
             "processo": "mentioned_process_numbers",
             "processos": "mentioned_process_numbers",
+            "process_numbers": "mentioned_process_numbers",
+            "start_timestamp": "start_seconds",
+            "timestamp_start": "start_seconds",
+            "end_timestamp": "end_seconds",
+            "timestamp_end": "end_seconds",
             "inicio_segundos": "start_seconds",
             "inicio_em_segundos": "start_seconds",
             "segundo_inicial": "start_seconds",
@@ -4655,6 +4720,8 @@ def _normalize_session_extraction_payload(payload: dict[str, Any]) -> dict[str, 
     normalized = _rename_payload_keys(
         payload,
         {
+            "session_date": "data_sessao",
+            "ministers_present": "composicao",
             "data_da_sessao": "data_sessao",
             "data_da_sessão": "data_sessao",
             "composicao_da_sessao": "composicao",
@@ -4744,6 +4811,57 @@ def sanitize_scan_chunk_windows(
         "descartados": dropped[:200],
     }
     return kept, report
+
+
+
+def scan_chunk_chapter_conflicts(
+    judgments: list["SessionWindow"],
+    *,
+    chapters: list[dict[str, Any]],
+    window_start_seconds: int,
+    window_end_seconds: int,
+    tolerance_seconds: int = 120,
+) -> list[dict[str, Any]]:
+    """Flag known cases returned from a clip disjoint from their official chapter.
+
+    This is a conflict requiring another read, never permission to move timestamps.
+    Unknown cases remain eligible. A case spanning several clips remains eligible
+    throughout its chapter, and repeated chapters for the same case are all checked.
+    """
+    def process_key(number: str) -> str:
+        digits = re.sub(r"\D", "", canonicalize_numero_processo(number) or "")
+        return digits[:9].rjust(9, "0") if digits else ""
+
+    known: dict[str, list[tuple[int, int]]] = {}
+    for chapter in chapters:
+        key = process_key(str(chapter.get("numero_processo") or ""))
+        start, end = chapter.get("start_seconds"), chapter.get("end_seconds")
+        if not key or start is None or end is None:
+            continue
+        start, end = coerce_seconds(start), coerce_seconds(end)
+        if end > start:
+            known.setdefault(key, []).append((start, end))
+    conflicts = []
+    for judgment in judgments:
+        if judgment.should_ignore:
+            continue
+        for number in judgment.mentioned_process_numbers:
+            intervals = known.get(process_key(number), [])
+            if not intervals or any(
+                window_start_seconds < end + tolerance_seconds
+                and window_end_seconds > start - tolerance_seconds
+                for start, end in intervals
+            ):
+                continue
+            conflicts.append({
+                "numero_processo": number,
+                "start_seconds": judgment.start_seconds,
+                "end_seconds": judgment.end_seconds,
+                "scan_window": [window_start_seconds, window_end_seconds],
+                "chapter_intervals": [list(interval) for interval in intervals],
+                "reason": "processo retornado em recorte distante do capítulo oficial",
+            })
+    return conflicts
 
 
 def scan_chunk_degeneration_report(
@@ -4991,6 +5109,145 @@ class RunArtifacts:
         return json.loads((self.root_dir / filename).read_text(encoding="utf-8"))
 
 
+def _scan_coverage_payload(
+    duration_seconds: int,
+    attempts: list[dict[str, Any]],
+    *,
+    source: str = "video",
+) -> dict[str, Any]:
+    """Coverage measures successful reads, never a claim of semantic completeness."""
+    covered = sorted(
+        (max(0, int(w["start_seconds"])), min(duration_seconds, int(w["end_seconds"])))
+        for attempt in attempts if attempt.get("source", "video") == "video"
+        for w in attempt.get("windows", []) if w.get("status") == "complete"
+    )
+    uncovered: list[list[int]] = []
+    cursor = 0
+    for start, end in covered:
+        if end <= cursor:
+            continue
+        if start > cursor:
+            uncovered.append([cursor, start])
+        cursor = max(cursor, end)
+    if cursor < duration_seconds:
+        uncovered.append([cursor, duration_seconds])
+    complete = duration_seconds > 0 and not uncovered
+    video_uncovered = list(uncovered)
+    if source == "transcript":
+        transcript_windows = [
+            window for attempt in attempts if attempt.get("source") == "transcript"
+            for window in attempt.get("windows", [])
+        ]
+        uncovered = [
+            [int(w["start_seconds"]), int(w["end_seconds"])]
+            for w in transcript_windows if w.get("status") != "complete"
+        ]
+        complete = bool(transcript_windows) and not uncovered
+    return {
+        "schema_version": 1,
+        "status": "complete" if complete else "incomplete",
+        "source": source,
+        "duration_seconds": duration_seconds,
+        "uncovered_intervals": uncovered,
+        "video_uncovered_intervals": video_uncovered,
+        "attempts": attempts,
+    }
+
+
+def load_scan_coverage_report(artifact_store: RunArtifacts) -> dict[str, Any] | None:
+    """Read the current manifest, or reconstruct coverage before trusting an old cache.
+
+    None means that the cache has no scan plan; it does not mean complete coverage.
+    Legacy .error files may remain after a successful retry, so a valid response wins.
+    """
+    if artifact_store.exists("00_scan_coverage.json"):
+        saved = artifact_store.read_json("00_scan_coverage.json")
+        return _scan_coverage_payload(
+            int(saved.get("duration_seconds") or 0), saved.get("attempts") or [],
+            source=saved.get("source") or "video",
+        )
+    if not artifact_store.exists("00_scan_windows.json"):
+        return None
+    scan = artifact_store.read_json("00_scan_windows.json")
+    attempts = []
+    for plan in scan.get("plans") or []:
+        label = plan.get("label", "primary")
+        prefix = "raw_global_response" if label == "primary" else "raw_global_fallback_response"
+        windows = []
+        for index, (start, end) in enumerate(plan.get("windows") or [], 1):
+            window = {"start_seconds": start, "end_seconds": end, "status": "pending"}
+            response = f"{prefix}_chunk_{index:02d}.json"
+            rejected = f"{prefix}_chunk_{index:02d}.descartes.json"
+            if artifact_store.exists(response):
+                try:
+                    SessionExtraction.model_validate(artifact_store.read_json(response))
+                    window["status"] = "complete"
+                    if artifact_store.exists(rejected):
+                        report = artifact_store.read_json(rejected)
+                        if (report.get("degeneracao") or {}).get("suspeito") or (
+                            report.get("blocos_descartados", 0) > 0
+                            and report.get("blocos_mantidos", 0) == 0
+                        ):
+                            window["status"] = "rejected"
+                    conflicts = f"{prefix}_chunk_{index:02d}.chapter_conflicts.json"
+                    if artifact_store.exists(conflicts) and artifact_store.read_json(conflicts).get("conflicts"):
+                        window["status"] = "rejected"
+                except (ValueError, TypeError):
+                    window["status"] = "failed"
+            elif artifact_store.exists(f"{prefix}_chunk_{index:02d}.error.json"):
+                window["status"] = "failed"
+            windows.append(window)
+        attempts.append({"label": label, "artifact_prefix": prefix, "source": "video", "windows": windows})
+    report = _scan_coverage_payload(int(scan.get("duration_seconds") or 0), attempts)
+    report["reconstructed_from_legacy_cache"] = True
+    return report
+
+
+
+def refresh_cached_rito_report(artifact_store: RunArtifacts) -> dict[str, Any] | None:
+    """Refresh detector evidence from the saved transcript without reindexing windows.
+
+    Keep the original report once when detector evidence changes. Reopening the same
+    cache is idempotent and does not cause new transcript/API requests.
+    """
+    if not artifact_store.exists("raw_transcript_fetch.json"):
+        return None
+    payload = artifact_store.read_json("raw_transcript_fetch.json")
+    snippets = [TranscriptSnippet(
+        text=normalize_transcript_text(item.get("text")),
+        start_seconds=coerce_seconds(item.get("start_seconds")),
+        end_seconds=coerce_seconds(item.get("end_seconds")),
+    ) for item in payload.get("snippets", []) if normalize_transcript_text(item.get("text"))]
+    if not snippets:
+        return None
+    events = detect_rito_events(snippets)
+    filename = "01b_rito_refinement.json"
+    previous = artifact_store.read_json(filename) if artifact_store.exists(filename) else {}
+    current_events = [event.model_dump() for event in events]
+    current_count = count_individual_apregoamentos(events)
+    if (previous.get("events") == current_events
+            and previous.get("apregoamentos_individuais") == current_count):
+        return previous
+    report = dict(previous)
+    report.update(
+        transcript_available=True,
+        events=current_events,
+        apregoamentos_individuais=current_count,
+        detector_version=2,
+        cached_windows_preserved=True,
+    )
+    if report == previous:
+        return report
+    if previous:
+        archive = "01b_rito_refinement.original.json"
+        if not artifact_store.exists(archive):
+            artifact_store.write_text(archive, (artifact_store.root_dir / filename).read_text(encoding="utf-8"))
+        report["previous_detector_report"] = archive
+        report["adjustments_are_historical"] = True
+    artifact_store.write_json(filename, report)
+    return report
+
+
 class GeminiSessionExtractor:
     def __init__(
         self,
@@ -5026,6 +5283,31 @@ class GeminiSessionExtractor:
         self.allow_transcript_fallback = allow_transcript_fallback
         self._transcript_snippets_cache: list[TranscriptSnippet] | None = None
 
+    def _start_scan_attempt(
+        self, *, label: str, artifact_prefix: str,
+        windows: list[tuple[int, int]], source: str = "video",
+    ) -> dict[str, Any]:
+        if not hasattr(self, "_scan_coverage_attempts"):
+            self._scan_coverage_attempts = []
+        attempt = {
+            "label": label, "artifact_prefix": artifact_prefix, "source": source,
+            "windows": [
+                {"start_seconds": start, "end_seconds": end, "status": "pending"}
+                for start, end in windows
+            ],
+        }
+        self._scan_coverage_attempts.append(attempt)
+        self._persist_scan_coverage(source=source)
+        return attempt
+
+    def _persist_scan_coverage(self, *, source: str = "video") -> dict[str, Any]:
+        report = _scan_coverage_payload(
+            getattr(self, "_scan_duration_seconds", 0),
+            getattr(self, "_scan_coverage_attempts", []), source=source,
+        )
+        self.artifact_store.write_json("00_scan_coverage.json", report)
+        return report
+
     def _fetch_transcript_snippets_best_effort(self, youtube_url: str) -> list[TranscriptSnippet] | None:
         """Transcrição para a camada do rito: ausência NÃO é erro (vídeo sem legenda
         segue o fluxo atual intacto)."""
@@ -5039,16 +5321,27 @@ class GeminiSessionExtractor:
     def analyze_session(self, youtube_url: str) -> AnalysisResult:
         normalized_url = normalize_youtube_link(youtube_url)
         if self.artifact_store.exists("01_session_windows.json"):
+            cached_coverage = load_scan_coverage_report(self.artifact_store)
+            if cached_coverage and cached_coverage["status"] != "complete":
+                self.artifact_store.write_json("00_scan_coverage.json", cached_coverage)
+                raise RuntimeError(
+                    "Cache da sessão tem cobertura incompleta do vídeo; reprocessar a sessão "
+                    f"antes de publicar. Lacunas: {cached_coverage['uncovered_intervals']}"
+                )
             session = SessionExtraction.model_validate(
                 self.artifact_store.read_json("01_session_windows.json")
             )
+            try:
+                refresh_cached_rito_report(self.artifact_store)
+            except (ValueError, TypeError, OSError) as exc:
+                self.logger.warning("Não foi possível atualizar a evidência de rito do cache: %s", exc)
         else:
             session = self._extract_session_windows(normalized_url)
             # Camada determinística do rito: corrige o plano de janelas ANTES de
             # persistir 01_session_windows.json (retomadas via cache e os índices
             # dos 02_judgment_NN não deslocam). Zero chamadas de IA.
             snippets = self._fetch_transcript_snippets_best_effort(normalized_url)
-            rito_report: dict[str, Any] = {"transcript_available": bool(snippets)}
+            rito_report: dict[str, Any] = {"transcript_available": bool(snippets), "detector_version": 2}
             if snippets:
                 events = detect_rito_events(snippets)
                 # Duracao do video: essencial para a guarda anti-"abertura no meio do
@@ -5073,33 +5366,178 @@ class GeminiSessionExtractor:
             self.artifact_store.write_json("01b_rito_refinement.json", rito_report)
             self.artifact_store.write_json("01_session_windows.json", session.model_dump(mode="json"))
 
+        session = self._add_missing_chapter_windows(session)
+        self.artifact_store.write_json("01_session_windows.json", session.model_dump(mode="json"))
         bundles: list[JudgmentBundleExtraction] = []
+        detail_report: dict[str, Any] = {"schema_version": 1, "status": "incomplete", "blocks": []}
         for index, window in enumerate(session.judgments, start=1):
+            record: dict[str, Any] = {
+                "index": index, "title_hint": window.title_hint,
+                "start_seconds": window.start_seconds, "end_seconds": window.end_seconds,
+                "expected_process_numbers": list(window.mentioned_process_numbers),
+                "observed_process_numbers": [], "retried": False,
+            }
             if window.should_ignore:
                 self.logger.info("Ignorando bloco %s: %s", index, window.ignore_reason or "marcado pelo modelo")
+                record.update(
+                    status="excluded" if window.ignore_reason.strip() else "pending",
+                    exclusion_reason=window.ignore_reason,
+                    issues=[] if window.ignore_reason.strip() else ["scan_ignored_without_reason"],
+                )
+                detail_report["blocks"].append(record)
+                self.artifact_store.write_json("02_detail_coverage.json", detail_report)
                 continue
             bundle_filename = f"02_judgment_{index:02d}.json"
+            bundle = None
             if self.artifact_store.exists(bundle_filename):
-                bundle = JudgmentBundleExtraction.model_validate(
+                cached_bundle = JudgmentBundleExtraction.model_validate(
                     self.artifact_store.read_json(bundle_filename)
                 )
-            else:
+                # Chapter recovery can change indices. Never reuse another block's detail.
+                if (cached_bundle.title_hint == window.title_hint
+                        and abs(cached_bundle.start_seconds - window.start_seconds) <= REFINE_START_LOOKBACK_SECONDS):
+                    bundle = cached_bundle
+            if bundle is None:
                 try:
                     bundle = self._extract_judgment_bundle(normalized_url, session, window, index)
                 except Exception as exc:
                     self.logger.warning(
                         "Falha ao extrair detalhamento do bloco %s (%s); gerando placeholder bloqueável: %s",
-                        index,
-                        window.title_hint or "sem título",
-                        exc,
+                        index, window.title_hint or "sem título", exc,
                     )
                     bundle = self._build_failed_bundle_placeholder(session, window, index, exc)
-                self.artifact_store.write_json(
-                    bundle_filename,
-                    bundle.model_dump(mode="json"),
+                self.artifact_store.write_json(bundle_filename, bundle.model_dump(mode="json"))
+            issues = self._detail_coverage_issues(window, bundle)
+            retry_filename = f"02_judgment_{index:02d}.coverage_retry.json"
+            previous_retry = (
+                self.artifact_store.read_json(retry_filename)
+                if self.artifact_store.exists(retry_filename) else {}
+            )
+            same_retry_window = (
+                previous_retry.get("window_start_seconds") == window.start_seconds
+                and previous_retry.get("expected_process_numbers") == window.mentioned_process_numbers
+            )
+            if issues and not same_retry_window:
+                record["retried"] = True
+                retry_context = (
+                    "REVISÃO DE COBERTURA: a primeira leitura deixou uma inconsistência: "
+                    + ", ".join(issues)
+                    + ". Processos indicados pelo inventário: "
+                    + ", ".join(window.mentioned_process_numbers)
+                    + ". Processos retornados antes: "
+                    + ", ".join(item.numero_processo for item in bundle.items)
+                    + ". Reveja o vídeo deste bloco. Diferencie o processo apregoado dos "
+                    "precedentes citados; não copie o processo do bloco seguinte. Retorne "
+                    "todos os processos efetivamente julgados, um item por processo. "
+                    "Se excluir o bloco, justifique com o que consta do trecho."
                 )
+                self.logger.warning("Revisando cobertura do bloco %s: %s", index, ", ".join(issues))
+                retry_record: dict[str, Any] = {
+                    "issues_before": issues, "attempted": True,
+                    "window_start_seconds": window.start_seconds,
+                    "expected_process_numbers": list(window.mentioned_process_numbers),
+                }
+                # Write before the request so resuming a failed retry stays bounded.
+                self.artifact_store.write_json(retry_filename, retry_record)
+                try:
+                    retry_bundle = self._extract_judgment_bundle(
+                        normalized_url, session, window, index, coverage_retry_context=retry_context,
+                    )
+                    retry_issues = self._detail_coverage_issues(window, retry_bundle)
+                    if len(retry_issues) <= len(issues):
+                        bundle, issues = retry_bundle, retry_issues
+                except Exception as exc:
+                    retry_record["error"] = str(exc)[:2000]
+                retry_record["issues_after"] = issues
+                self.artifact_store.write_json(retry_filename, retry_record)
+            if "empty_bundle" in issues or "ignored_without_reason" in issues:
+                bundle = self._build_failed_bundle_placeholder(
+                    session, window, index,
+                    RuntimeError("Detalhamento sem julgamento recuperado: " + ", ".join(issues)),
+                )
+            record.update(
+                status="pending" if issues else ("excluded" if bundle.should_ignore else "complete"),
+                issues=issues,
+                observed_process_numbers=[item.numero_processo for item in bundle.items],
+                exclusion_reason=bundle.ignore_reason if bundle.should_ignore else "",
+            )
+            detail_report["blocks"].append(record)
+            self.artifact_store.write_json(bundle_filename, bundle.model_dump(mode="json"))
+            self.artifact_store.write_json("02_detail_coverage.json", detail_report)
             bundles.append(bundle)
+        detail_report["status"] = (
+            "incomplete" if any(block["status"] == "pending" for block in detail_report["blocks"])
+            else "complete"
+        )
+        self.artifact_store.write_json("02_detail_coverage.json", detail_report)
         return AnalysisResult(session=session, bundles=bundles)
+
+    def _add_missing_chapter_windows(self, session: SessionExtraction) -> SessionExtraction:
+        """Official YouTube chapters provide an independent inventory before detail extraction."""
+        if not self.artifact_store.exists("00_chapter_inventory.json"):
+            return session
+        inventory = self.artifact_store.read_json("00_chapter_inventory.json")
+        chapters = sorted(inventory.get("chapters") or [], key=lambda item: int(item["start_seconds"]))
+        self._chapter_detail_limits = {
+            (self._chave_de_processo(str(chapter.get("numero_processo") or "")), int(chapter["start_seconds"])):
+                int(chapter["end_seconds"])
+            for chapter in chapters if chapter.get("end_seconds") is not None
+        }
+        existing = {
+            self._chave_de_processo(number)
+            for window in session.judgments if not window.should_ignore
+            for number in window.mentioned_process_numbers
+        }
+        duration = 0
+        if self.artifact_store.exists("00_scan_windows.json"):
+            duration = int(self.artifact_store.read_json("00_scan_windows.json").get("duration_seconds") or 0)
+        recovered = []
+        for chapter in chapters:
+            number = str(chapter.get("numero_processo") or "")
+            key = self._chave_de_processo(number)
+            if not key or key in existing:
+                continue
+            start = int(chapter["start_seconds"])
+            following = [int(item["start_seconds"]) for item in chapters if int(item["start_seconds"]) > start]
+            end = chapter.get("end_seconds")
+            if end is None:
+                end = min(following) if following else duration or None
+            if end is not None:
+                end = min(int(end), duration) if duration else int(end)
+            if end is not None and end <= start:
+                continue
+            window = SessionWindow(
+                title_hint=f"{chapter.get('classe_processo') or chapter.get('classe') or ''} {number}".strip(),
+                start_seconds=start, end_seconds=end, mentioned_process_numbers=[number],
+            )
+            session.judgments.append(window)
+            existing.add(key)
+            recovered.append(window.model_dump(mode="json"))
+        if recovered:
+            session.judgments.sort(key=lambda window: (window.start_seconds, window.title_hint))
+            self.logger.warning("Recuperados %s julgamento(s) ausentes pelo inventário de capítulos.", len(recovered))
+            self.artifact_store.write_json("01d_chapter_recovery.json", recovered)
+        return session
+
+    def _detail_coverage_issues(
+        self, window: SessionWindow, bundle: JudgmentBundleExtraction,
+    ) -> list[str]:
+        if bundle.should_ignore:
+            return [] if normalize_model_text(bundle.ignore_reason) else ["ignored_without_reason"]
+        if bundle.ignore_reason.startswith("Falha de extração detalhada:"):
+            return ["detail_extraction_failed"]
+        if not bundle.items:
+            return ["empty_bundle"]
+        expected = {
+            self._chave_de_processo(number) for number in window.mentioned_process_numbers
+            if len(re.sub(r"\D", "", number)) in {8, 9, 20}
+        } - {""}
+        observed = {self._chave_de_processo(item.numero_processo) for item in bundle.items} - {""}
+        if expected and not expected.intersection(observed):
+            return ["process_identity_mismatch"]
+        if expected - observed:
+            return ["missing_scan_process"]
+        return []
 
     def _build_failed_bundle_placeholder(
         self,
@@ -5244,6 +5682,10 @@ class GeminiSessionExtractor:
 
         extracted_chunks: list[SessionExtraction] = []
         consecutive_failures_without_success = 0
+        attempt = self._start_scan_attempt(
+            label="transcript", artifact_prefix="raw_transcript_response", source="transcript",
+            windows=[(chunk.start_seconds, chunk.end_seconds) for chunk in transcript_chunks],
+        )
         for chunk_index, chunk in enumerate(transcript_chunks, start=1):
             self.artifact_store.write_text(
                 f"raw_transcript_chunk_{chunk_index:02d}.txt",
@@ -5293,6 +5735,8 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                         "error": str(exc)[:2000],
                     },
                 )
+                attempt["windows"][chunk_index - 1].update(status="failed", error=str(exc)[:500])
+                self._persist_scan_coverage(source="transcript")
                 consecutive_failures_without_success += 1
                 if (
                     not extracted_chunks
@@ -5332,14 +5776,24 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                 judgment.scan_window = [chunk.start_seconds, chunk.end_seconds]
             chunk_result.judgments = kept
 
-            extracted_chunks.append(chunk_result)
+            rejected = bool(sanitize_report["blocos_descartados"] and not kept)
             self.artifact_store.write_json(
                 f"raw_transcript_response_chunk_{chunk_index:02d}.json",
                 chunk_result.model_dump(mode="json"),
             )
+            attempt["windows"][chunk_index - 1]["status"] = "rejected" if rejected else "complete"
+            self._persist_scan_coverage(source="transcript")
+            if not rejected:
+                extracted_chunks.append(chunk_result)
 
         if not extracted_chunks:
             raise RuntimeError("Nenhum chunk da transcrição foi extraído com sucesso.")
+        coverage = self._persist_scan_coverage(source="transcript")
+        if coverage["status"] != "complete":
+            raise RuntimeError(
+                "Cobertura incompleta da transcrição; trechos não analisados: "
+                f"{coverage['uncovered_intervals']}"
+            )
         return extracted_chunks
 
     def _build_transcript_detail_chunk(
@@ -5386,6 +5840,8 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
 
     def _extract_session_windows(self, youtube_url: str) -> SessionExtraction:
         duration_seconds = fetch_youtube_duration_seconds(youtube_url)
+        self._scan_duration_seconds = duration_seconds
+        self._scan_coverage_attempts: list[dict[str, Any]] = []
         primary_windows = chunk_video_windows(duration_seconds)
         fallback_windows = chunk_video_windows(
             duration_seconds,
@@ -5413,10 +5869,25 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
             },
         )
         last_error: Exception | None = None
-        for plan_label, windows, artifact_prefix in [
+        all_chunks: list[SessionExtraction] = []
+        all_orphans: list[tuple[str, int, int]] = []
+        for plan_label, planned_windows, artifact_prefix in [
             ("primary", primary_windows, "raw_global_response"),
             ("fallback", fallback_windows, "raw_global_fallback_response"),
         ]:
+            windows = planned_windows
+            if plan_label == "fallback" and all_chunks:
+                gaps = self._persist_scan_coverage()["uncovered_intervals"]
+                windows = [
+                    (start, end) for start, end in planned_windows
+                    if any(start < gap_end and end > gap_start for gap_start, gap_end in gaps)
+                ]
+                self.logger.warning(
+                    "Cobertura incompleta do vídeo; recuperando %s janela(s) em %s.",
+                    len(windows), gaps,
+                )
+            if not windows:
+                continue
             try:
                 extracted_chunks = self._extract_session_windows_for_plan(
                     youtube_url=youtube_url,
@@ -5427,32 +5898,37 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
                 )
             except Exception as exc:
                 last_error = exc
-                self.logger.warning(
-                    "Falha na varredura global (%s): %s",
-                    plan_label,
-                    exc,
+                self.logger.warning("Falha na varredura global (%s): %s", plan_label, exc)
+                continue
+            all_chunks.extend(extracted_chunks)
+            all_orphans.extend(getattr(self, "_processos_orfaos_do_scan", []))
+            coverage = self._persist_scan_coverage()
+            if coverage["status"] != "complete":
+                last_error = RuntimeError(
+                    "Cobertura incompleta do vídeo após recuperação; trechos não analisados: "
+                    f"{coverage['uncovered_intervals']}"
                 )
                 continue
-            if extracted_chunks:
-                merged = self._merge_session_chunks(extracted_chunks)
+            if all_chunks:
+                merged = self._merge_session_chunks(all_chunks)
                 absorvidos = getattr(self, "_fragmentos_sanduiche", None) or []
                 if absorvidos:
                     self.artifact_store.write_json("01c_fragmentos_sanduiche.json", absorvidos)
                 self._preencher_vaos_com_processos_orfaos(
-                    merged,
-                    getattr(self, "_processos_orfaos_do_scan", []),
-                    duration_seconds=duration_seconds,
+                    merged, all_orphans, duration_seconds=duration_seconds,
                 )
                 return merged
         if not getattr(self, "allow_transcript_fallback", True):
             # Salvaguarda: não rebaixa para transcrição (registros rasos). Falha para que
             # o vídeo seja reprocessado por vídeo quando o Gemini conseguir baixá-lo.
             message = (
-                "Extração por VÍDEO falhou em todos os planos e o fallback de transcrição "
-                "está desativado (allow_transcript_fallback=False). Provável vídeo recém-saído "
-                "de transmissão ao vivo, ainda não processável pelo Gemini — reprocessar por "
-                "vídeo quando o VOD estabilizar."
+                "Extração por VÍDEO falhou em obter cobertura confiável de todos os trechos; "
+                "o fallback de transcrição está desativado (allow_transcript_fallback=False). "
+                "Consulte 00_scan_coverage.json e os descartes para recuperar apenas as "
+                "janelas com falha ou resposta rejeitada."
             )
+            if last_error is not None:
+                message += f" Diagnóstico: {last_error}"
             self.logger.warning("%s", message)
             if last_error is not None:
                 raise RuntimeError(message) from last_error
@@ -5481,7 +5957,15 @@ Marque como should_ignore=true qualquer bloco de julgamento em lista ou equivale
         extracted_chunks: list[SessionExtraction] = []
         consecutive_failures_without_success = 0
         blocos_descartados_no_plano = 0
+        attempt = self._start_scan_attempt(
+            label=plan_label, artifact_prefix=artifact_prefix, windows=windows,
+        )
         self._processos_orfaos_do_scan: list[tuple[str, int, int]] = []
+        chapters = []
+        if self.artifact_store.exists("00_chapter_inventory.json"):
+            inventory = self.artifact_store.read_json("00_chapter_inventory.json")
+            if inventory.get("status") == "available":
+                chapters = inventory.get("chapters") or []
         for chunk_index, (start_seconds, end_seconds) in enumerate(windows, start=1):
             prompt = f"""
 Analise apenas o trecho da sessão delimitado por esta janela.
@@ -5498,6 +5982,9 @@ Retorne:
 - números de processo mencionados no bloco;
 - se deve ser ignorado e por quê.
 
+Use o áudio e as imagens deste recorte como evidência. A descrição e os capítulos do YouTube não provam que um processo está sendo julgado neste recorte: não os copie como resposta.
+Se não houver julgamento identificável no recorte (por exemplo, espera pelo início da transmissão), retorne judgments=[]; não preencha a resposta com processos de outros momentos.
+Os timestamps são ABSOLUTOS no vídeo inteiro: não reinicie a contagem em zero nem desloque um capítulo para fazê-lo caber nesta janela.
 Se um bloco atravessar a fronteira da janela, ainda assim devolva o timestamp absoluto que conseguir identificar.
 Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equivalente. Não confunda com LISTA TRÍPLICE (formação de lista de três nomes para vaga de TRE), que é julgamento normal: nunca marque should_ignore=true nela. Sempre que marcar should_ignore=true, escreva o motivo em ignore_reason.
 """
@@ -5529,6 +6016,8 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                         "error": str(exc)[:2000],
                     },
                 )
+                attempt["windows"][chunk_index - 1].update(status="failed", error=str(exc)[:500])
+                self._persist_scan_coverage()
                 consecutive_failures_without_success += 1
                 if (
                     not extracted_chunks
@@ -5558,13 +6047,28 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                 window_end_seconds=end_seconds,
                 duration_seconds=duration_seconds,
             )
+            chapter_conflicts = scan_chunk_chapter_conflicts(
+                kept, chapters=chapters,
+                window_start_seconds=start_seconds,
+                window_end_seconds=end_seconds,
+            )
+            if chapter_conflicts:
+                self.artifact_store.write_json(
+                    f"{artifact_prefix}_chunk_{chunk_index:02d}.chapter_conflicts.json",
+                    {"plan": plan_label, "conflicts": chapter_conflicts},
+                )
+                self.logger.warning(
+                    "Scan %s/%s: %s processo(s) incompatíveis com os horários dos capítulos; "
+                    "recorte pendente de nova leitura.",
+                    plan_label, chunk_index, len(chapter_conflicts),
+                )
             blocos_descartados_no_plano += sanitize_report["blocos_descartados"]
             # O numero descartado nao se perde: o chunk so viu o recorte [start, end], entao
             # se ele nomeia um processo, o processo esta ali. Guarda para
             # `_preencher_vaos_com_processos_orfaos` decidir depois, com a sessao montada,
             # se sobrou vao para ele. Chunk com assinatura de degeneracao nao entra: ali o
             # proprio numero costuma ser fabricado.
-            if not degeneration["suspeito"]:
+            if not degeneration["suspeito"] and not chapter_conflicts:
                 for descartado in sanitize_report.get("descartados", []):
                     for numero in descartado.get("mentioned_process_numbers", []):
                         self._processos_orfaos_do_scan.append((numero, start_seconds, end_seconds))
@@ -5595,15 +6099,24 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
                     degeneration["passo_constante_segundos"],
                     degeneration["cnj_dv_invalidos"],
                 )
+            rejected = bool(chapter_conflicts or degeneration["suspeito"] or (
+                sanitize_report["blocos_descartados"] and not kept
+            ))
             for judgment in kept:
                 judgment.scan_window = [start_seconds, end_seconds]
             chunk_result.judgments = kept
-
-            extracted_chunks.append(chunk_result)
             self.artifact_store.write_json(
                 f"{artifact_prefix}_chunk_{chunk_index:02d}.json",
                 chunk_result.model_dump(mode="json"),
             )
+            attempt["windows"][chunk_index - 1].update(
+                status="rejected" if rejected else "complete",
+                discarded_windows=sanitize_report["blocos_descartados"],
+                chapter_conflicts=chapter_conflicts,
+            )
+            self._persist_scan_coverage()
+            if not rejected:
+                extracted_chunks.append(chunk_result)
         if not extracted_chunks:
             raise RuntimeError(f"Nenhum chunk global foi extraído com sucesso no plano {plan_label}.")
 
@@ -6138,7 +6651,8 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
             coerce_seconds(outra.start_seconds)
             for outra in session.judgments
             if outra is not window and outra.start_seconds is not None
-            and coerce_seconds(outra.start_seconds) > fim
+            and coerce_seconds(outra.start_seconds) >= fim
+            and coerce_seconds(outra.start_seconds) > coerce_seconds(window.start_seconds)
         ]
         if proximos:
             limite = min(limite, min(proximos))
@@ -6150,6 +6664,8 @@ Marque como should_ignore=true qualquer bloco de "julgamento em lista" ou equiva
         session: SessionExtraction,
         window: SessionWindow,
         index: int,
+        *,
+        coverage_retry_context: str = "",
     ) -> JudgmentBundleExtraction:
         refined_start_seconds = self._refine_bundle_start_seconds(
             youtube_url=youtube_url,
@@ -6175,6 +6691,16 @@ Contexto global:
 - Seja fiel ao vídeo e deixe em branco o que não estiver explícito.
 - Exceção quanto à composição: preencha o campo composicao de CADA item com a lista de ministros indicada em "Composição da sessão" acima (os que participaram deste julgamento), no formato "Min. <Nome>", mesmo que o trecho não a repita. Só altere se o trecho mostrar entrada, saída, ausência ou substituição de ministro para ESTE processo. Nunca deixe composicao vazia quando a composição da sessão for conhecida.
 """
+        if coverage_retry_context:
+            prompt += "\n\n" + coverage_retry_context
+        detail_end_seconds = self._detail_end_seconds(session, window)
+        # An official chapter may end at a collective list absent from scan windows.
+        # Its boundary still limits the tail padding, preventing the next case leaking in.
+        chapter_limits = getattr(self, "_chapter_detail_limits", {})
+        for number in window.mentioned_process_numbers:
+            chapter_end = chapter_limits.get((self._chave_de_processo(number), window.start_seconds))
+            if chapter_end is not None:
+                detail_end_seconds = min(detail_end_seconds, chapter_end) if detail_end_seconds else chapter_end
         try:
             bundle = self._call_gemini(
                 youtube_url=youtube_url,
@@ -6182,8 +6708,9 @@ Contexto global:
                 response_model=JudgmentBundleExtraction,
                 system_prompt=DETAIL_SYSTEM_PROMPT,
                 start_seconds=refined_start_seconds,
-                end_seconds=self._detail_end_seconds(session, window),
-                artifact_name=f"raw_detail_{index:02d}.txt",
+                end_seconds=detail_end_seconds,
+                artifact_name=(f"raw_detail_{index:02d}.coverage_retry.txt" if coverage_retry_context
+                               else f"raw_detail_{index:02d}.txt"),
             )
         except Exception as exc:
             if not getattr(self, "allow_transcript_fallback", True):
@@ -7040,6 +7567,57 @@ class GeminiThemePunchlineEnricher:
         return candidate
 
 
+
+def _metadata_cache_identity_matches(
+    row: PublishPreviewRow, cached: PublishPreviewRow, peers: list[PublishPreviewRow],
+) -> bool:
+    """A positional cache is reusable only for the same video, date and case."""
+    video = extract_youtube_video_id(row.youtube_link)
+    date = normalize_session_date_to_iso(row.data_sessao)
+    if (not video or not date or video != extract_youtube_video_id(cached.youtube_link)
+            or date != normalize_session_date_to_iso(cached.data_sessao)):
+        return False
+
+    def digits(value: str) -> str:
+        # canonicalize_numero_processo intentionally strips the full CNJ suffix.
+        # Preserve that suffix here: same core with a different year/court is not
+        # sufficient identity for two fully specified case numbers.
+        return re.sub(r"\D", "", extract_full_cnj(value) or canonicalize_numero_processo(value) or "")
+
+    current_number, cached_number = digits(row.numero_processo), digits(cached.numero_processo)
+    if len(current_number) == len(cached_number) == 20:
+        return current_number == cached_number
+    if len(current_number) not in {8, 9, 20} or len(cached_number) not in {8, 9, 20}:
+        return False
+    key = current_number[:9].rjust(9, "0")
+    if key != cached_number[:9].rjust(9, "0"):
+        return False
+    # A short number cannot safely select between two rows with the same CNJ core.
+    matching_peers = [peer for peer in peers
+        if extract_youtube_video_id(peer.youtube_link) == video
+        and normalize_session_date_to_iso(peer.data_sessao) == date
+        and digits(peer.numero_processo)[:9].rjust(9, "0") == key]
+    return len(matching_peers) == 1
+
+
+def _archive_metadata_identity_mismatch(artifact_store: RunArtifacts, filename: str) -> None:
+    """Keep the rejected response and its raw text before fresh metadata replaces it."""
+    path = artifact_store.root_dir / filename
+    data = path.read_bytes()
+    stem = path.stem
+    archive = path.with_name(f"{stem}.identity_mismatch.json")
+    revision = 2
+    while archive.exists() and archive.read_bytes() != data:
+        archive = path.with_name(f"{stem}.identity_mismatch_{revision:02d}.json")
+        revision += 1
+    if not archive.exists():
+        archive.write_bytes(data)
+    raw = path.with_suffix(".txt")
+    archived_raw = archive.with_suffix(".txt")
+    if raw.exists() and not archived_raw.exists():
+        archived_raw.write_bytes(raw.read_bytes())
+
+
 class GeminiProcessMetadataEnricher:
     def __init__(
         self,
@@ -7067,8 +7645,16 @@ class GeminiProcessMetadataEnricher:
                 cached_payload = self.artifact_store.read_json(cache_filename)
                 applied = cached_payload.get("applied")
                 if applied:
-                    enriched_rows.append(PublishPreviewRow.model_validate(applied))
-                    continue
+                    candidate = PublishPreviewRow.model_validate(applied)
+                    if _metadata_cache_identity_matches(row, candidate, rows):
+                        parsed = cached_payload.get("parsed") or {}
+                        if parsed.get("is_judged_process") is False:
+                            _apply_nonjudgment_metadata_assessment(
+                                candidate, ProcessMetadataResult.model_validate(parsed), self.artifact_store,
+                            )
+                        enriched_rows.append(candidate)
+                        continue
+                    _archive_metadata_identity_mismatch(self.artifact_store, cache_filename)
             has_full_cnj = bool(extract_full_cnj(row.numero_processo))
             has_origem = bool(normalize_model_text(row.origem))
             # Lista tríplice: os indicados (advogados/juristas) são públicos mas não vêm no
@@ -7155,23 +7741,7 @@ class GeminiProcessMetadataEnricher:
                         "partes (indicados da lista tríplice) preenchidas via busca Google; confira os nomes."
                     )
             elif response.is_judged_process is False:
-                if _row_has_strong_local_judgment_evidence(candidate, self.artifact_store):
-                    candidate.add_warning(
-                        "Grounding indicou precedente citado, mas o próprio vídeo traz prova local forte do julgamento; mantendo item."
-                    )
-                elif _grounding_rationale_is_inconclusive(response.rationale):
-                    # A busca não achar o processo NÃO prova que ele não foi julgado:
-                    # PAs administrativos quase não têm cobertura e o buscador chegou a
-                    # tratar a data da sessão como "futura" (caso do PA 0600904-54 em
-                    # 23/06/2026, descartado por engano). Só descartamos quando o
-                    # grounding aponta positivamente o número como precedente citado.
-                    candidate.add_warning(
-                        "Grounding não localizou o processo (número incompleto/data tida como futura); item mantido para vistoria."
-                    )
-                else:
-                    candidate.add_error(
-                        "Busca Google indicou que o número consultado aparece como precedente citado, não como processo julgado."
-                    )
+                _apply_nonjudgment_metadata_assessment(candidate, response, self.artifact_store)
             enriched_rows.append(candidate)
             self.artifact_store.write_json(
                 f"04a_process_metadata_{index:02d}.json",
@@ -8623,6 +9193,10 @@ def assess_row_publishability(row: PublishPreviewRow) -> tuple[str, list[str]]:
         return "skipped", ["Item descartado: identificado como precedente citado, não como processo julgado."]
     if error_texts and all("evento de pauta" in error for error in error_texts):
         return "skipped", ["Item descartado: evento de pauta (anúncio/leitura/inclusão), não processo julgado."]
+    if error_texts and all(error.startswith("processo sem julgamento na sessão:") for error in error_texts):
+        return "skipped", [error for error in row.errors if normalize_model_text(error)]
+    if any(error.startswith("grounding informou ausência de julgamento sem esclarecer") for error in error_texts):
+        return "blocked", list(row.errors)
 
     signal_fields = [
         row.numero_processo,
@@ -9491,8 +10065,26 @@ def publish_preview_rows(
     rows: list[PublishPreviewRow],
     notion_client: NotionSessoesClient,
     notion_schema: NotionDataSourceSchema,
+    *,
+    result_callback: Any = None,
 ) -> list[dict[str, Any]]:
+    """Publish rows and optionally persist each outcome before the next write.
+
+    The callback receives a result snapshot plus its zero-based ``row_index``
+    in the original batch. Returned results retain their existing shape. A
+    write failure is reported to the callback and then raised; callback failures
+    also stop publication so a broken journal cannot silently lose later writes.
+    """
     results: list[dict[str, Any]] = []
+
+    def record_result(result: dict[str, Any], row_index: int) -> None:
+        results.append(result)
+        if result_callback is not None:
+            snapshot = dict(result, row_index=row_index)
+            snapshot["errors"] = list(result.get("errors", []))
+            snapshot["warnings"] = list(result.get("warnings", []))
+            result_callback(snapshot)
+
     definitive_processos: set[str] = set()
     assessed: list[tuple[PublishPreviewRow, str, list[str]]] = []
     for row in rows:
@@ -9500,38 +10092,62 @@ def publish_preview_rows(
         disposition, reasons = assess_row_publishability(row)
         assessed.append((row, disposition, reasons))
     _renumber_judgments_after_skips([(row, disposition) for row, disposition, _ in assessed])
-    for row, disposition, reasons in assessed:
+    for row_index, (row, disposition, reasons) in enumerate(assessed):
         if disposition == "skipped":
-            results.append(
+            record_result(
                 {
                     "tema": row.tema,
                     "numero_processo": row.numero_processo,
                     "status": "skipped",
                     "errors": [],
                     "warnings": dedupe_preserve_order(row.warnings + reasons),
-                }
+                },
+                row_index,
             )
             continue
         if disposition == "blocked":
-            results.append(
+            record_result(
                 {
                     "tema": row.tema,
                     "numero_processo": row.numero_processo,
                     "status": "blocked",
                     "errors": reasons,
                     "warnings": row.warnings,
-                }
+                },
+                row_index,
             )
             continue
-        if row.action == "update" and row.page_id:
-            response = notion_client.update_row(notion_schema, row.page_id, row)
-            status = "updated"
-        else:
-            response = notion_client.create_row(notion_schema, row)
-            status = "created"
+        try:
+            if row.action == "update" and row.page_id:
+                response = notion_client.update_row(notion_schema, row.page_id, row)
+                status = "updated"
+            else:
+                response = notion_client.create_row(notion_schema, row)
+                status = "created"
+            page_id = response.get("id") if isinstance(response, dict) else None
+            if not isinstance(page_id, str) or not page_id.strip():
+                raise RuntimeError("Resposta do Notion sem id da página; publicação não confirmada.")
+        except Exception as exc:
+            try:
+                record_result(
+                    {
+                        "tema": row.tema,
+                        "numero_processo": row.numero_processo,
+                        "status": "error",
+                        "page_id": row.page_id if row.action == "update" else "",
+                        "url": "",
+                        "errors": [str(exc)],
+                        "warnings": row.warnings,
+                    },
+                    row_index,
+                )
+            except Exception:
+                # Preserve the original write error even if its journal also fails.
+                logging.getLogger(__name__).exception("Falha ao registrar erro de publicação no monitor.")
+            raise
         if row.votacao in DEFINITIVE_VOTACAO and row.numero_processo:
             definitive_processos.add(row.numero_processo)
-        results.append(
+        record_result(
             {
                 "tema": row.tema,
                 "numero_processo": row.numero_processo,
@@ -9540,7 +10156,8 @@ def publish_preview_rows(
                 "url": response.get("url", ""),
                 "errors": [],
                 "warnings": row.warnings,
-            }
+            },
+            row_index,
         )
 
     # Quando um processo foi definitivamente julgado (Unânime/Por maioria) nesta

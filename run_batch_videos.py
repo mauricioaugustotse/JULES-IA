@@ -47,15 +47,19 @@ def main() -> int:
     result = process_video_batch(videos, options, q, stop)
 
     print("\n==== RESUMO DO LOTE ====", flush=True)
-    print(f"solicitados={result.get('total_requested')} done={result.get('total_done')} erro={result.get('total_error')}", flush=True)
+    print(f"solicitados={result.get('total_requested')} done={result.get('total_done')} "
+          f"pendencias={result.get('total_pending', 0)} erro={result.get('total_error')}", flush=True)
     for v in result.get("videos", []):
-        if v.get("status") == "done":
+        if v.get("status") in {"done", "pending", "preview"}:
             print(f"  [{v['position']:02d}] {v['video_id']} -> linhas={v['rows_extracted']} "
-                  f"criadas={v['created']} atualizadas={v['updated']} bloqueadas={v['blocked']} ignoradas={v['skipped']}", flush=True)
+                  f"criadas={v['created']} atualizadas={v['updated']} bloqueadas={v['blocked']} ignoradas={v['skipped']} "
+                  f"estado={v['status']}", flush=True)
         else:
             print(f"  [{v.get('position')}] {v.get('video_id')} -> ERRO: {str(v.get('error', ''))[:250]}", flush=True)
     print("artifacts:", result.get("artifact_dir"), flush=True)
-    return 0
+    if result.get("total_error"):
+        return 1
+    return 2 if result.get("total_pending") or result.get("total_unprocessed") or result.get("total_stopped") else 0
 
 
 if __name__ == "__main__":

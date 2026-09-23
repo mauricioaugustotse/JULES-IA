@@ -2429,7 +2429,7 @@ CNJ_ELECTORAL_UF_BY_CODE = {
     "27": "TO",
 }
 
-_RESULTADO_SUSPENSIVOS = {"Suspenso por vista", "Suspenso mas julgado depois", "Sobrestado", "Prejudicado"}
+_RESULTADO_SUSPENSIVOS = {"Suspenso", "Suspenso por vista", "Suspenso mas julgado depois", "Sobrestado", "Prejudicado"}
 _RESULTADO_RECURSAL = {
     "Provido",
     "Provido em parte",
@@ -2456,6 +2456,8 @@ _RESULTADO_PC = {
     "Não prestadas",
 } | _RESULTADO_SUSPENSIVOS
 _RESULTADO_PA = {
+    "Deferido",
+    "Indeferido",
     "Aprovada",
     "Aprovada com ressalvas",
     "Referendada",

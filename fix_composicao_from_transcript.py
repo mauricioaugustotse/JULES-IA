@@ -1,4 +1,4 @@
-"""Corrige a coluna composicao usando a FONTE AUTORITATIVA: a saudacao de abertura da sessao na
+"""Propõe correção da coluna composicao usando a saudacao de abertura da sessao na
 TRANSCRICAO do YouTube (o presidente cumprimenta os ministros PRESENTES: "Cumprimento os
 integrantes desse tribunal, ... ministro X, ministro Y, ministra Z ..."). O Gemini vinha
 devolvendo o plenario TITULAR (nao os presentes do dia) — sinal: relator fora da propria
@@ -7,6 +7,9 @@ composicao.
 Por SESSAO (video): baixa transcricao -> acha a saudacao -> extrai 'ministr[oa] <Nome>' ->
 casa cada nome com o conjunto canonico (nomes ja vistos na base) -> VALIDA (todo relator das
 paginas da sessao tem que estar entre os presentes). So aplica quando valida; senao FLAG.
+A abertura nao substitui a composicao de cada julgamento: votos preservados de assentada
+anterior e substituicoes podem variar entre processos da mesma sessao. Composicoes ja
+preenchidas com seis ou sete nomes e seu relator sao preservadas e conflitos registrados.
 
 Uso:
   python fix_composicao_from_transcript.py                 # dry-run, so sessoes com erro
@@ -37,6 +40,19 @@ def fold(x: str) -> str:
     x = re.sub(r"^min\.?\s*", "", str(x or "").lower())
     x = unicodedata.normalize("NFKD", x)
     return re.sub(r"[^a-z ]", " ", "".join(c for c in x if not unicodedata.combining(c))).strip()
+
+
+def preserve_case_composition(current: list[str], relator: str) -> bool:
+    """Nao substitui colegiado completo de um caso apenas pela saudacao inicial.
+
+    A ausencia do relator ainda permite o reparo que motivou estes scripts.
+    Sem relator informado, a composicao completa existente continua protegida.
+    """
+    names = {fold(name) for name in current if fold(name)}
+    if not 6 <= len(names) <= 7:
+        return False
+    rel = fold(relator)
+    return not rel or any(rel == name or (len(rel) > 4 and (rel in name or name in rel)) for name in names)
 
 
 def video_id(url: str) -> str:
@@ -139,7 +155,8 @@ def main() -> int:
     LOGGER.info("sessoes a revisar: %d", len(sessions))
 
     stats = {"sessoes": len(sessions), "aplicadas": 0, "flag_sem_transcript": 0, "flag_sem_saudacao": 0,
-             "flag_relator_ausente": 0, "paginas_alteradas": 0, "applied": 0, "falhas": 0}
+             "flag_relator_ausente": 0, "paginas_alteradas": 0, "applied": 0, "falhas": 0,
+             "preservadas_por_processo": 0}
     detail = []
     for vid, pgs in sessions:
         txt = fetch_transcript(vid)
@@ -170,7 +187,16 @@ def main() -> int:
         stats["aplicadas"] += 1
         built = client._build_property_value(schema, "composicao", present)
         for p in pgs:
-            if parse_multi_value_text(t(p, "composicao")) == present:
+            current = parse_multi_value_text(t(p, "composicao"))
+            if {fold(name) for name in current} == {fold(name) for name in present}:
+                continue
+            if preserve_case_composition(current, t(p, "relator")):
+                stats["preservadas_por_processo"] += 1
+                rec.setdefault("conflitos_por_processo", []).append({
+                    "page_id": p["id"], "numero_processo": t(p, "numero_processo"),
+                    "mantida": current, "abertura": present,
+                    "reason": "Abertura da sessao nao comprova composicao de julgamento com votos preservados.",
+                })
                 continue
             stats["paginas_alteradas"] += 1
             if args.apply:
@@ -185,7 +211,7 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "detalhe.json").write_text(json.dumps(detail, ensure_ascii=False, indent=1), encoding="utf-8")
     LOGGER.info("RESUMO: %s | %s", json.dumps({"mode": "apply" if args.apply else "dry-run", **stats}, ensure_ascii=False), run_dir)
-    return 0
+    return 1 if stats["falhas"] else 0
 
 
 if __name__ == "__main__":

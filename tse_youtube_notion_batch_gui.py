@@ -28,6 +28,7 @@ from tse_youtube_notion_core import (
     DEFAULT_NOTION_DATABASE_URL,
     GeminiSessionExtractor,
     NotionSessoesClient,
+    PublishPreviewRow,
     RunArtifacts,
     build_preview_rows,
     build_runtime_context,
@@ -48,6 +49,9 @@ from tse_normalization import (infer_session_date_from_video_title,
                                normalize_numero_processo_display)
 
 import vistoria_queue
+from tse_workflow_monitor import BatchMonitor, atomic_json, read_json, reconcile_video, verify_notion_rows, process_key
+from tse_chapter_coverage import ensure_chapter_inventory, compare_chapters
+from tse_official_session import fetch_official_session, compare_official_rows, INVENTORY_FILENAME as OFFICIAL_INVENTORY_FILENAME
 
 
 LOGGER = logging.getLogger("tse_youtube_notion_batch_gui")
@@ -72,7 +76,7 @@ except Exception:  # noqa: BLE001
 
 MAX_LINKS = 10
 BATCH_ARTIFACT_ROOT = ARTIFACT_ROOT / "batch_gui"
-TERMINAL_STATUSES = {"Concluido", "Erro"}
+TERMINAL_STATUSES = {"Concluido", "Erro", "Pendencias", "Interrompido", "Previa"}
 STAGE_PROGRESS = {
     "Em andamento": 0.02,
     "analisando video": 0.08,
@@ -421,6 +425,8 @@ def process_single_video(
     # ``analysis`` pre-extraido (IA bruta vinda dos artefatos) pula a extracao pelo
     # Gemini e segue por TODAS as demais etapas de padronizacao iguais ao fluxo normal
     # (capitulos, data pelo titulo, CNJ, metadados, tema/punchline, noticias, publish).
+    progress("conferindo inventario de capitulos")
+    chapter_inventory = ensure_chapter_inventory(artifact_store, video.url)
     if analysis is None:
         progress("analisando video")
         extractor = GeminiSessionExtractor(
@@ -433,6 +439,11 @@ def process_single_video(
         analysis = extractor.analyze_session(video.url)
     else:
         progress("usando analise pre-extraida dos artefatos (IA bruta)")
+    from tse_youtube_notion_core import load_scan_coverage_report, refresh_cached_rito_report
+    refresh_cached_rito_report(artifact_store)
+    scan_coverage = load_scan_coverage_report(artifact_store)
+    if scan_coverage and scan_coverage.get("status") != "complete":
+        raise RuntimeError("Varredura incompleta: ha trechos sem analise. Consulte 00_scan_coverage.json.")
     artifact_store.write_json("03_analysis.json", analysis.model_dump(mode="json"))
 
     progress("montando previa")
@@ -457,6 +468,9 @@ def process_single_video(
         youtube_url=video.url,
         logger=LOGGER,
     )
+
+    progress("consultando inventario oficial da sessao")
+    official_inventory = _fetch_official_for_rows(artifact_store, rows)
 
     progress("enriquecendo via CNJ DataJud")
     rows = enrich_preview_rows_with_cnj(
@@ -511,6 +525,17 @@ def process_single_video(
             [row.model_dump(mode="json") for row in rows],
         )
 
+    progress("confrontando julgados com o inventario oficial")
+    rows, official_excluded = _apply_official_gate(artifact_store, rows, official_inventory)
+    # Esta e a previa exata enviada ao publicador e usada na releitura final.
+    artifact_store.write_json("04h_publish_preview_rows.json", [row.model_dump(mode="json") for row in rows])
+    progress("conferindo cobertura dos julgados")
+    coverage = _video_coverage_report(artifact_store, analysis, rows, chapter_inventory, scan_coverage,
+                                      official=official_inventory)
+    if coverage["issues"]:
+        LOGGER.warning("[%s] Monitor: %s pendencia(s) de cobertura antes da publicacao.",
+                       video.video_id, len(coverage["issues"]))
+    _queue_monitor_issues(video, artifact_store, coverage)
     publish_results: list[dict[str, Any]] = []
     # GATE DE PARADA — o pedido de parada tem de valer para o video EM CURSO, nao so
     # para os seguintes: e no video em curso que o usuario acaba de ver o defeito no
@@ -539,8 +564,39 @@ def process_single_video(
         )
     elif options.publish:
         progress("publicando no Notion")
-        publish_results = publish_preview_rows(rows, notion_client, notion_schema)
+        journal: list[dict[str, Any]] = []
+
+        def record_result(event: dict[str, Any]) -> None:
+            journal.append(event)
+            atomic_json(artifact_store.root_dir / "05_publish_journal.json", journal)
+            progress(f"publicando no Notion: {len(journal)}/{len(rows)} registros")
+
+        atomic_json(artifact_store.root_dir / "05_publish_journal.json", journal)
+        try:
+            publish_results = publish_preview_rows(rows, notion_client, notion_schema, result_callback=record_result)
+        except Exception:
+            partial_checks = verify_notion_rows(rows, journal, notion_client, notion_schema)
+            artifact_store.write_json("05b_notion_verification.json", partial_checks)
+            coverage = _video_coverage_report(
+                artifact_store, analysis, rows, chapter_inventory, scan_coverage,
+                results=journal, verification=partial_checks, published=True,
+                official=official_inventory,
+            )
+            _queue_monitor_issues(video, artifact_store, coverage)
+            raise
         artifact_store.write_json("05_publish_results.json", publish_results)
+        progress("confirmando paginas publicadas no Notion")
+        verification = verify_notion_rows(
+            rows, publish_results, notion_client, notion_schema,
+            checkpoint=lambda checks: atomic_json(artifact_store.root_dir / "05b_notion_verification.json", checks),
+        )
+        artifact_store.write_json("05b_notion_verification.json", verification)
+        coverage = _video_coverage_report(
+            artifact_store, analysis, rows, chapter_inventory, scan_coverage,
+            results=publish_results, verification=verification, published=True,
+            official=official_inventory,
+        )
+        _queue_monitor_issues(video, artifact_store, coverage)
 
     rito_count_check = _build_rito_count_check(artifact_store, rows)
     if rito_count_check is not None:
@@ -569,6 +625,8 @@ def process_single_video(
         "blocked": count_result_status(publish_results, "blocked"),
         "skipped": count_result_status(publish_results, "skipped"),
         "publish_results": publish_results,
+        "coverage": coverage,
+        "official_excluded": len(official_excluded),
     }
     if rito_count_check is not None:
         summary["rito_count_check"] = rito_count_check
@@ -576,6 +634,105 @@ def process_single_video(
     summary["publish_skipped_by_stop"] = parou_antes_de_publicar
     artifact_store.write_json("06_batch_video_summary.json", summary)
     return summary
+
+
+def _fetch_official_for_rows(artifact_store, rows):
+    dates = {str(getattr(row, "data_sessao", "") or "")[:10] for row in rows}
+    try:
+        if len(dates) != 1 or not next(iter(dates), ""):
+            raise ValueError("Data ausente ou divergente")
+        return fetch_official_session(next(iter(dates)), artifact_store)
+    except (TypeError, ValueError):
+        payload = {"status": "unavailable", "session_date": None, "expected_count": None,
+                   "processes": [], "excluded": [], "counts": {},
+                   "error": "Data da sessão não confirmada nas linhas; inventário oficial desconhecido."}
+        artifact_store.write_json(OFFICIAL_INVENTORY_FILENAME, payload)
+        return payload
+
+
+def _apply_official_gate(artifact_store, rows, inventory):
+    """Contradicoes bloqueiam a linha; retiradas/listas exatas ficam excluidas.
+
+    Nao altera dados substantivos, completa numeros ou transforma uma pendencia
+    em precedente. O snapshot e a classificacao oficial ficam reproduziveis.
+    """
+    comparison = compare_official_rows(inventory, [row.model_dump(mode="json") for row in rows])
+    artifact_store.write_json("04f_official_comparison.json", comparison)
+    excluded_indexes = set()
+    exclusions = []
+    for issue in comparison:
+        if issue.get("severity") != "error":
+            continue
+        indexes = issue.get("row_indices", [issue.get("row_index")])
+        for index in indexes:
+            if not isinstance(index, int) or not 0 <= index < len(rows):
+                continue
+            row = rows[index]
+            if issue["code"] == "official_excluded_row":
+                digits = re.sub(r"\D", "", str(row.numero_processo or ""))
+                canonical = re.sub(r"\D", "", issue.get("numero_processo", ""))
+                if len(digits) == 9 or (len(digits) == 20 and digits == canonical):
+                    excluded_indexes.add(index)
+                    exclusions.append({"status": "official_exclusion", "original_row_index": index,
+                                       "classification": issue["classification"],
+                                       "numero_processo": issue["numero_processo"],
+                                       "message": issue["message"], "row": row.model_dump(mode="json")})
+                    continue
+            row.add_error(f"[oficial:{issue['code']}] {issue['message']}"
+                          + (f" Esperado: {issue['expected']!r}; observado: {issue.get('actual')!r}."
+                             if "expected" in issue else ""))
+    artifact_store.write_json("04g_official_excluded_rows.json", exclusions)
+    return [row for index, row in enumerate(rows) if index not in excluded_indexes], exclusions
+
+
+def _video_coverage_report(artifact_store, analysis, rows, chapters, scan, **kwargs):
+    row_data = [row.model_dump(mode="json") for row in rows]
+    report = reconcile_video(
+        analysis.model_dump(mode="json"), row_data,
+        rito=read_json(artifact_store.root_dir / "01b_rito_refinement.json", {}),
+        detail=read_json(artifact_store.root_dir / "02_detail_coverage.json", {}),
+        scan=scan, **kwargs,
+    )
+    official = kwargs.get("official") or {}
+    excluded_keys = {process_key(i.get("numero_processo")) for i in report.get("information", [])
+                     if i.get("code") == "official_exclusion"}
+    for issue in compare_chapters(chapters, row_data):
+        if issue.get("kind") == "chapter_inventory_unavailable" and official.get("status") == "available":
+            report["information"].append(issue)
+            continue
+        if issue.get("kind") == "chapter_missing_from_rows" and process_key(issue.get("numero_processo")) in excluded_keys:
+            continue
+        report["issues"].append({**issue, "code": issue.get("kind", "chapter_coverage")})
+    if report["issues"]:
+        report["status"] = "pending"
+    report["counts"]["issues"] = len(report["issues"])
+    atomic_json(artifact_store.root_dir / "04e_coverage_report.json", report)
+    return report
+
+
+def _queue_monitor_issues(video, artifact_store, report):
+    items = []
+    for issue in report.get("issues", []):
+        if issue.get("severity") == "info":
+            continue
+        if issue["code"] == "unpublished_row" and issue.get("status") in {"skipped", "blocked"}:
+            continue
+        timestamp = issue.get("start_seconds")
+        url = f"https://www.youtube.com/watch?v={video.video_id}"
+        if isinstance(timestamp, (int, float)) and timestamp >= 0:
+            url += f"&t={int(timestamp)}s"
+        message = issue["message"]
+        if issue.get("numero_processo"):
+            message += " Processo: " + str(issue["numero_processo"])
+        items.append(vistoria_queue.make_vistoria_item(
+            source="monitor", video_id=video.video_id, youtube_url=url,
+            disposition="cobertura", reasons=[message],
+            artifact_dir=str(artifact_store.root_dir), extra={"coverage_issue": issue},
+            dedupe_key=str(issue.get("code")) + ":" + str(issue.get("numero_processo", ""))
+            + ":" + str(issue.get("start_seconds", issue.get("row_index", issue.get("bundle_index", "")))),
+        ))
+    if items:
+        vistoria_queue.append_items(items)
 
 
 def _build_rito_count_check(artifact_store: RunArtifacts, rows: list[Any]) -> dict[str, Any] | None:
@@ -755,12 +912,33 @@ def _gf_run_relations(script: str, output_queue: "queue.Queue[tuple[str, Any]]",
 
 
 def process_video_batch(
+    videos: list[VideoInput], options: BatchOptions,
+    output_queue: "queue.Queue[tuple[str, Any]]", stop_event: threading.Event,
+    resume_root: Path | None = None,
+    analysis_provider: Callable[[VideoInput], Any] | None = None,
+) -> dict[str, Any]:
+    run_root = resume_root or (BATCH_ARTIFACT_ROOT / (time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1000000:06d}"))
+    monitor = BatchMonitor(run_root, videos)
+    output_queue.put(("batch_artifact_dir", str(run_root)))
+    try:
+        summary = _process_video_batch(videos, options, output_queue, stop_event,
+                                      resume_root=run_root, analysis_provider=analysis_provider,
+                                      monitor=monitor)
+    except Exception as exc:
+        monitor.event("", "Falha no lote: " + str(exc), status="error")
+        raise
+    monitor.finish(summary)
+    return summary
+
+
+def _process_video_batch(
     videos: list[VideoInput],
     options: BatchOptions,
     output_queue: "queue.Queue[tuple[str, Any]]",
     stop_event: threading.Event,
     resume_root: Path | None = None,
     analysis_provider: Callable[[VideoInput], Any] | None = None,
+    monitor: BatchMonitor | None = None,
 ) -> dict[str, Any]:
     runtime = build_runtime_context()
     gemini_key = runtime["gemini_api_key"]
@@ -774,7 +952,7 @@ def process_video_batch(
     run_root.mkdir(parents=True, exist_ok=True)
     output_queue.put(("batch_artifact_dir", str(run_root)))
     LOGGER.info("Artifacts do lote: %s", run_root)
-    if resume_root is not None:
+    if resume_root is not None and any(run_root.glob("[0-9][0-9]_*")):
         LOGGER.info("Retomando lote existente a partir dos artifacts.")
     LOGGER.info("Banco Notion: %s", runtime.get("notion_database_url") or DEFAULT_NOTION_DATABASE_URL)
     LOGGER.info("Data source Notion: %s", runtime["notion_data_source_id"])
@@ -786,6 +964,8 @@ def process_video_batch(
     # do DJe (pos-publicacao, --once) e o watcher ja encontrem o material novo. Fica
     # fora de qualquer condicao de publicacao: atualizar o acervo nao depende disso.
     if options.atualizar_tse and not stop_event.is_set():
+        if monitor:
+            monitor.event("", "Atualizando o acervo do TSE")
         output_queue.put(("status", "__post__", "Atualizando o acervo do TSE...", ""))
         LOGGER.info("Atualizando o acervo do TSE a partir do portal.")
         _gf_run_tse_update(options.tse_coletor, options.tse_max_idade_horas, output_queue,
@@ -811,8 +991,13 @@ def process_video_batch(
         output_queue.put(("video_started", video.video_id, index, len(videos)))
         output_queue.put(("status", video.video_id, "Em andamento", ""))
         LOGGER.info("[%s/%s] Iniciando %s", index, len(videos), video.url)
+        journal_path = artifact_store.root_dir / "05_publish_journal.json"
+        journal_before = journal_path.stat().st_mtime_ns if journal_path.exists() else None
 
         def _progress(message: str) -> None:
+            if monitor:
+                coverage = read_json(artifact_store.root_dir / "04e_coverage_report.json", {})
+                monitor.event(video.video_id, message, status="running", coverage=coverage)
             output_queue.put(("status", video.video_id, message, ""))
             LOGGER.info("[%s] %s", video.video_id, message)
 
@@ -841,16 +1026,25 @@ def process_video_batch(
                 output_queue.put(("video_finished", video.video_id, "stopped"))
                 LOGGER.warning("[%s] %s", video.video_id, final_status)
             else:
-                summaries.append({"status": "done", **summary})
+                pending = (summary.get("coverage") or {}).get("status") == "pending"
+                status = "pending" if pending else ("done" if options.publish else "preview")
+                label = "Pendencias" if pending else ("Concluido" if options.publish else "Previa")
+                summaries.append({"status": status, **summary})
                 final_status = (
-                    f"OK: {summary['created']} criadas, {summary['updated']} atualizadas, "
-                    f"{summary['blocked']} bloqueadas, {summary['skipped']} ignoradas"
+                    f"{label}: {summary['created']} criadas, {summary['updated']} atualizadas, "
+                    f"{summary['blocked']} bloqueadas, {summary['skipped']} ignoradas; "
+                    f"{len((summary.get('coverage') or {}).get('issues', []))} pendencia(s) no monitor"
                 )
-                output_queue.put(("status", video.video_id, "Concluido", final_status))
-                output_queue.put(("video_finished", video.video_id, "done"))
+                output_queue.put(("status", video.video_id, label, final_status))
+                output_queue.put(("video_finished", video.video_id, status))
                 LOGGER.info("[%s] %s", video.video_id, final_status)
+            if monitor:
+                monitor.event(video.video_id, final_status, status=summaries[-1]["status"],
+                              coverage=summary.get("coverage", {}))
         except Exception as exc:
             error_text = str(exc)
+            journal_changed = journal_path.exists() and journal_path.stat().st_mtime_ns != journal_before
+            partial_results = read_json(journal_path, []) if journal_changed else []
             summaries.append(
                 {
                     "status": "error",
@@ -859,16 +1053,24 @@ def process_video_batch(
                     "url": video.url,
                     "artifact_dir": str(artifact_store.root_dir),
                     "error": error_text,
+                    "created": count_result_status(partial_results, "created"),
+                    "updated": count_result_status(partial_results, "updated"),
+                    "publish_results": partial_results,
                     "traceback": traceback.format_exc(),
                 }
             )
             artifact_store.write_json("06_batch_video_error.json", summaries[-1])
+            if monitor:
+                monitor.event(video.video_id, error_text, status="error",
+                              coverage=read_json(artifact_store.root_dir / "04e_coverage_report.json", {}))
             output_queue.put(("status", video.video_id, "Erro", error_text))
             output_queue.put(("video_finished", video.video_id, "error"))
             LOGGER.exception("[%s] Falha no processamento", video.video_id)
             if not options.continue_on_error:
                 break
 
+    if monitor:
+        monitor.event("", "Conferencias e tratamentos pos-publicacao")
     # ===== POS-PUBLICACAO GOING-FORWARD =====
     # A ORDEM AQUI E A LICAO DE 19/08/2026:
     #   publicar -> confrontar sessoes -> popular base DJe -> relations
@@ -880,7 +1082,7 @@ def process_video_batch(
     # continua precisando entrar nas bases. `stop_event` barra tudo -- e o que o botao
     # "Parar antes de publicar" promete.
     post_publish: dict[str, Any] = {}
-    publicou = any(item.get("status") == "done" for item in summaries)
+    publicou = any(item.get("created", 0) + item.get("updated", 0) > 0 for item in summaries)
     if options.publish and publicou and not stop_event.is_set() and options.post_publish_steps:
         dsid = runtime["notion_data_source_id"]
         output_queue.put(("status", "__post__", "Pos-publicacao: tratamentos de dados...", ""))
@@ -942,6 +1144,13 @@ def process_video_batch(
     )
     if "treatments_error" in post_publish:
         post_publish_falhas.insert(0, "treatments")
+    treatment_results = (post_publish.get("treatments") or {}).get("results", {})
+    if isinstance(treatment_results, dict):
+        failed_treatments = {name: result for name, result in treatment_results.items()
+                             if result.get("status") == "failed"}
+        if failed_treatments:
+            post_publish["failed_treatments"] = failed_treatments
+            post_publish_falhas.extend("treatments:" + name for name in sorted(failed_treatments))
     if post_publish_falhas:
         for etapa_nome in post_publish_falhas:
             output_queue.put(("log",
@@ -949,6 +1158,11 @@ def process_video_batch(
                               f"(retorno {post_publish.get(etapa_nome)!r}). As bases podem "
                               f"ter ficado desatualizadas — veja o log acima.\n"))
         post_publish["falhas"] = post_publish_falhas
+
+    if options.publish and publicou:
+        output_queue.put(("status", "__post__", "Reconferindo paginas apos todos os tratamentos...", ""))
+        post_publish["final_verification"] = _verify_after_post_publish(
+            summaries, notion_client, notion_schema, output_queue, monitor)
 
     # ===== FILA DE VISTORIA: consolida os itens do run e alimenta a fila global =====
     run_vistoria_items: list[dict[str, Any]] = []
@@ -980,6 +1194,11 @@ def process_video_batch(
         "notion_database_url": runtime.get("notion_database_url") or DEFAULT_NOTION_DATABASE_URL,
         "notion_data_source_id": runtime["notion_data_source_id"],
         "total_requested": len(videos),
+        "publish_requested": options.publish,
+        "total_pending": sum(item.get("status") == "pending" for item in summaries),
+        "total_stopped": sum(item.get("status") == "stopped" for item in summaries),
+        "total_preview": sum(item.get("status") == "preview" for item in summaries),
+        "total_unprocessed": len(videos) - len(summaries),
         "total_done": sum(1 for item in summaries if item.get("status") == "done"),
         # Falha pos-publicacao conta como erro do LOTE: o resumo "0 com erro" com o
         # relations morto foi o que escondeu o incidente de 20/08/2026.
@@ -992,6 +1211,69 @@ def process_video_batch(
         encoding="utf-8",
     )
     return summary_payload
+
+
+def _verify_after_post_publish(summaries, notion_client, notion_schema, output_queue, monitor=None):
+    """Read-only final gate: later scripts must not invalidate checked judgments."""
+    fields = {"numero_processo", "data_sessao", "youtube_link", "classe_processo", "origem",
+              "relator", "resultado", "votacao", "composicao", "pedido_vista", "eleicao"}
+    final = []
+    for summary in summaries:
+        if not (summary.get("created", 0) + summary.get("updated", 0)):
+            continue
+        report = dict(summary.get("coverage") or {})
+        report["issues"] = list(report.get("issues") or [])
+        try:
+            if not summary.get("artifact_dir"):
+                raise ValueError("Pasta da previa publicada nao registrada")
+            store = RunArtifacts(Path(summary["artifact_dir"]))
+            raw = read_json(store.root_dir / "04h_publish_preview_rows.json")
+            if not isinstance(raw, list):
+                raise ValueError("Previa exata da publicacao indisponivel para releitura final")
+            rows = [PublishPreviewRow.model_validate(row) for row in raw]
+            results = summary.get("publish_results") or []
+            checks = verify_notion_rows(
+                rows, results, notion_client, notion_schema, fields=fields,
+                checkpoint=lambda data: atomic_json(store.root_dir / "05c_final_notion_verification.json", data))
+            store.write_json("05c_final_notion_verification.json", checks)
+            official = read_json(store.root_dir / OFFICIAL_INVENTORY_FILENAME,
+                                 {"status": "unavailable", "error": "Snapshot oficial nao encontrado na conferencia final."})
+            comparison = compare_official_rows(official, raw)
+            store.write_json("05d_final_official_comparison.json", comparison)
+            expected = sum(result.get("status") in {"created", "updated"} for result in results)
+            failed = [check for check in checks if check.get("status") != "verified"]
+            final.append({"video_id": summary["video_id"], "expected": expected,
+                          "verified": len(checks) - len(failed), "failed": len(failed)})
+            if expected == 0 or len(checks) != expected or failed:
+                report["issues"].append({"code": "notion_final_unverified",
+                    "message": "Releitura final das paginas diverge da previa ou nao foi confirmada apos os tratamentos.",
+                    "expected": expected, "checks": checks})
+            existing = {(i.get("code"), i.get("row_index"), i.get("numero_processo"), i.get("field"))
+                        for i in report["issues"]}
+            report["issues"].extend(i for i in comparison if i.get("severity") != "info"
+                and (i.get("code"), i.get("row_index"), i.get("numero_processo"), i.get("field")) not in existing)
+            report["final_verification"] = final[-1]
+        except Exception as exc:
+            report["issues"].append({"code": "notion_final_unverified",
+                                     "message": "Falha na conferencia final das paginas: " + str(exc)[:500]})
+            final.append({"video_id": summary["video_id"], "status": "unverified"})
+        if report["issues"]:
+            report["status"] = "pending"
+            if summary.get("status") not in {"error", "stopped"}:
+                summary["status"] = "pending"
+        report.setdefault("counts", {})["issues"] = len(report["issues"])
+        summary["coverage"] = report
+        if summary.get("artifact_dir"):
+            folder = Path(summary["artifact_dir"])
+            atomic_json(folder / "04e_coverage_report.json", report)
+            atomic_json(folder / "06_batch_video_summary.json", summary)
+            _queue_monitor_issues(VideoInput(summary.get("position", 0), summary.get("url", ""), summary["video_id"]),
+                                  RunArtifacts(folder), report)
+        if monitor:
+            monitor.event(summary["video_id"], "Conferencia final apos tratamentos", status=summary.get("status", "pending"), coverage=report)
+        if report["issues"]:
+            output_queue.put(("status", summary["video_id"], "Pendencias", "Conferencia final exige revisao; consulte o monitor."))
+    return final
 
 
 class BatchGuiApp:
@@ -1071,7 +1353,7 @@ class BatchGuiApp:
         try:
             pastas = sorted(
                 (p for p in BATCH_ARTIFACT_ROOT.iterdir()
-                 if p.is_dir() and re.match(r"^\d{8}_\d{6}$", p.name)),
+                 if p.is_dir() and re.match(r"^\d{8}_\d{6}(?:_\d{6})?$", p.name)),
                 key=lambda p: p.name, reverse=True)
         except OSError:
             return None, ""
@@ -1080,9 +1362,18 @@ class BatchGuiApp:
         ultima = pastas[0]
         quando = f"{ultima.name[6:8]}/{ultima.name[4:6]} {ultima.name[9:11]}:{ultima.name[11:13]}"
         try:
+            resolution = read_json(ultima / "monitor_resolution.json", {})
+            if resolution.get("status") == "verified":
+                return ultima, f"último lote: {quando} (corrigido e conferido)"
+        except (OSError, ValueError, TypeError):
+            pass
+        try:
             resumo = json.loads((ultima / "batch_summary.json").read_text(encoding="utf-8"))
             done, err = resumo.get("total_done", "?"), resumo.get("total_error", 0)
             detalhe = f"{done} vídeo(s) ok" + (f", {err} com erro" if err else "")
+            pending = resumo.get("total_pending", 0)
+            if pending:
+                detalhe += f", {pending} com pendencias"
         except Exception:
             detalhe = "interrompido"
         return ultima, f"último lote: {quando} ({detalhe})"
@@ -1488,6 +1779,10 @@ class BatchGuiApp:
             "Abre no Explorer a pasta dos arquivos intermediários do lote (extrações, prévias e resultados de "
             "publicação) — útil para auditoria e diagnóstico. Sem lote nesta sessão, abre a pasta do ÚLTIMO "
             "lote processado.",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tip(
+            ttk.Button(actions, text="Monitor", command=self._open_monitor),
+            "Abre o painel de cobertura e pendencias; atualiza a cada 10 segundos.",
         ).pack(side=tk.LEFT, padx=(8, 0))
         tip(
             ttk.Button(actions, text="Retomar artifacts", command=self._load_resume_root),
@@ -1917,6 +2212,16 @@ class BatchGuiApp:
                                    "(sem tratamentos pós-publicação)")
         self.stop_button.configure(state=tk.DISABLED)
 
+    def _open_monitor(self) -> None:
+        folder = Path(self.batch_artifact_dir) if self.batch_artifact_dir else self.last_batch_dir
+        path = folder / "monitor.html" if folder else None
+        if not self.batch_artifact_dir and folder and (folder / "resolution_monitor.html").exists():
+            path = folder / "resolution_monitor.html"
+        if path and path.exists():
+            webbrowser.open(path.resolve().as_uri())
+        else:
+            messagebox.showinfo("Monitor", "O monitor sera criado automaticamente ao iniciar o proximo lote.")
+
     def _open_artifacts(self) -> None:
         # prioridade: lote da sessão atual > último lote encontrado no boot > raiz
         if self.batch_artifact_dir:
@@ -2075,7 +2380,10 @@ class BatchGuiApp:
                     pp_falhas = (summary.get("post_publish") or {}).get("falhas") or []
                     message = (
                         "\nResumo: "
-                        f"{summary.get('total_done', 0)} concluidos, "
+                        f"{summary.get('total_done', 0)} concluidos com conferencia, "
+                        f"{summary.get('total_pending', 0)} com pendencias, "
+                        f"{summary.get('total_stopped', 0)} interrompidos, "
+                        f"{summary.get('total_unprocessed', 0)} nao processados, "
                         f"{summary.get('total_error', 0)} com erro. "
                         f"Artifacts: {summary.get('artifact_dir', '')}\n"
                     )
@@ -2091,6 +2399,13 @@ class BatchGuiApp:
                             f"{', '.join(pp_falhas)} — veja o log acima.\n"
                         )
                     self._append_output(message)
+                    if summary.get("total_pending", 0) or summary.get("total_error", 0):
+                        messagebox.showwarning("Lote precisa de atencao",
+                            f"{summary.get('total_error', 0)} erro(s) de processamento e "
+                            f"{summary.get('total_pending', 0)} video(s) com pendencias de conferencia.\n\n"
+                            "Abra Monitor para ver os videos afetados e a causa de cada alerta. "
+                            "As paginas ja publicadas foram preservadas; nao repita o lote inteiro "
+                            "sem conferir o que falta.")
                 elif event == "fatal_error":
                     _, error, detail = item
                     self._append_output(f"\nERRO FATAL: {error}\n{detail}\n")
