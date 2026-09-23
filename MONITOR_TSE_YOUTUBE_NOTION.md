@@ -80,6 +80,9 @@ lote criar seu próprio painel.
 
 A consulta oficial não valida, sozinha, todo o raciocínio jurídico. Resultados
 compostos, fundamentos e dados omitidos pela fonte exigem conferência da sessão.
+Quando um agravo interno ou regimental é provido para julgar o recurso
+subjacente, a etiqueta `resultado` segue o desfecho desse recurso; o texto
+registra separadamente o provimento do agravo.
 Contagens do rito também incluem chamadas sem julgamento e não substituem a
 conferência das identidades. Uma nova sessão ainda precisa passar pelo fluxo
 atualizado para validar a execução completa em produção.

@@ -579,7 +579,7 @@ ORIENTAÇÕES OBRIGATÓRIAS POR CAMPO:
 - `punchline`: escreva uma frase editorial curta, precisa e autônoma, contextualizando o caso, a tese jurídica debatida e a consequência do julgamento. A `punchline` deve complementar o `tema`, não repeti-lo com outras palavras. Evite fórmulas pobres como "recurso provido", "julgamento sobre..." ou simples cópia da ementa.
 - `classe_processo`: leia a classe processual exatamente como aparece na autuação/cabeçalho exibido na tela e no pregão do caso (ex.: "AgR-AREspe nº 0601309-60"). Capture a classe COMPLETA, preservando os prefixos de recurso interno, especialmente Agravo Regimental (AgR/AgRg) e Embargos de Declaração (ED), antes da classe-base. Não reduza um "AgR-AREspe" a "AREspe" nem um "ED-REspe" a "REspe". Se houver agravo regimental sendo julgado pelo colegiado contra decisão monocrática, a classe é a forma com AgRg-. Se a tela não exibir a classe com clareza, deixe o campo vazio em vez de adivinhar a classe-base.
 - `origem`: informe o MUNICÍPIO de origem do processo no formato "Cidade/UF" (ex.: "Santo Antônio do Tauá/PA"), tal como citado no caso. Não preencha origem com o tribunal ("Tribunal Regional Eleitoral do Pará", "TRE-PA") nem com a capital do estado quando o município específico aparecer no vídeo; o nome do tribunal de origem pertence a outro contexto, não à coluna origem.
-- `resultado_final`: registre SEMPRE o desfecho objetivo proclamado para este processo, conforme a classe. Recurso (REspe/AREspe/RO/AgRg-*/RHC/RMS): "Provido", "Desprovido", "Provido em parte", "Não conhecido"/"Não conhecida", "Prejudicado". Consulta: "Aprovada" (consulta respondida). Lista tríplice formada/encaminhada: "Aprovada". Lista tríplice devolvida para recomposição, complementação ou correção: "Devolvida"; nunca registre "Aprovada" nesse caso. Prestação de contas: "Aprovada"/"Aprovada com ressalvas"/"Rejeitada". Registro (RPP/RCand/DRAP): "Deferido"/"Indeferido". Representação/AIJE: "Procedente"/"Procedente em parte"/"Improcedente". Use o gênero correto (recurso=masculino; consulta/contas=feminino). Se o julgamento foi suspenso por pedido de vista, use "Suspenso por vista". Não deixe vazio quando o presidente proclamar o resultado.
+- `resultado_final`: registre SEMPRE o desfecho objetivo proclamado para este processo, conforme a classe. Recurso (REspe/AREspe/RO/AgRg-*/RHC/RMS): "Provido", "Desprovido", "Provido em parte", "Não conhecido"/"Não conhecida", "Prejudicado". Se o agravo interno/regimental foi provido para julgar o recurso subjacente, use na etiqueta a sorte desse recurso: "agravo provido para negar provimento ao recurso especial" = "Desprovido"; explique ambos os atos no texto. Se o recurso subjacente não foi julgado, não invente seu resultado. Consulta: "Aprovada" (consulta respondida). Lista tríplice formada/encaminhada: "Aprovada". Lista tríplice devolvida para recomposição, complementação ou correção: "Devolvida"; nunca registre "Aprovada" nesse caso. Prestação de contas: "Aprovada"/"Aprovada com ressalvas"/"Rejeitada". Registro (RPP/RCand/DRAP): "Deferido"/"Indeferido". Representação/AIJE: "Procedente"/"Procedente em parte"/"Improcedente". Use o gênero correto (recurso=masculino; consulta/contas=feminino). Se o julgamento foi suspenso por pedido de vista, use "Suspenso por vista". Não deixe vazio quando o presidente proclamar o resultado.
 - `pedido_vista`: nomeie o ministro que PEDIU VISTA, no formato "Min. <Nome>". Atenção ao pedido de vista ANTECIPADO: é comum o relator ou o presidente ANUNCIAR que outro ministro antecipará a vista ("o Ministro X antecipa o pedido de vista"). Quem pede vista é o ministro NOMEADO, nunca quem anuncia. Se ninguém pediu vista, deixe o campo vazio.
 - QUEM FALA NÃO É QUEM DECIDE. Antes de atribuir a alguém uma divergência, um voto-vista ou um pedido de vista, confira o nome dito no julgamento: o presidente conduz a sessão e anuncia atos de outros ministros o tempo todo, e o relator resume votos alheios. Nunca deduza o autor da divergência a partir de quem está com a palavra. Se não der para identificar o ministro com segurança, escreva "houve divergência" sem nome em vez de atribuí-la a quem falava.
 - COERÊNCIA entre `pedido_vista`, `analise_do_conteudo_juridico`, `raciocinio_juridico` e `punchline`: quem pediu vista e quem divergiu podem ser pessoas diferentes — não funda os dois papéis num nome só. Se `pedido_vista` ficou vazio, não afirme em prosa quem pediu vista; se o julgamento foi suspenso por vista, a prosa não pode descrevê-lo como decidido.
@@ -1981,6 +1981,30 @@ def infer_resultado_from_row_text(row: "PublishPreviewRow") -> str:
         if inferred and inferred != text.strip() and len(inferred) <= 40:
             return inferred
     return ""
+
+
+def infer_recurso_desprovido_apos_agravo_provido(row: "PublishPreviewRow") -> bool:
+    """Read a clear collective disposition, not a dissent or procedural vote.
+
+    The label for a granted internal appeal follows the underlying appeal when
+    the court also decided it. A mere mention of a special appeal is insufficient.
+    """
+    if not normalize_classe_processo(row.classe_processo).startswith("AgRg-"):
+        return False
+    for source in (row.punchline, row.analise_do_conteudo_juridico):
+        for fragment in re.split(r"[.!?\n]+", source):
+            sentence = normalize_class_text(fragment)
+            if not re.search(r"\b(?:tribunal|tse|corte|colegiado)\b", sentence):
+                continue
+            if not re.search(r"\bagravo\b", sentence):
+                continue
+            if not re.search(r"\b(?:proveu|deu provimento ao|deram provimento ao)\s+(?:o\s+)?agravo\b", sentence):
+                continue
+            if re.search(r"\b(?:negar|negou)\s+provimento\s+ao\s+recurso\b", sentence):
+                return True
+            if re.search(r"\brecurso\b[^;,.]{0,80}\bdesprovido\b", sentence):
+                return True
+    return False
 
 
 def _classe_processo_specificity(value: str, row: "PublishPreviewRow") -> int:
@@ -9063,6 +9087,8 @@ def validate_preview_row(
     if row_indicates_suspension_by_vista(row):
         row.resultado = "Suspenso por vista"
         row.votacao = "Suspenso"
+    if row.resultado in {"Provido", "Provido em parte"} and infer_recurso_desprovido_apos_agravo_provido(row):
+        row.resultado = "Desprovido"
     row.youtube_link = normalize_youtube_link(row.youtube_link)
     row.partes = normalize_party_list(row.partes)
     row.advogados = normalize_advogado_list(row.advogados)

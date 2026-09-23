@@ -2248,6 +2248,32 @@ def test_validate_preview_row_keeps_final_result_when_view_was_historical_but_vo
     assert validated.resultado == "Desprovido"
 
 
+def test_agravo_provido_label_follows_special_appeal_rejected_by_court():
+    row = PublishPreviewRow(
+        tema="Impulsionamento de propaganda eleitoral negativa",
+        numero_processo="0600491-95.2024.6.20.0051",
+        classe_processo="AgRg-REspe",
+        resultado="Provido",
+        votacao="Por maioria",
+        data_sessao="2026-09-22",
+        analise_do_conteudo_juridico=(
+            "O Tribunal proveu o agravo interno e negou provimento ao recurso especial eleitoral."
+        ),
+    )
+    assert validate_preview_row(row, make_schema()).resultado == "Desprovido"
+
+
+def test_agravo_result_does_not_follow_underlying_appeal_from_dissent_vote():
+    row = PublishPreviewRow(
+        tema="Caso eleitoral", classe_processo="AgRg-REspe", resultado="Provido",
+        analise_do_conteudo_juridico=(
+            "O relator havia votado para negar provimento ao recurso especial. "
+            "O Tribunal deu provimento ao agravo interno."
+        ),
+    )
+    assert validate_preview_row(row, None).resultado == "Provido"
+
+
 def test_infer_resultado_from_row_text_maps_consulta_respondida_to_aprovada():
     row = PublishPreviewRow(
         tema="Utilização de Fundo Partidário para defesa de filiados",

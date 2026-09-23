@@ -223,8 +223,17 @@ def _official_decision(process: dict[str, Any]) -> tuple[str, str]:
         voting = "unanime"
     elif "por maioria" in text:
         voting = "por maioria"
-    # A process may have distinct interlocutory and merits outcomes, or an agravo
-    # may be granted while its special appeal is rejected. Do not flatten either.
+    # When the court grants the agravo precisely to reject the special appeal,
+    # the outcome label follows the appeal. Keep other compound dispositions
+    # unresolved: partial knowledge or several merits outcomes need review.
+    if (
+        "agravo" in text and "recurso especial" in text
+        and re.search(r"\b(?:deu provimento ao agravo|proveu o agravo)\b", text)
+        and re.search(r"\b(?:para|e)\s+(?:negar|negou)\s+provimento\s+ao\s+recurso especial\b", text)
+        and not re.search(r"\b(?:parcialmente|em parte|parte conhecida)\b", text)
+    ):
+        return "desprovido", voting
+    # A process may have distinct interlocutory and merits outcomes.
     if ("agravo" in text and "recurso especial" in text) or "no merito" in text or "parcialmente" in text or "em parte" in text:
         return "", voting
     if re.search(r"\b(?:acolheu|rejeitou).+\b(?:indeferiu|deferiu|negou|deu provimento)\b", text):

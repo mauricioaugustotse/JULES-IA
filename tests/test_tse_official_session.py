@@ -222,6 +222,24 @@ def test_compound_agravo_and_appeal_not_flattened_but_voting_checked():
     assert [x["field"] for x in result] == ["votacao"]
 
 
+def test_granted_agravo_followed_by_rejected_special_appeal_checks_appeal_outcome():
+    p = process(
+        siglaClasseJudicial="AgR no(a) REspEl",
+        classeJudicial="AGRAVO REGIMENTAL no(a) REspEl",
+        proclamacaoDecisao=(
+            "O Tribunal, por maioria, deu provimento ao agravo interno, para negar "
+            "provimento ao recurso especial eleitoral, a fim de manter os acórdãos regionais."
+        ),
+    )
+    expected = row(classe_processo="AgRg-REspe", resultado="Desprovido")
+    assert compare_official_rows(inventory([p]), [expected]) == []
+    wrong = row(classe_processo="AgRg-REspe", resultado="Provido")
+    issues = compare_official_rows(inventory([p]), [wrong])
+    assert [(x["field"], x["expected"], x["actual"]) for x in issues] == [
+        ("resultado", "desprovido", "Provido")
+    ]
+
+
 def test_procedural_and_merit_compound_is_not_inferred_from_first_verb():
     p = process(proclamacaoDecisao="O Tribunal, por maioria, acolheu o pedido de desabilitação e, no mérito, indeferiu o pedido de revisão.")
     assert compare_official_rows(inventory([p]), [row(resultado="Procedente")]) == []
