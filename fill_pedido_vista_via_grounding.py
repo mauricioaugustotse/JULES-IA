@@ -26,8 +26,9 @@ from local_secrets import get_secret
 from tse_normalization import (is_plausible_ministro_name, normalize_ministro_name,
                                normalize_pedido_vista_value, parse_multi_value_text)
 from tse_youtube_notion_core import (DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
-                                     DEFAULT_NOTION_DATA_SOURCE_ID, NotionSessoesClient,
-                                     _build_gemini_rest_part, call_gemini_generate_content_rest)
+                                     DEFAULT_NOTION_DATA_SOURCE_ID, OPENAI_TEXT_MODEL,
+                                     NotionSessoesClient, call_openai_structured,
+                                     get_openai_api_key)
 
 LOGGER = logging.getLogger("fill_pedido_vista_via_grounding")
 ARTIFACT_ROOT = Path("artifacts") / "notion_pedido_vista_grounding"
@@ -102,12 +103,11 @@ def ground_pedido_vista(key: str, model: str, contexto: str, retries: int = 3) -
         text = _grounded_text(key, model, prompt)
         if (text or "").strip():
             last_text = text
-            parsed, _, _ = call_gemini_generate_content_rest(
-                api_key=key, model_name=model,
-                contents=[{"parts": [_build_gemini_rest_part(text=EXTRACT + text)]}],
+            # 2a passada e so texto: OpenAI (regra de 27/09/2026 — o Gemini fica com a busca).
+            parsed, _ = call_openai_structured(
+                api_key=get_openai_api_key(), model=OPENAI_TEXT_MODEL,
                 system_instruction="Voce converte um texto factual ja pesquisado em JSON, sem inventar.",
-                response_model=PedidoVistaResult, temperature=0.0, use_google_search=False,
-                timeout_seconds=DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS)
+                prompt=EXTRACT + text, response_model=PedidoVistaResult)
             if (parsed.ministro_pediu_vista or "").strip():
                 return parsed, text
         if attempt < retries - 1:

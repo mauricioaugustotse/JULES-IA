@@ -18,17 +18,11 @@ from audit_notion_sessoes_round2 import notion_request_with_retry
 from local_secrets import get_secret
 from tse_normalization import normalize_class_text
 from tse_youtube_notion_core import (
-    DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
-    DEFAULT_GEMINI_MODEL,
     DEFAULT_NOTION_DATA_SOURCE_ID,
-    GEMINI_CALL_RETRIES,
-    GEMINI_RETRY_BASE_DELAY,
+    OPENAI_TEXT_MODEL,
     NotionSessoesClient,
     PublishPreviewRow,
-    _build_gemini_rest_part,
-    call_gemini_generate_content_rest,
-    extract_retry_delay_seconds,
-    should_disable_model,
+    call_openai_structured,
 )
 from tse_backfill_2025_notion import notion_page_to_row
 
@@ -257,44 +251,34 @@ def call_rewrite_batch(
     if cached is not None:
         return cached
     prompt = build_batch_prompt(records)
-    last_error: Exception | None = None
-    for attempt in range(1, GEMINI_CALL_RETRIES + 1):
-        try:
-            parsed, response_text, response_payload = call_gemini_generate_content_rest(
-                api_key=api_key,
-                model_name=model,
-                contents=[{"parts": [_build_gemini_rest_part(text=prompt)]}],
-                system_instruction=SYSTEM_PROMPT,
-                response_model=RewriteBatchResult,
-                temperature=0.25,
-                timeout_seconds=DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
-            )
-            result = RewriteBatchResult.model_validate(parsed)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
-                json.dumps(
-                    {
-                        "keys": [record.key for record in records],
-                        "prompt": prompt,
-                        "response_text": response_text,
-                        "parsed": result.model_dump(),
-                        "raw_candidate_count": len(response_payload.get("candidates") or []),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            return result
-        except Exception as exc:
-            last_error = exc
-            LOGGER.warning("Falha no lote %s-%s tentativa %s/%s: %s", records[0].key, records[-1].key, attempt, GEMINI_CALL_RETRIES, exc)
-            if should_disable_model(exc):
-                break
-            if attempt < GEMINI_CALL_RETRIES:
-                retry_delay = extract_retry_delay_seconds(exc)
-                time.sleep(max(GEMINI_RETRY_BASE_DELAY**attempt, retry_delay))
-    raise RuntimeError(f"Falha definitiva no lote {records[0].key}-{records[-1].key}: {last_error}") from last_error
+    # Só texto: OpenAI (regra do usuário, 27/09/2026). O SDK refaz 429/5xx/timeout.
+    try:
+        parsed, response_text = call_openai_structured(
+            api_key=api_key,
+            model=model,
+            system_instruction=SYSTEM_PROMPT,
+            prompt=prompt,
+            response_model=RewriteBatchResult,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Falha definitiva no lote {records[0].key}-{records[-1].key}: {exc}") from exc
+    result = RewriteBatchResult.model_validate(parsed)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "keys": [record.key for record in records],
+                "model": model,
+                "prompt": prompt,
+                "response_text": response_text,
+                "parsed": result.model_dump(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return result
 
 
 def clean_sentence(value: str) -> str:
@@ -567,7 +551,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     parser.add_argument("--artifact-dir", default="")
-    parser.add_argument("--model", default=DEFAULT_GEMINI_MODEL)
+    parser.add_argument("--model", default=OPENAI_TEXT_MODEL)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--max-records", type=int, default=0)
@@ -582,17 +566,17 @@ def main() -> int:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(levelname)s %(message)s")
     notion_key = get_secret("NOTION_API_KEY", "NOTION_TOKEN")
-    gemini_key = get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    openai_key = get_secret("OPENAI_API_KEY")
     if not notion_key:
         raise RuntimeError("NOTION_API_KEY/NOTION_TOKEN nao encontrado.")
-    if not gemini_key:
-        raise RuntimeError("GEMINI_API_KEY/GOOGLE_API_KEY nao encontrado.")
+    if not openai_key:
+        raise RuntimeError("OPENAI_API_KEY nao encontrado.")
     artifact_dir = Path(args.artifact_dir) if args.artifact_dir else ARTIFACT_ROOT / datetime.now().strftime("%Y%m%d_%H%M")
     client = NotionSessoesClient(api_key=notion_key, data_source_id=args.data_source_id)
     records = load_records(client, start_index=args.start_index, max_records=args.max_records, page_ids=args.page_ids)
     LOGGER.info("Registros carregados: %s", len(records))
     changes, validation_issues = generate_changes(
-        api_key=gemini_key,
+        api_key=openai_key,
         model=args.model,
         records=records,
         artifact_dir=artifact_dir,

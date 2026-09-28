@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -457,6 +458,7 @@ RECOMPUTED_WARNING_PATTERNS = (
     re.compile(r"^Número corrigido para os autos originais da instrução", re.IGNORECASE),
     re.compile(r"^Dígito verificador do CNJ reprova", re.IGNORECASE),
     re.compile(r"^Número do processo consta dos precedentes citados", re.IGNORECASE),
+    re.compile(r"^(?:analise_do_conteudo_juridico|raciocinio_juridico) reproduz o acórdão", re.IGNORECASE),
 )
 
 NOTION_PROPERTY_MAP = {
@@ -673,7 +675,7 @@ REGRAS PARA `tema`:
 - Não use tema amplo demais, só classe processual, "Processo", "Julgamento" ou frase de decisão.
 
 REGRAS PARA `punchline`:
-- Use uma frase completa, preferencialmente entre 28 e 55 palavras.
+- Use uma frase completa, preferencialmente entre 28 e 55 palavras, sem ponto e vírgula (encadeie com vírgula ou "e").
 - Deve complementar o `tema`, não copiá-lo nem apenas trocar sinônimos.
 - Inclua, quando constar do contexto, o cenário fático, a tese debatida, o problema processual e o resultado prático.
 - Evite fórmulas pobres como "recurso provido", "julgamento sobre...", "o relator entendeu..." ou repetição da fundamentação.
@@ -682,6 +684,29 @@ REGRAS PARA `punchline`:
 RETORNO:
 - Devolva exatamente um item para cada `key` recebido.
 - Se o contexto for insuficiente para escrever com segurança, mantenha o melhor texto possível a partir dos campos existentes e marque `source_insufficient=true`.
+"""
+
+TEOR_ANALISE_SYSTEM_PROMPT = """
+Você é um juiz eleitoral encarregado de redigir, a partir do INTEIRO TEOR OFICIAL de acórdãos do TSE (ementa e decisão publicadas), dois campos analíticos de uma base de julgamentos.
+
+FONTE:
+- Use exclusivamente a ementa, a decisão e os metadados de cada item. Não use fonte externa e não invente fatos, nomes, datas, valores, municípios ou dispositivos ausentes do material.
+- O que o material não disser, não afirme.
+
+CAMPOS:
+- `analise_do_conteudo_juridico`: narrativa FACTUAL do caso concreto e do percurso processual imediato. Diga o que aconteceu: quem pede o quê, a conduta atribuída ou o pedido formulado, o contexto fático-eleitoral (eleição, cargo, município/UF quando constarem), a decisão recorrida ou o ato submetido ao Tribunal, a sanção ou consequência em jogo e as teses efetivamente enfrentadas; feche com o desfecho proclamado. Não faça síntese abstrata da matéria.
+- `raciocinio_juridico`: reconstrua o encadeamento lógico da decisão — premissas fáticas ou processuais tomadas como dadas, norma, súmula ou precedente aplicado (com o número quando constar), argumento acolhido ou rejeitado e por que isso levou ao resultado. Não se limite a dizer que o recurso foi provido ou desprovido.
+
+REDAÇÃO:
+- Escreva com as SUAS palavras, em prosa corrida: `analise_do_conteudo_juridico` com 600 a 1.300 caracteres; `raciocinio_juridico` com 500 a 1.200.
+- É PROIBIDO copiar a ementa ou a decisão. Não reproduza a verbetação em CAIXA ALTA ("ELEIÇÕES 2024. AGRAVO INTERNO. ..."), não use os rótulos estruturais do acórdão ("I. CASO EM EXAME", "QUESTÃO EM DISCUSSÃO", "RAZÕES DE DECIDIR", "DISPOSITIVO", "Tese de julgamento"), não transcreva a fórmula "ACORDAM os ministros..." nem a lista "Acompanharam o Relator..."/"Composição:". Citação literal só de expressão curta e essencial (até 10 palavras), entre aspas.
+- Não comece pela classe processual nem pelo número do processo.
+- Escreva sobre o CASO, não sobre a fonte: não mencione a ementa, "o material", "o texto fornecido", "o trecho" nem lacunas da fonte ("não consta", "a ementa não informa"). O que não constar, apenas omita — e, se faltar algo essencial, marque `source_insufficient=true`.
+- Resultado e votação dos metadados são os proclamados: não os contradiga. Se o julgamento ficou suspenso por pedido de vista, diga qual debate ficou pendente, sem descrevê-lo como decidido.
+
+RETORNO:
+- JSON {"items": [{"key", "analise_do_conteudo_juridico", "raciocinio_juridico", "source_insufficient"}]}, com exatamente um item para cada `key` recebido.
+- Se o material for insuficiente para um campo (ex.: só há a decisão, sem ementa), escreva apenas o que for seguro e marque `source_insufficient=true`.
 """
 
 START_REFINEMENT_SYSTEM_PROMPT = """
@@ -725,6 +750,41 @@ def get_notion_api_key() -> str:
 def get_openai_api_key() -> str:
     load_runtime_secrets()
     return get_secret("OPENAI_API_KEY", base_dir=SCRIPT_DIR)
+
+
+# Regra do usuário (27/09/2026): o Gemini só lê/assiste o vídeo (e sua transcrição) e faz a
+# pesquisa web (grounding); TODA outra chamada de IA — só texto — vai para a OpenAI. Saída
+# estruturada estrita: o schema Pydantic vira o contrato, sem chave adivinhada.
+OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL") or "gpt-6-luna"
+OPENAI_TEXT_EFFORT = os.getenv("OPENAI_TEXT_EFFORT") or "medium"
+OPENAI_HTTP_TIMEOUT_SECONDS = int(os.getenv("OPENAI_HTTP_TIMEOUT_SECONDS") or "300")
+
+
+def call_openai_structured(
+    *,
+    api_key: str,
+    model: str,
+    system_instruction: str,
+    prompt: str,
+    response_model: type[BaseModel],
+    effort: str = OPENAI_TEXT_EFFORT,
+    timeout_seconds: int = OPENAI_HTTP_TIMEOUT_SECONDS,
+) -> tuple[BaseModel, str]:
+    """Responses API com `text_format`; resposta incompleta ou sem objeto vira erro explícito."""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=2)
+    response = client.responses.parse(
+        model=model,
+        instructions=system_instruction,
+        input=prompt,
+        text_format=response_model,
+        reasoning={"effort": effort},
+    )
+    if response.status != "completed" or response.output_parsed is None:
+        detalhe = getattr(response.incomplete_details, "reason", "") if response.incomplete_details else ""
+        raise RuntimeError(f"OpenAI {model} sem saída estruturada (status={response.status} {detalhe})".strip())
+    return response.output_parsed, response.output_text
 
 
 def chunk_rich_text(value: str, chunk_size: int = 1900) -> list[dict[str, Any]]:
@@ -882,7 +942,13 @@ def _looks_like_meta_or_citation_punchline(normalized: str, raw_text: str = "") 
     if re.search(r"\bacompanharam\s+o\s+voto\b", normalized):
         return True
     text = normalize_model_text(raw_text)
-    if text.count(";") >= 1 and not re.search(r"\b(?:discute|examina|reconhece|afasta|define|permite|veda|mant[eé]m|cassa)\b", normalized):
+    # ";" sem verbo de decisão = lista de citações. Formas no passado entram desde 27/09/2026:
+    # o gpt-6-luna narra no pretérito ("afastou", "manteve") e punchlines boas caíam no fallback.
+    if text.count(";") >= 1 and not re.search(
+        r"\b(?:discut\w*|examin\w*|reconhec\w*|afast\w*|defin\w*|permit\w*|ved\w*|mant[eé]m|manteve|mantid\w*"
+        r"|cass\w*|aprov\w*|neg\w*|conden\w*|deferi\w*|indeferi\w*|devolv\w*|determin\w*)\b",
+        normalized,
+    ):
         return True
     return False
 
@@ -1255,47 +1321,34 @@ def build_theme_repair_context(row: "PublishPreviewRow", artifact_text: str = ""
 
 def repair_theme_from_text_context(
     *,
-    api_key: str,
-    model: str,
     row: "PublishPreviewRow",
     context_text: str,
+    api_key: str = "",
+    model: str = OPENAI_TEXT_MODEL,
     artifact_store: Optional["RunArtifacts"] = None,
     logger: Optional[logging.Logger] = None,
     artifact_name: str = "08_theme_repair.txt",
 ) -> ThemeRepairResult:
+    """Tema a partir de texto já extraído — chamada só de texto: OpenAI (OPENAI_TEXT_MODEL).
+
+    O SDK refaz 429/5xx/timeout; o erro definitivo sobe para o chamador (como antes)."""
     if not context_text.strip():
         return ThemeRepairResult()
-    last_error: Optional[Exception] = None
-    logger = logger or logging.getLogger(__name__)
-    for attempt in range(1, GEMINI_CALL_RETRIES + 1):
-        try:
-            parsed, response_text, _ = call_gemini_generate_content_rest(
-                api_key=api_key,
-                model_name=model or DEFAULT_GEMINI_MODEL,
-                contents=[{"parts": [_build_gemini_rest_part(text=context_text)]}],
-                system_instruction=THEME_REPAIR_SYSTEM_PROMPT,
-                response_model=ThemeRepairResult,
-                temperature=0.1,
-                timeout_seconds=DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
-            )
-            if artifact_store is not None:
-                artifact_store.write_text(artifact_name, response_text)
-            parsed.tema = build_fallback_tema(row.model_copy(update={"tema": parsed.tema}))
-            return parsed
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "Falha no reparo textual de tema (tentativa %s/%s): %s",
-                attempt,
-                GEMINI_CALL_RETRIES,
-                exc,
-            )
-            if should_disable_model(exc):
-                break
-            if attempt < GEMINI_CALL_RETRIES:
-                retry_delay = extract_retry_delay_seconds(exc)
-                time.sleep(max(GEMINI_RETRY_BASE_DELAY ** attempt, retry_delay))
-    raise RuntimeError(f"Falha definitiva no reparo textual de tema: {last_error}") from last_error
+    try:
+        parsed, response_text = call_openai_structured(
+            api_key=api_key or get_openai_api_key(),
+            model=model or OPENAI_TEXT_MODEL,
+            system_instruction=THEME_REPAIR_SYSTEM_PROMPT,
+            prompt=context_text,
+            response_model=ThemeRepairResult,
+        )
+    except Exception as exc:
+        (logger or logging.getLogger(__name__)).warning("Falha no reparo textual de tema: %s", exc)
+        raise RuntimeError(f"Falha definitiva no reparo textual de tema: {exc}") from exc
+    if artifact_store is not None:
+        artifact_store.write_text(artifact_name, response_text)
+    parsed.tema = build_fallback_tema(row.model_copy(update={"tema": parsed.tema}))
+    return parsed
 
 
 def coerce_seconds(value: Any) -> int:
@@ -4411,6 +4464,17 @@ class ThemePunchlineRepairBatchResult(BaseModel):
     items: list[ThemePunchlineRepairItem] = Field(default_factory=list)
 
 
+class TeorAnaliseItem(BaseModel):
+    key: str = ""
+    analise_do_conteudo_juridico: str = ""
+    raciocinio_juridico: str = ""
+    source_insufficient: bool = False
+
+
+class TeorAnaliseBatchResult(BaseModel):
+    items: list[TeorAnaliseItem] = Field(default_factory=list)
+
+
 class StartRefinementResult(BaseModel):
     exact_start_seconds: int | None = None
     confidence: str = ""
@@ -7450,19 +7514,26 @@ class GeminiNewsEnricher:
         return dedupe_preserve_order(urls)
 
 
-class GeminiThemePunchlineEnricher:
+TEMA_FALLBACK_WARNING = "Tema montado pelo fallback local (proposta do modelo ausente ou inválida)."
+PUNCHLINE_FALLBACK_WARNING = "Punchline montada pelo fallback local (proposta do modelo ausente, curta ou repetitiva)."
+
+
+class ThemePunchlineEnricher:
+    """Revisão editorial de tema/punchline — chamada só de texto: OpenAI (OPENAI_TEXT_MODEL)."""
+
     def __init__(
         self,
-        api_key: str,
-        model: str = DEFAULT_GEMINI_MODEL,
+        api_key: str = "",
+        model: str = OPENAI_TEXT_MODEL,
         artifact_store: Optional[RunArtifacts] = None,
         logger: Optional[logging.Logger] = None,
         batch_size: int = 10,
     ) -> None:
+        api_key = api_key or get_openai_api_key()
         if not api_key:
-            raise ValueError("GEMINI_API_KEY/GOOGLE_API_KEY não encontrado.")
+            raise ValueError("OPENAI_API_KEY não encontrado.")
         self.api_key = api_key
-        self.model = model or DEFAULT_GEMINI_MODEL
+        self.model = model or OPENAI_TEXT_MODEL
         self.artifact_store = artifact_store or RunArtifacts.for_youtube_url("unknown")
         self.logger = logger or logging.getLogger(__name__)
         self.batch_size = max(1, int(batch_size or 10))
@@ -7476,18 +7547,26 @@ class GeminiThemePunchlineEnricher:
                 for offset, row in enumerate(batch)
             ]
             cache_filename = f"04b_theme_punchline_{batch_number:02d}.json"
+            identidade = {
+                "model": self.model,
+                "prompt_sha1": hashlib.sha1(THEME_PUNCHLINE_REPAIR_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+                "payload": payload,
+            }
+            parsed: Optional[ThemePunchlineRepairBatchResult] = None
             if self.artifact_store.exists(cache_filename):
-                cached_payload = self.artifact_store.read_json(cache_filename)
-                applied = cached_payload.get("applied")
-                if cached_payload.get("payload") == payload and applied:
-                    enriched_rows.extend(PublishPreviewRow.model_validate(item) for item in applied)
-                    continue
+                cached = self.artifact_store.read_json(cache_filename)
+                # Só resposta bem-sucedida do MESMO modelo e prompt — fallback de falha transitória
+                # (gravado com "error") não vira resultado permanente — e as regras de limpeza
+                # atuais são reaplicadas sobre ela, em vez de confiar no "applied" antigo.
+                if cached.get("parsed") and all(cached.get(k) == v for k, v in identidade.items()):
+                    parsed = ThemePunchlineRepairBatchResult.model_validate(cached["parsed"])
 
             try:
-                parsed = self._call_batch(
-                    payload=payload,
-                    artifact_name=f"04b_theme_punchline_{batch_number:02d}.txt",
-                )
+                if parsed is None:
+                    parsed = self._call_batch(
+                        payload=payload,
+                        artifact_name=f"04b_theme_punchline_{batch_number:02d}.txt",
+                    )
                 items_by_key = {normalize_model_text(item.key): item for item in parsed.items}
                 applied_rows = [
                     self._apply_repair_item(row, items_by_key.get(normalize_model_text(item_payload["key"])))
@@ -7496,7 +7575,7 @@ class GeminiThemePunchlineEnricher:
                 self.artifact_store.write_json(
                     cache_filename,
                     {
-                        "payload": payload,
+                        **identidade,
                         "parsed": parsed.model_dump(mode="json"),
                         "applied": [row.model_dump(mode="json") for row in applied_rows],
                     },
@@ -7510,7 +7589,7 @@ class GeminiThemePunchlineEnricher:
                 self.artifact_store.write_json(
                     cache_filename,
                     {
-                        "payload": payload,
+                        **identidade,
                         "error": str(exc),
                         "applied": [row.model_dump(mode="json") for row in applied_rows],
                     },
@@ -7529,34 +7608,16 @@ class GeminiThemePunchlineEnricher:
             "Preserve a fidelidade ao contexto fornecido e retorne JSON no schema solicitado.\n\n"
             f"ITENS:\n{json.dumps({'items': payload}, ensure_ascii=False, indent=2)}"
         )
-        last_error: Optional[Exception] = None
-        for attempt in range(1, GEMINI_CALL_RETRIES + 1):
-            try:
-                parsed, response_text, _ = call_gemini_generate_content_rest(
-                    api_key=self.api_key,
-                    model_name=self.model,
-                    contents=[{"parts": [_build_gemini_rest_part(text=prompt)]}],
-                    system_instruction=THEME_PUNCHLINE_REPAIR_SYSTEM_PROMPT,
-                    response_model=ThemePunchlineRepairBatchResult,
-                    temperature=0.2,
-                    timeout_seconds=DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
-                )
-                self.artifact_store.write_text(artifact_name, response_text)
-                return parsed
-            except Exception as exc:
-                last_error = exc
-                self.logger.warning(
-                    "Falha no reparo Gemini de tema/punchline (tentativa %s/%s): %s",
-                    attempt,
-                    GEMINI_CALL_RETRIES,
-                    exc,
-                )
-                if should_disable_model(exc):
-                    break
-                if attempt < GEMINI_CALL_RETRIES:
-                    retry_delay = extract_retry_delay_seconds(exc)
-                    time.sleep(max(GEMINI_RETRY_BASE_DELAY ** attempt, retry_delay))
-        raise RuntimeError(f"Falha definitiva no reparo Gemini de tema/punchline: {last_error}") from last_error
+        # O SDK refaz 429/5xx/timeout; o erro definitivo sobe para o fallback local de enrich_rows.
+        parsed, response_text = call_openai_structured(
+            api_key=self.api_key,
+            model=self.model,
+            system_instruction=THEME_PUNCHLINE_REPAIR_SYSTEM_PROMPT,
+            prompt=prompt,
+            response_model=ThemePunchlineRepairBatchResult,
+        )
+        self.artifact_store.write_text(artifact_name, response_text)
+        return parsed
 
     def _apply_repair_item(
         self,
@@ -7569,6 +7630,7 @@ class GeminiThemePunchlineEnricher:
         proposed_theme = clean_theme_punchline_theme(item.tema if item else "", candidate)
         if not proposed_theme:
             proposed_theme = build_fallback_tema(candidate)
+            candidate.add_warning(TEMA_FALLBACK_WARNING)
         if proposed_theme:
             candidate.tema = proposed_theme
 
@@ -7579,16 +7641,297 @@ class GeminiThemePunchlineEnricher:
             or theme_punchline_pair_too_similar(candidate.tema, proposed_punchline)
         ):
             proposed_punchline = build_editorial_punchline_fallback(candidate, candidate.tema)
+            # Rastro para quem precisa distinguir texto do modelo de texto remontado localmente
+            # (a punchline do fallback é uma frase da própria análise/raciocínio).
+            candidate.add_warning(PUNCHLINE_FALLBACK_WARNING)
         if proposed_punchline:
             candidate.punchline = proposed_punchline
 
         if item and item.source_insufficient:
             candidate.add_warning("Reparo de tema/punchline marcou fonte insuficiente; texto preserva apenas inferências locais.")
         if error:
-            candidate.add_warning("Reparo Gemini de tema/punchline falhou; aplicado fallback local.")
+            candidate.add_warning("Reparo de tema/punchline pelo modelo falhou; aplicado fallback local.")
         if theme_punchline_pair_needs_rewrite(candidate):
             candidate.add_warning("Tema/punchline ainda requerem revisão editorial manual.")
         return candidate
+
+
+# --- Campos analíticos x inteiro teor ------------------------------------------------
+# 27/09/2026: o import_dje_faltantes gravava a EMENTA crua em analise_do_conteudo_juridico
+# (ementa[:1900]) e o DISPOSITIVO cru em raciocinio_juridico. A LT 0600317-32 (TRE/TO,
+# sessão de 09/06/2026) tinha como "análise" só o começo do acórdão: verbetação em caixa
+# alta, "I. CASO EM EXAME1. Lista tríplice...". Os dois campos são ANALÍTICOS (ver
+# DETAIL_SYSTEM_PROMPT): narrativa factual e encadeamento fatos → norma → conclusão.
+# Quando a fonte é o acórdão, o texto é redigido pelo modelo e a guarda abaixo recusa
+# cópia — no import e em qualquer revalidação.
+TEOR_COPIA_NGRAM = 6
+# Fração dos 6-gramas do campo que aparecem literalmente no teor. Dois usos, dois rigores:
+# - PROPOSTA do modelo (guarda de saída): 0,5 — recusar custa só uma nova tentativa.
+# - Texto EXISTENTE na base (decidir se é cópia a reescrever): 0,8 e, abaixo de 20 6-gramas,
+#   0,95. Prosa curta e legítima do vídeo que cita nome completo + cargo + coligação passa de
+#   0,5 (Boulos, 0600808-20: 26 palavras, 0,571); as cópias do import ficam em ~0,82-1,0.
+TEOR_COPIA_LIMIAR = 0.5
+TEOR_COPIA_LIMIAR_EXISTENTE = 0.8
+TEOR_COPIA_LIMIAR_CURTO = 0.95
+TEOR_COPIA_MIN_NGRAMAS = 20
+# Frase da proposta com 15+ palavras inteira no teor: transcrição, mesmo que o resto seja prosa
+# própria — é essa 1ª frase que o fallback da punchline reaproveita.
+TEOR_FRASE_LITERAL_MIN_PALAVRAS = 15
+TEOR_ANALISE_CAMPOS = ("analise_do_conteudo_juridico", "raciocinio_juridico")
+TEOR_ANALISE_MIN_CHARS = {"analise_do_conteudo_juridico": 250, "raciocinio_juridico": 200}
+_EMENTA_ROTULOS_RE = re.compile(
+    r"\b(?:I{1,3}|IV)\s*[.\-–—]\s*(?:CASO EM EXAME|QUEST(?:[ÃA]O|[ÕO]ES) EM DISCUSS[ÃA]O"
+    r"|RAZ[ÕO]ES DE DECIDIR|DISPOSITIVO)\b"
+    r"|\bTese de julgamento\s*:"
+)
+# Fórmulas que só existem no acórdão: abertura "ACORDAM..." e a lista de composição do fecho.
+_ACORDAO_FORMULA_RE = re.compile(r"^\s*ACORDAM\b|\bComposi[çc][ãa]o:\s*Ministr")
+# Texto redigido que fala da FONTE em vez do caso ("a ementa fornecida não contém...", "não consta
+# do material") — artefato da redação, não conteúdo da base (piloto de 27/09/2026).
+_META_FONTE_RE = re.compile(
+    # "material" sozinho não serve: "retirada do material" (de campanha) é fato do caso (0600808-24).
+    r"(?i)\bementa\b|\bn[ãa]o consta(?:m)? (?:d|n)o material\b"
+    r"|\bmaterial (?:fornecido|publicado|dispon[ií]vel|apresentado|analisado|examinado)"
+    r"|\btexto (?:fornecido|dispon[ií]vel)|\btrecho (?:fornecido|dispon[ií]vel|da decis)"
+)
+
+
+def texto_abre_com_verbetacao(texto: str) -> bool:
+    """Abre com a verbetação da ementa: rubricas em CAIXA ALTA separadas por ponto
+    ("ELEIÇÕES 2020. AGRAVO INTERNO. RECURSO ESPECIAL. ...")."""
+    cabeca = re.match(r"[^a-zß-ÿ]*", normalize_model_text(texto)).group(0)
+    return sum(ch.isalpha() for ch in cabeca) >= 25 and cabeca.count(".") >= 2
+
+
+def parece_copia_do_acordao(texto: str) -> bool:
+    """Forma de trecho do acórdão, mesmo sem o teor à mão para comparar."""
+    valor = normalize_model_text(texto)
+    return bool(valor) and (
+        texto_abre_com_verbetacao(valor)
+        or bool(_EMENTA_ROTULOS_RE.search(valor))
+        or bool(_ACORDAO_FORMULA_RE.search(valor))
+    )
+
+
+def fracao_copiada_do_teor(texto: str, teor: str, n: int = TEOR_COPIA_NGRAM) -> float:
+    """Fração dos n-gramas de palavras de `texto` presentes literalmente em `teor`."""
+    palavras = fold_text_for_match(texto).split()
+    fonte = fold_text_for_match(teor).split()
+    if len(palavras) < n or len(fonte) < n:
+        return 0.0
+    gramas_fonte = {tuple(fonte[i:i + n]) for i in range(len(fonte) - n + 1)}
+    gramas = [tuple(palavras[i:i + n]) for i in range(len(palavras) - n + 1)]
+    return sum(grama in gramas_fonte for grama in gramas) / len(gramas)
+
+
+def frase_literal_do_teor(texto: str, teor: str) -> bool:
+    """Alguma frase de 15+ palavras de `texto` está inteira, literalmente, no teor."""
+    for frase in re.split(r"(?<=[.;!?])\s+(?=[A-ZÁÂÃÉÊÍÓÔÕÚÇ\"“])", normalize_model_text(texto)):
+        if len(fold_text_for_match(frase).split()) >= TEOR_FRASE_LITERAL_MIN_PALAVRAS \
+                and fracao_copiada_do_teor(frase, teor) == 1.0:
+            return True
+    return False
+
+
+def campo_analitico_copia_teor(texto: str, teor: str = "", *, proposta: bool = False) -> bool:
+    """Campo analítico que só repete o acórdão em vez de analisá-lo.
+
+    `proposta=True` é a guarda de saída sobre texto recém-redigido (mais rigorosa); o padrão
+    classifica texto que já está na base, sem derrubar prosa curta legítima do vídeo."""
+    if not normalize_model_text(texto):
+        return False
+    if parece_copia_do_acordao(texto):
+        return True
+    if not normalize_model_text(teor):
+        return False
+    fracao = fracao_copiada_do_teor(texto, teor)
+    if proposta:
+        return fracao >= TEOR_COPIA_LIMIAR or frase_literal_do_teor(texto, teor)
+    ngramas = len(fold_text_for_match(texto).split()) - TEOR_COPIA_NGRAM + 1
+    if ngramas <= 0:
+        return False
+    limiar = TEOR_COPIA_LIMIAR_EXISTENTE if ngramas >= TEOR_COPIA_MIN_NGRAMAS else TEOR_COPIA_LIMIAR_CURTO
+    return fracao >= limiar
+
+
+# Sufixo que build_editorial_punchline_fallback cola na 1ª frase da análise; com a ementa no
+# lugar da análise, a punchline virava "<verbetação da ementa>. O desfecho registrado foi X."
+_FALLBACK_DESFECHO_RE = re.compile(r"\bO desfecho registrado foi [^.]*\.?\s*$")
+
+
+def punchline_copia_teor(punchline: str, teor: str, analise_copiada: bool, *, proposta: bool = False) -> bool:
+    """Punchline que repete o acórdão, direto ou pelo fallback montado sobre a análise-cópia."""
+    if campo_analitico_copia_teor(punchline, teor, proposta=proposta):
+        return True
+    return analise_copiada and bool(_FALLBACK_DESFECHO_RE.search(normalize_model_text(punchline)))
+
+
+def tema_quebrado(tema: str) -> bool:
+    """Tema que recebeu o fallback da punchline ou a verbetação da ementa (caixa alta)."""
+    valor = normalize_model_text(tema)
+    letras = [ch for ch in valor if ch.isalpha()]
+    caixa_alta = len(letras) >= 20 and sum(ch.isupper() for ch in letras) / len(letras) > 0.6
+    return bool(_FALLBACK_DESFECHO_RE.search(valor)) or caixa_alta
+
+
+def build_teor_analise_payload(row: PublishPreviewRow, ementa: str, decisao: str, key: str) -> dict[str, Any]:
+    return {
+        "key": key,
+        "numero_processo": row.numero_processo,
+        "classe_processo": row.classe_processo,
+        "data_sessao": row.data_sessao,
+        "tribunal": row.tribunal,
+        "origem": row.origem,
+        "eleicao": row.eleicao,
+        "partes": ", ".join(row.partes),
+        "relator": row.relator,
+        "pedido_vista": row.pedido_vista,
+        "resultado": row.resultado,
+        "votacao": row.votacao,
+        "tema": row.tema,
+        # Ementas de casos grandes passam de 7 mil caracteres (Deltan, RO 0601407-70: o corte
+        # amputava a alínea g). Os limites só protegem contra teor anômalo.
+        "ementa": _compact_theme_punchline_context(ementa, 18000),
+        "decisao": _compact_theme_punchline_context(decisao, 6000),
+    }
+
+
+class TeorAnaliseEnricher:
+    """Redige analise_do_conteudo_juridico/raciocinio_juridico a partir do inteiro teor.
+
+    Só toca campo VAZIO ou que seja cópia do teor — texto que veio do vídeo é preservado.
+    A proposta do modelo passa pela mesma guarda de cópia; recusada nas duas tentativas, o
+    campo fica vazio com aviso: vazio é melhor que um trecho do acórdão fingindo ser análise.
+    Modelo: OpenAI (OPENAI_TEXT_MODEL), com saída estruturada.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = OPENAI_TEXT_MODEL,
+        artifact_store: Optional[RunArtifacts] = None,
+        logger: Optional[logging.Logger] = None,
+        batch_size: int = 5,
+        effort: str = OPENAI_TEXT_EFFORT,
+    ) -> None:
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY não encontrado.")
+        self.api_key = api_key
+        self.model = model or OPENAI_TEXT_MODEL
+        self.effort = effort or OPENAI_TEXT_EFFORT
+        self.artifact_store = artifact_store or RunArtifacts.for_youtube_url("unknown")
+        self.logger = logger or logging.getLogger(__name__)
+        self.batch_size = max(1, int(batch_size or 5))
+
+    @staticmethod
+    def campos_a_redigir(row: PublishPreviewRow, teor: str) -> list[str]:
+        return [
+            campo for campo in TEOR_ANALISE_CAMPOS
+            if not normalize_model_text(getattr(row, campo)) or campo_analitico_copia_teor(getattr(row, campo), teor)
+        ]
+
+    def enrich_rows(
+        self,
+        rows: list[PublishPreviewRow],
+        teores: list[tuple[str, str]],
+    ) -> list[PublishPreviewRow]:
+        """`teores[i]` = (ementa, decisao) oficiais de `rows[i]`; par vazio = sem teor."""
+        if len(teores) != len(rows):
+            raise ValueError("teores deve ter um par (ementa, decisao) por linha.")
+        result = [row.model_copy(deep=True) for row in rows]
+        fontes = [" ".join(part for part in teor if part) for teor in teores]
+        pendentes = [
+            index for index, row in enumerate(result)
+            if normalize_model_text(fontes[index]) and self.campos_a_redigir(row, fontes[index])
+        ]
+        for tentativa in (1, 2):
+            if not pendentes:
+                break
+            for batch_number, start in enumerate(range(0, len(pendentes), self.batch_size), start=1):
+                indices = pendentes[start: start + self.batch_size]
+                payload = [
+                    build_teor_analise_payload(result[i], teores[i][0], teores[i][1], key=f"row_{i + 1:03d}")
+                    for i in indices
+                ]
+                items_by_key = self._items_for_batch(payload, f"04c_teor_analise_{tentativa}_{batch_number:02d}", tentativa)
+                for index, item_payload in zip(indices, payload):
+                    self._apply_item(result[index], items_by_key.get(item_payload["key"]), fontes[index])
+            pendentes = [i for i in pendentes if self.campos_a_redigir(result[i], fontes[i])]
+        for index in pendentes:
+            row = result[index]
+            for campo in self.campos_a_redigir(row, fontes[index]):
+                setattr(row, campo, "")
+                row.add_warning(
+                    f"{campo} não redigido a partir do inteiro teor (proposta ausente, curta ou "
+                    "cópia do acórdão) — campo deixado vazio para revisão."
+                )
+        return result
+
+    def _items_for_batch(self, payload: list[dict[str, Any]], stem: str, tentativa: int) -> dict[str, TeorAnaliseItem]:
+        cache_filename = f"{stem}.json"
+        identidade = {
+            "model": self.model,
+            "effort": self.effort,
+            "prompt_sha1": hashlib.sha1(TEOR_ANALISE_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+            "payload": payload,
+        }
+        parsed: Optional[TeorAnaliseBatchResult] = None
+        # A 2ª tentativa só existe para itens RECUSADOS na 1ª: reaproveitar a resposta dela numa
+        # nova execução devolveria a mesma recusa para sempre. Só a 1ª usa o cache.
+        if tentativa == 1 and self.artifact_store.exists(cache_filename):
+            cached = self.artifact_store.read_json(cache_filename)
+            if cached.get("parsed") and all(cached.get(k) == v for k, v in identidade.items()):
+                parsed = TeorAnaliseBatchResult.model_validate(cached["parsed"])
+        if parsed is None:
+            try:
+                parsed = self._call_batch(payload=payload, artifact_name=f"{stem}.txt", tentativa=tentativa)
+                self.artifact_store.write_json(cache_filename, {**identidade, "parsed": parsed.model_dump(mode="json")})
+            except Exception as exc:
+                self.logger.warning("Falha ao redigir análise a partir do teor (%s): %s", stem, exc)
+                self.artifact_store.write_json(cache_filename, {**identidade, "error": str(exc)})
+                return {}
+        return {normalize_model_text(item.key): item for item in parsed.items}
+
+    def _call_batch(self, *, payload: list[dict[str, Any]], artifact_name: str, tentativa: int) -> TeorAnaliseBatchResult:
+        prompt = (
+            "Redija `analise_do_conteudo_juridico` e `raciocinio_juridico` para os itens abaixo, "
+            "a partir da ementa e da decisão oficiais de cada um.\n"
+        )
+        if tentativa > 1:
+            prompt += (
+                "ATENÇÃO: a versão anterior destes itens foi recusada por copiar trechos do acórdão, por "
+                "comentar a fonte (a palavra \"ementa\", \"o material\", \"o texto fornecido\") ou por ser "
+                "curta demais. Reescreva com suas próprias palavras, falando só do caso, sem verbetação em "
+                "caixa alta, sem rótulos do acórdão e sem transcrever frases da ementa.\n"
+            )
+        prompt += f"\nITENS:\n{json.dumps({'items': payload}, ensure_ascii=False, indent=2)}"
+        # O SDK já refaz 429/5xx/timeout (max_retries); aqui só o erro definitivo sobe.
+        parsed, response_text = call_openai_structured(
+            api_key=self.api_key,
+            model=self.model,
+            system_instruction=TEOR_ANALISE_SYSTEM_PROMPT,
+            prompt=prompt,
+            response_model=TeorAnaliseBatchResult,
+            effort=self.effort,
+        )
+        self.artifact_store.write_text(artifact_name, response_text)
+        return parsed
+
+    @staticmethod
+    def _apply_item(row: PublishPreviewRow, item: Optional[TeorAnaliseItem], teor: str) -> None:
+        if item is None:
+            return
+        for campo in TeorAnaliseEnricher.campos_a_redigir(row, teor):
+            proposta = re.sub(r"\s+", " ", normalize_model_text(getattr(item, campo))).strip()
+            if (
+                len(proposta) < TEOR_ANALISE_MIN_CHARS[campo]
+                or campo_analitico_copia_teor(proposta, teor, proposta=True)
+                or _META_FONTE_RE.search(proposta)
+            ):
+                continue
+            setattr(row, campo, proposta)
+        if item.source_insufficient:
+            row.add_warning("Análise redigida a partir do teor marcou fonte insuficiente — conferir.")
 
 
 
@@ -7826,16 +8169,15 @@ class GeminiProcessMetadataEnricher:
         raise RuntimeError(f"Falha definitiva no enriquecimento de metadados processuais: {last_error}") from last_error
 
     def _structure_grounded_text(self, text: str, response_model: type[BaseModel]) -> BaseModel:
-        """2ª passada SEM grounding: estrutura o texto já pesquisado no schema (chaves explícitas)."""
-        parsed, _, _ = call_gemini_generate_content_rest(
-            api_key=self.api_key,
-            model_name=self.model,
-            contents=[{"parts": [_build_gemini_rest_part(text=PROCESS_METADATA_EXTRACTION_PROMPT + text)]}],
+        """2ª passada SEM grounding: estrutura o texto já pesquisado no schema (chaves explícitas).
+
+        A pesquisa (1ª passada) é do Gemini com Google Search; esta etapa é só texto: OpenAI."""
+        parsed, _ = call_openai_structured(
+            api_key=get_openai_api_key(),
+            model=OPENAI_TEXT_MODEL,
             system_instruction="Você converte um texto factual já pesquisado em JSON estruturado, sem acrescentar dados ausentes.",
+            prompt=PROCESS_METADATA_EXTRACTION_PROMPT + text,
             response_model=response_model,
-            temperature=0.0,
-            use_google_search=False,
-            timeout_seconds=DEFAULT_GEMINI_HTTP_TIMEOUT_SECONDS,
         )
         return parsed
 
@@ -9001,6 +9343,15 @@ def apply_rag_consistency_checks(row: "PublishPreviewRow") -> None:
         row.add_warning(
             f"resultado '{row.resultado}' incompatível com a classe {row.classe_processo} — conferir na vistoria."
         )
+    # 27/09/2026: campo analítico com forma de trecho do acórdão (verbetação da ementa,
+    # rótulos "I. CASO EM EXAME", "ACORDAM...") é cópia, não análise — ver
+    # TeorAnaliseEnricher, que redige esses campos quando a fonte é o teor.
+    for campo in TEOR_ANALISE_CAMPOS:
+        if parece_copia_do_acordao(getattr(row, campo)):
+            row.add_warning(
+                f"{campo} reproduz o acórdão (ementa/dispositivo) em vez de analisá-lo — "
+                "redigir a partir do inteiro teor."
+            )
 
 
 def validate_preview_row(
@@ -10013,14 +10364,14 @@ def enrich_preview_rows_with_process_metadata(
 def enrich_preview_rows_with_theme_punchline(
     rows: list[PublishPreviewRow],
     *,
-    api_key: str,
-    model: str = DEFAULT_GEMINI_MODEL,
+    api_key: str = "",
+    model: str = OPENAI_TEXT_MODEL,
     artifact_store: Optional[RunArtifacts] = None,
     logger: Optional[logging.Logger] = None,
-    enricher: Optional[GeminiThemePunchlineEnricher] = None,
+    enricher: Optional[ThemePunchlineEnricher] = None,
     notion_schema: Optional[NotionDataSourceSchema] = None,
 ) -> list[PublishPreviewRow]:
-    text_enricher = enricher or GeminiThemePunchlineEnricher(
+    text_enricher = enricher or ThemePunchlineEnricher(
         api_key=api_key,
         model=model,
         artifact_store=artifact_store,

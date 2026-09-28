@@ -100,10 +100,8 @@ def analyze_video(youtube_url: str, model_name: str) -> None:
         logger=LOGGER,
         notion_schema=notion_schema,
     )
-    rows = enrich_preview_rows_with_theme_punchline(
+    rows = enrich_preview_rows_with_theme_punchline(  # só texto: OpenAI (OPENAI_TEXT_MODEL)
         rows,
-        api_key=gemini_key,
-        model=model_name,
         artifact_store=artifact_store,
         logger=LOGGER,
         notion_schema=notion_schema,

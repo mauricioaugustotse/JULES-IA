@@ -56,7 +56,7 @@ from tse_youtube_notion_core import (
     GeminiNewsEnricher,
     GeminiProcessMetadataEnricher,
     GeminiSessionExtractor,
-    GeminiThemePunchlineEnricher,
+    ThemePunchlineEnricher,
     JudgmentBundleExtraction,
     JudgmentItemExtraction,
     NotionDataSourceSchema,
@@ -2860,9 +2860,7 @@ def repair_existing_video_rows(
                 )
                 if context_text:
                     try:
-                        result = repair_theme_from_text_context(
-                            api_key=gemini_api_key,
-                            model=model,
+                        result = repair_theme_from_text_context(  # só texto: OpenAI
                             row=repaired,
                             context_text=context_text,
                             artifact_store=artifact_store,
@@ -4405,9 +4403,7 @@ def process_video(
         artifact_store=artifact_store,
         logger=LOGGER,
     )
-    theme_punchline_enricher = GeminiThemePunchlineEnricher(
-        api_key=gemini_api_key,
-        model=model,
+    theme_punchline_enricher = ThemePunchlineEnricher(  # só texto: OpenAI (OPENAI_TEXT_MODEL)
         artifact_store=artifact_store,
         logger=LOGGER,
     )

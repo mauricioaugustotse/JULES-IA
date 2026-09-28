@@ -10,7 +10,7 @@ from tse_youtube_notion_core import (
     GeminiSessionExtractor,
     GeminiNewsEnricher,
     GeminiProcessMetadataEnricher,
-    GeminiThemePunchlineEnricher,
+    ThemePunchlineEnricher,
     InstitutionalRepairResult,
     JudgmentBundleExtraction,
     JudgmentItemExtraction,
@@ -4716,7 +4716,7 @@ def test_theme_punchline_enricher_applies_complementary_repair_item():
             "a igualdade da disputa, e o TSE reconheceu o impacto concreto da conduta no desfecho do pleito."
         ),
     )
-    enricher = object.__new__(GeminiThemePunchlineEnricher)
+    enricher = object.__new__(ThemePunchlineEnricher)
 
     repaired = enricher._apply_repair_item(row, repair_item)
 

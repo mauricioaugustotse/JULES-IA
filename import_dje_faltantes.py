@@ -5,7 +5,10 @@ Fontes por linha: dados OFICIAIS do CSV bruto do DJE (numeroUnico, classe,
 relator, ementa completa, dispositivo, município/UF, ano da eleição) + link do
 vídeo da sessão no trecho em que o processo é mencionado (artifacts). Resultado
 e votação são inferidos do dispositivo oficial ("ACORDAM ... por unanimidade,
-negar provimento"). Tema/punchline vêm do enricher Gemini do próprio pipeline
+negar provimento"). Análise do conteúdo jurídico e raciocínio jurídico são
+REDIGIDOS a partir da ementa+decisão pelo TeorAnaliseEnricher (OpenAI, gpt-6-luna) —
+nunca a ementa/dispositivo crus (até 27/09/2026 a ementa ia inteira para a análise).
+Tema/punchline vêm do enricher de tema do próprio pipeline (OpenAI)
 (fallback determinístico). Partes/advogados/composição ficam vazios de
 propósito: os pipelines do watcher DJE (fill_partes/fill_composicao/...)
 completam com o registro oficial no próximo confronto, casando por CNJ-20+data.
@@ -32,14 +35,18 @@ from local_secrets import get_secret
 from tse_normalization import CNJ_ELECTORAL_UF_BY_CODE
 from tse_youtube_notion_core import (
     ARTIFACT_ROOT,
-    DEFAULT_GEMINI_MODEL,
     DEFAULT_NOTION_DATA_SOURCE_ID,
+    TEOR_ANALISE_CAMPOS,
     NotionSessoesClient,
     PublishPreviewRow,
     RunArtifacts,
+    TeorAnaliseEnricher,
     assess_row_publishability,
+    campo_analitico_copia_teor,
     enrich_preview_rows_with_theme_punchline,
     publish_preview_rows,
+    punchline_copia_teor,
+    tema_quebrado,
     validate_preview_row,
 )
 
@@ -243,8 +250,12 @@ def main() -> int:
         action="store_true",
         help="Reprocessa também itens já publicados (upsert corrige páginas existentes).",
     )
-    parser.add_argument("--skip-theme-enricher", action="store_true", help="Não chama o Gemini (tema determinístico).")
-    parser.add_argument("--model", default=DEFAULT_GEMINI_MODEL)
+    parser.add_argument("--skip-theme-enricher", action="store_true", help="Não chama o modelo de tema/punchline (tema determinístico).")
+    parser.add_argument(
+        "--skip-teor-analise",
+        action="store_true",
+        help="Não redige análise/raciocínio a partir do teor (os campos ficam VAZIOS, nunca com a ementa crua).",
+    )
     parser.add_argument("--data-source-id", default=DEFAULT_NOTION_DATA_SOURCE_ID)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -286,6 +297,7 @@ def main() -> int:
 
     rows: list[PublishPreviewRow] = []
     row_items: list[dict] = []
+    teores: list[tuple[str, str]] = []
     counters: dict[str, int] = {}
     for item in sorted(items, key=lambda x: (x.get("data_sessao", ""), x["id"])):
         record = (item.get("extra") or {}).get("dje", {})
@@ -296,7 +308,9 @@ def main() -> int:
             continue
         data_sessao = item.get("data_sessao", "") or iso(full.get("dataDecisao", ""))
         ementa = clean_text(full.get("textoEmenta", ""))
-        dispositivo = extract_dispositivo(full.get("textoDecisao", ""))
+        decisao = clean_text(full.get("textoDecisao", ""))
+        teor = f"{ementa} {decisao}"
+        dispositivo = extract_dispositivo(decisao)
         resultado, votacao = resultado_votacao_from_dispositivo(dispositivo)
         tribunal, origem = tribunal_origem_from_cnj(cnj20, full.get("nomeMunicipio", ""), full.get("siglaUF", ""))
         counters[data_sessao] = counters.get(data_sessao, 0) + 1
@@ -321,8 +335,7 @@ def main() -> int:
             resultado=resultado,
             votacao=votacao,
             data_sessao=data_sessao,
-            analise_do_conteudo_juridico=ementa[:1900],
-            raciocinio_juridico=dispositivo,
+            # analise/raciocinio: redigidos do teor pelo TeorAnaliseEnricher, abaixo.
         )
         row.add_warning(
             "Importado do confronto DJE (CSV oficial); posição na pauta não verificada; "
@@ -346,18 +359,33 @@ def main() -> int:
                     # A página do fluxo do vídeo tem conteúdo rico (análise dos votos,
                     # tema contextual, link com timestamp): o update corrige número/
                     # resultado/classe oficiais, mas os textos do vídeo prevalecem —
-                    # ementa/dispositivo oficiais só preenchem campos vazios.
-                    for field in (
-                        "tema",
-                        "punchline",
-                        "analise_do_conteudo_juridico",
-                        "fundamentacao_normativa",
-                        "raciocinio_juridico",
-                        "precedentes_citados",
-                        "resolucoes_citadas",
-                        "youtube_link",
-                    ):
-                        current = client._extract_property_text(page, schema, field) or ""
+                    # o teor oficial só alimenta campo vazio. Texto que já é cópia do
+                    # acórdão (import anterior) não é "texto do vídeo": é redigido de novo —
+                    # inclusive a punchline/tema que o fallback montou sobre a ementa-cópia.
+                    atuais = {
+                        field: client._extract_property_text(page, schema, field) or ""
+                        for field in (
+                            "tema",
+                            "punchline",
+                            "analise_do_conteudo_juridico",
+                            "fundamentacao_normativa",
+                            "raciocinio_juridico",
+                            "precedentes_citados",
+                            "resolucoes_citadas",
+                            "youtube_link",
+                        )
+                    }
+                    analise_copiada = campo_analitico_copia_teor(atuais["analise_do_conteudo_juridico"], teor)
+                    for field, current in atuais.items():
+                        if (
+                            (field in TEOR_ANALISE_CAMPOS and campo_analitico_copia_teor(current, teor))
+                            or (field == "punchline" and punchline_copia_teor(current, teor, analise_copiada))
+                            or (field == "tema" and tema_quebrado(current))
+                        ):
+                            # update_row omite campo vazio: sem isto, se a redação falhar, a
+                            # cópia antiga continuaria na página.
+                            row.clear_properties.append(field)
+                            continue
                         if current.strip():
                             setattr(row, field, current)
                     break
@@ -365,19 +393,41 @@ def main() -> int:
             LOGGER.warning("Upsert lookup falhou para %s: %s", row.numero_processo, exc)
         rows.append(row)
         row_items.append(item)
+        teores.append((ementa, decisao))
+
+    if not args.skip_teor_analise and rows:
+        # Sem redator (chave da OpenAI ausente) o import não segue: publicaria páginas sem
+        # análise que nada volta a encontrar. Falha por lote é tratada dentro do enricher.
+        try:
+            redator = TeorAnaliseEnricher(
+                api_key=get_secret("OPENAI_API_KEY"),
+                artifact_store=artifact_store,
+                logger=LOGGER,
+            )
+        except ValueError as exc:
+            LOGGER.error("Sem redator da análise (%s). Configure a chave da OpenAI ou use --skip-teor-analise.", exc)
+            return 2
+        rows = redator.enrich_rows(rows, teores)
 
     if not args.skip_theme_enricher and rows:
         try:
-            rows = enrich_preview_rows_with_theme_punchline(
+            rows = enrich_preview_rows_with_theme_punchline(  # só texto: OpenAI
                 rows,
-                api_key=get_secret("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-                model=args.model,
+                api_key=get_secret("OPENAI_API_KEY"),
                 artifact_store=artifact_store,
                 logger=LOGGER,
                 notion_schema=schema,
             )
         except Exception as exc:
             LOGGER.warning("Enricher de tema falhou (%s); seguindo com fallback determinístico.", exc)
+
+    # O fallback da punchline reaproveita a 1ª frase da análise; se ela (ou a proposta do
+    # modelo) repetir o acórdão, é melhor punchline vazia que cópia.
+    for row, (ementa, decisao) in zip(rows, teores):
+        if punchline_copia_teor(row.punchline, f"{ementa} {decisao}", False, proposta=True):
+            row.punchline = ""
+            row.clear_properties.append("punchline")
+            row.add_warning("punchline descartada: repetia o acórdão (ementa/dispositivo).")
 
     rows = [validate_preview_row(row, schema) for row in rows]
 
@@ -399,14 +449,23 @@ def main() -> int:
     results = publish_preview_rows(rows, client, schema)
     artifact_store.write_json("import_results.json", results)
     published_ids = []
-    for item, result in zip(row_items, results[: len(row_items)]):
+    sem_analise = 0
+    for item, row, result in zip(row_items, rows, results[: len(row_items)]):
         status = result.get("status")
         print(f"[{status}] {result.get('numero_processo')} -> {result.get('url', '')}")
-        if status in {"created", "updated"}:
-            published_ids.append(str(item["id"]))
+        if status not in {"created", "updated"}:
+            continue
+        # Página publicada sem análise/raciocínio (redação recusada ou falhou): o item fica
+        # PENDENTE na fila para o próximo import completar o campo pelo upsert.
+        if not args.skip_teor_analise and not all(getattr(row, campo).strip() for campo in TEOR_ANALISE_CAMPOS):
+            sem_analise += 1
+            continue
+        published_ids.append(str(item["id"]))
     if published_ids:
         vistoria_queue.update_status(published_ids, "published")
     print(f"\nPublicados: {len(published_ids)} de {len(row_items)}. Artifacts: {artifact_store.root_dir}")
+    if sem_analise:
+        print(f"ATENÇÃO: {sem_analise} página(s) gravada(s) sem análise/raciocínio seguem pendentes na fila.")
     return 0
 
 

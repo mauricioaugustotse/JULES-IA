@@ -493,10 +493,8 @@ def process_single_video(
 
     if rows:
         progress("revisando tema e punchline")
-        rows = enrich_preview_rows_with_theme_punchline(
+        rows = enrich_preview_rows_with_theme_punchline(  # só texto: OpenAI (OPENAI_TEXT_MODEL)
             rows,
-            api_key=gemini_api_key,
-            model=options.model,
             artifact_store=artifact_store,
             logger=LOGGER,
             notion_schema=notion_schema,
