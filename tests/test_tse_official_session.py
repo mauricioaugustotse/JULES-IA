@@ -134,6 +134,28 @@ def test_unknown_collection_status_not_silently_excluded():
     assert "official_unknown_status" in codes(compare_official_rows(out, []))
 
 
+def test_explicit_adjournment_is_accounted_without_pending_review():
+    out = inventory([process(situacaoProcesso="Não julgado", motivoRetiradaPauta="Adiado")])
+    assert out["expected_count"] == 0
+    assert out["counts"]["deferred"] == 1
+    assert codes(compare_official_rows(out, [])) == ["official_exclusion"]
+    assert "official_excluded_row" in codes(compare_official_rows(out, [row()]))
+
+
+def test_vista_is_expected_without_unknown_status_and_cached_unknown_is_reclassified():
+    out = inventory([process(situacaoProcesso="Não julgado", motivoRetiradaPauta="Pedido de vista",
+                             proclamacaoDecisao="Após o voto do relator, pediu vista o Ministro André Mendonça.")])
+    assert out["expected_count"] == 1
+    out["processes"][0]["classification"] = "unknown"
+    assert codes(compare_official_rows(out, [])) == ["official_missing_judgment"]
+    assert not compare_official_rows(out, [row(resultado="Suspenso por vista", votacao="Suspenso")])
+
+
+def test_nonjudgment_without_explicit_reason_remains_pending():
+    out = inventory([process(situacaoProcesso="Não julgado")])
+    assert "official_unknown_status" in codes(compare_official_rows(out, []))
+
+
 def test_correct_row_has_no_issue_and_inputs_not_mutated():
     inv, rows = inventory(), [row()]
     backup = deepcopy((inv, rows))
@@ -285,3 +307,41 @@ def test_voters_compare_only_complete_known_valid_names():
     assert compare_official_rows(inventory([p]), [row(composicao=[])]) == []
     p["votantes"] = voters[:2]
     assert compare_official_rows(inventory([p]), [row(composicao=[])]) == []
+
+def test_pending_view_blocks_final_result_and_checks_official_substitute():
+    proclamation = (
+        "Iniciado o julgamento, o Relator votou pelo provimento do recurso. "
+        "Em seguida, antecipou pedido de vista o Ministro André Mendonça.\n\n"
+        "Composição: Ministros (as) Nunes Marques (Presidente), André Mendonça, "
+        "Dias Toffoli, Ricardo Villas Bôas Cueva, Sebastião Reis Júnior (substituto), "
+        "Floriano de Azevedo Marques e Estela Aranha."
+    )
+    inv = inventory([process(situacaoProcesso="Não julgado", motivoRetiradaPauta="Pedido de vista",
+                             siglaClasseJudicial="RO-El", proclamacaoDecisao=proclamation)])
+    correct_composition = ["Min. Nunes Marques", "Min. André Mendonça", "Min. Dias Toffoli",
+                           "Min. Ricardo Villas Bôas Cueva", "Min. Sebastião Reis Júnior",
+                           "Min. Floriano de Azevedo Marques", "Min. Estela Aranha"]
+    wrong = row(classe_processo="RO", resultado="Provido", votacao="Por maioria",
+                composicao=[n.replace("Sebastião Reis Júnior", "Antônio Carlos Ferreira")
+                            for n in correct_composition])
+    issues = compare_official_rows(inv, [wrong])
+    assert {x.get("field") for x in issues if x["severity"] == "error"} == {
+        "resultado", "votacao", "composicao"}
+    corrected = row(classe_processo="RO", resultado="Suspenso por vista", votacao="Suspenso",
+                    composicao=correct_composition)
+    assert all(x["severity"] != "error" for x in compare_official_rows(inv, [corrected]))
+
+
+def test_ro_alias_matches_official_ro_el():
+    inv = inventory([process(siglaClasseJudicial="RO-El")])
+    assert not any(x.get("field") == "classe_processo"
+                   for x in compare_official_rows(inv, [row(classe_processo="RO")]))
+
+
+def test_compound_proclamation_does_not_assign_other_appeals_vote():
+    p = process(siglaClasseJudicial="RO-El", proclamacaoDecisao=(
+        "O Tribunal, por unanimidade, deu parcial provimento ao recurso de A; "
+        "e, por maioria, negou provimento ao recurso ordinário de B."
+    ))
+    issues = compare_official_rows(inventory([p]), [row(classe_processo="RO", resultado="Desprovido", votacao="Por maioria")])
+    assert not any(x.get("field") in {"resultado", "votacao", "classe_processo"} for x in issues)

@@ -45,9 +45,8 @@ import threading
 import pytest
 
 
-class _LinhaFalsa:
-    def model_dump(self, mode=None):
-        return {"row": True}
+class _LinhaFalsa(gui.PublishPreviewRow):
+    """Uma linha real, sem data/identidade: os testes de parada não usam rede."""
 
 
 class _AnaliseFalsa:

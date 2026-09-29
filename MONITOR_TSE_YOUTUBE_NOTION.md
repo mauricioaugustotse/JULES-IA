@@ -4,6 +4,35 @@ Abra o atalho **TSE YouTube Notion** normalmente e inicie o lote. O monitor é
 ativado automaticamente; o botão **Monitor** abre o painel no navegador. Uma
 janela que já estava aberta antes da atualização precisa ser reaberta.
 
+## Correções automáticas e vistoria
+
+O fluxo reconcilia as linhas com o inventário oficial **antes do enriquecimento
+e novamente antes da publicação**. CNJ curto ou com um zero excedente é corrigido
+quando existe uma única correspondência sustentada pelo número original do vídeo
+e pelos demais dados da sessão. A relatoria e a composição efetiva, incluindo
+substitutos, prevalecem sobre o gabinete atual do DataJud e o cadastro de titulares.
+Linhas já confirmadas dispensam a consulta ao DataJud.
+
+Pedido de vista gera `Suspenso por vista`, votação `Suspenso`, ministro solicitante
+e texto que distingue voto do relator de decisão final. Uma proclamação com
+resultados diferentes para recursos distintos preserva a informação específica
+extraída do julgamento. Adiamentos expressos ficam contabilizados como exclusões.
+Números citados em outro julgamento são excluídos quando scan, detalhe, partes e
+texto comprovam essa relação; a ausência no inventário, isoladamente, não basta.
+
+Após os tratamentos finais, campos confirmados pela reconciliação são restaurados
+se algum script os alterar. Cada reparo registra o valor anterior antes de escrever
+e passa por nova leitura no Notion. A busca de páginas é repetida após completar o
+CNJ para evitar duplicação durante a recuperação.
+
+Na **Fila de vistoria**, cada linha representa um caso. O painel de evidências
+mostra o problema, os campos extraídos, os dados oficiais, a proclamação e o próximo
+passo. **Abrir trecho** leva ao ponto do vídeo; **Fonte oficial** abre o inventário.
+**Corrigir dados** permite editar uma proposta local e revalidá-la antes de
+**Publicar julgamento**. Salvar a correção não publica. Alertas superados são
+encerrados automaticamente; publicações só saem da fila após releitura confirmada.
+O filtro de histórico conserva os casos resolvidos, publicados e descartados.
+
 O painel mostra a última etapa registrada e as pendências de cada vídeo. Ele se
 atualiza a cada dez segundos. Se o processo for encerrado, o horário para de
 avançar; o arquivo não é um serviço independente que reinicia o workflow.
@@ -57,10 +86,14 @@ Dentro de `artifacts/tse_youtube_notion/batch_gui/<lote>/`:
 - `<video>/04g_official_excluded_rows.json`: retiradas e listas excluídas com
   identificação e justificativa.
 - `<video>/04h_publish_preview_rows.json`: linhas exatas enviadas ao publicador.
+- `<video>/04i_automatic_reconciliation.json`: identidades, correções e citações
+  excluídas, com evidências e valores anteriores, nas duas etapas do fluxo.
 - `<video>/05_publish_journal.json`: resultados por linha, inclusive publicação parcial.
 - `<video>/05b_notion_verification.json`: confirmação das páginas por leitura.
 - `<video>/05c_final_notion_verification.json`: nova leitura após os tratamentos.
 - `<video>/05d_final_official_comparison.json`: confronto oficial no fechamento.
+- `<video>/05e_automatic_post_repair.json`: reparos de campos oficiais alterados
+  pelos tratamentos posteriores.
 - `batch_summary.json`: contagem separada de concluídos, pendentes, erros,
   interrompidos e vídeos não processados.
 
@@ -99,3 +132,14 @@ das páginas individuais. O erro da execução original permanece no histórico;
 O relatório e as leituras estão em
 `artifacts/monitor_repair_WYjLx6WzMns/` na máquina onde a recuperação ocorreu.
 Uma nova execução completa do atalho ainda precisa ser observada.
+
+## Sessão de 24/09/2026
+
+O replay dos dados originais confirmou cinco registros e excluiu três referências
+a condenações citadas dentro do recurso de Arruda. O PA de Doutor Severiano/RN,
+`0601130-04.2026.6.20.0000`, foi publicado e relido. As cinco páginas foram
+conferidas contra o inventário; os 15 itens pendentes foram encerrados com trilha
+de auditoria. Evidências em
+`artifacts/tse_youtube_notion/batch_gui/20260929_153718_906300/automatic_repair_20260929/`.
+O painel `resolution_monitor.html` registra a situação atual; o lote original
+permanece preservado.

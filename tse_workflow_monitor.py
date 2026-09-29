@@ -47,6 +47,7 @@ def reconcile_video(
     verification: list[dict[str, Any]] | None = None,
     published: bool = False,
     official: dict[str, Any] | None = None,
+    reconciliation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
@@ -71,6 +72,24 @@ def reconcile_video(
                   reasons=block.get("issues", []))
     bundles = analysis.get("bundles") or []
     row_keys = {process_key(r.get("numero_processo")) for r in rows} - {""}
+    # Números corrigidos e citações excluídas continuam contabilizados, com prova
+    # no diário de reconciliação. Os artefatos originais permanecem intactos.
+    phases = (reconciliation or {}).get("phases", [reconciliation or {}])
+    for phase in phases:
+        for match in phase.get("matches", []):
+            if process_key(match.get("numero_processo")) not in row_keys:
+                continue
+            aliases = match.get("aliases", []) + [match.get("original_numero_processo"), match.get("numero_origem_video")]
+            row_keys.update(process_key(alias) for alias in aliases if process_key(alias))
+        for exclusion in phase.get("exclusions", []):
+            if (exclusion.get("code") != "cited_process_number"
+                    or not exclusion.get("evidence")
+                    or process_key(exclusion.get("parent_numero_processo")) not in row_keys):
+                continue
+            key = process_key(exclusion.get("numero_processo"))
+            if key and key not in official_exclusions:
+                official_exclusions.add(key)
+                information.append({**exclusion, "severity": "info", "message": exclusion.get("reason", "Número citado em outro julgamento.")})
     for window in (analysis.get("session") or {}).get("judgments", []):
         expected = {process_key(n) for n in window.get("mentioned_process_numbers", [])} - {""}
         if window.get("should_ignore"):

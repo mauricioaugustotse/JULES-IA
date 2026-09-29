@@ -197,6 +197,25 @@ def test_failed_internal_postpublish_script_is_exposed(tmp_path, monkeypatch, of
     assert json.loads((tmp_path / "monitor_status.json").read_text())["status"] == "pending"
 
 
+def test_successful_final_readback_replaces_transient_verification_alert(tmp_path, monkeypatch):
+    store = gui.RunArtifacts(tmp_path)
+    store.write_json("04h_publish_preview_rows.json", [preview().model_dump(mode="json")])
+    store.write_json(gui.OFFICIAL_INVENTORY_FILENAME, official())
+    monkeypatch.setattr(gui, "_queue_monitor_issues", lambda *args: None)
+    class Client:
+        def build_properties_payload(self, schema, row):
+            return {"resultado": {"select": {"name": row.resultado}}}
+        def _request(self, *args):
+            return {"id": "page-a", "properties": {"resultado": {"select": {"name": "Indeferido"}}}}
+    summary = {"status": "pending", "video_id": "abc", "artifact_dir": str(tmp_path), "created": 1,
+               "publish_results": [{"status": "created", "page_id": "page-a"}],
+               "coverage": {"status": "pending", "issues": [{"code": "notion_unverified", "message": "Transient read timeout"}]}}
+    gui._verify_after_post_publish([summary], Client(), None, queue.Queue())
+    assert summary["status"] == "done"
+    assert summary["coverage"]["status"] == "verified"
+    assert not summary["coverage"]["issues"]
+
+
 def test_last_batch_resolution_label_and_monitor_preserve_original_summary(tmp_path, monkeypatch):
     folder = tmp_path / "20260919_095400_895000"
     folder.mkdir()

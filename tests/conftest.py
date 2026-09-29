@@ -8,6 +8,13 @@ isolado, que e o pior modo de falhar.
 import pytest
 
 import tse_youtube_notion_core as core
+import vistoria_queue
+
+
+@pytest.fixture(autouse=True)
+def _isola_fila_vistoria(tmp_path, monkeypatch):
+    """Testes de lote e falhas nunca gravam na fila usada pela GUI real."""
+    monkeypatch.setattr(vistoria_queue, "QUEUE_FILE", tmp_path / "vistoria_queue.jsonl")
 
 
 @pytest.fixture(autouse=True)

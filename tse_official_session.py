@@ -38,7 +38,7 @@ _CLASS_ALIASES = {
     "arespe": "arespe", "arespel": "arespe", "agravo em recurso especial eleitoral": "arespe",
     "tutantant": "tutantant", "tutela antecipada antecedente": "tutantant",
     "tutcautant": "tutcautant", "tutela cautelar antecedente": "tutcautant",
-    "rot": "rot", "ro el": "rot", "recurso ordinario eleitoral": "rot", "recurso ordinario": "rot",
+    "rot": "rot", "ro": "rot", "ro el": "rot", "recurso ordinario eleitoral": "rot", "recurso ordinario": "rot",
     "pc": "pc", "prestacao de contas": "pc",
     "pet": "pet", "peticao": "pet",
     "aije": "aije", "acao de investigacao judicial eleitoral": "aije",
@@ -56,7 +56,7 @@ def _norm(value: Any) -> str:
 def _name(value: Any) -> str:
     text = _norm(value)
     text = re.sub(r"^(?:(?:min|ministro|ministra|senhor|senhora)\s+)+", "", text)
-    text = re.sub(r"\s+presidente$", "", text)
+    text = re.sub(r"\s+(?:presidente|substituto)$", "", text)
     return "nunes marques" if text == "kassio nunes marques" else text
 
 
@@ -99,6 +99,11 @@ def _issue(code: str, message: str, severity: str = "error", **extra: Any) -> di
 
 def _classification(process: dict[str, Any]) -> str:
     status = _norm(process.get("situacaoProcesso"))
+    reason = _norm(process.get("motivoRetiradaPauta"))
+    if status == "nao julgado" and reason == "adiado":
+        return "deferred"
+    if status == "nao julgado" and reason == "pedido de vista":
+        return "suspended"
     if status in {"retirado de julgamento", "retirado de pauta"}:
         return "withdrawn"
     # The class Lista Tríplice is an individual case, not a voting list.
@@ -151,8 +156,9 @@ def normalize_official_session(raw: Any, session_date: Any) -> dict[str, Any]:
             item["session_id"] = session.get("id")
             item["classification"] = _classification(p)
             out["processes"].append(item)
-            out["counts"][item["classification"]] += 1
-            if item["classification"] in {"withdrawn", "list"}:
+            kind = item["classification"]
+            out["counts"][kind] = out["counts"].get(kind, 0) + 1
+            if kind in {"withdrawn", "list", "deferred"}:
                 out["excluded"].append({
                     "numero_processo": p.get("numeroProcesso", ""),
                     "classification": item["classification"],
@@ -163,7 +169,7 @@ def normalize_official_session(raw: Any, session_date: Any) -> dict[str, Any]:
     out["status"] = "available"
     # Unique expected identities; duplicate official records stay in processes and
     # will trigger an ambiguous-inventory issue in comparison, not silent selection.
-    out["expected_count"] = len({p.get("numeroProcesso") for p in out["processes"] if p["classification"] == "judged"})
+    out["expected_count"] = len({p.get("numeroProcesso") for p in out["processes"] if p["classification"] in {"judged", "suspended"}})
     return out
 
 
@@ -219,9 +225,15 @@ def _official_decision(process: dict[str, Any]) -> tuple[str, str]:
     raw = str(process.get("proclamacaoDecisao") or "")
     text = _norm(raw.split("\n\n", 1)[0])
     voting = ""
-    if "por unanimidade" in text or "a unanimidade" in text:
+    has_unanimity = "por unanimidade" in text or "a unanimidade" in text
+    has_majority = "por maioria" in text
+    # Uma proclamação pode reunir recursos com votações distintas. Sem vincular
+    # cada votação à linha certa, a primeira delas não representa o conjunto.
+    if has_unanimity and has_majority:
+        voting = ""
+    elif has_unanimity:
         voting = "unanime"
-    elif "por maioria" in text:
+    elif has_majority:
         voting = "por maioria"
     # When the court grants the agravo precisely to reject the special appeal,
     # the outcome label follows the appeal. Keep other compound dispositions
@@ -301,9 +313,13 @@ def compare_official_rows(inventory: dict[str, Any], rows: list[dict[str, Any]])
             issues.append(_issue("official_invalid_identity", "Inventário oficial contém processo sem número CNJ completo utilizável.", "warning", numero_processo=p.get("numeroProcesso"), coverage_status="unknown"))
             continue
         by_core[core].append(p)
-        kind = p.get("classification", _classification(p))
-        if kind in {"withdrawn", "list"}:
-            issues.append(_issue("official_exclusion", "Processo oficialmente retirado de julgamento." if kind == "withdrawn" else "Processo julgado em lista, fora dos julgamentos individuais.", "info", numero_processo=p["numeroProcesso"], classification=kind))
+        # Reclassifica snapshots anteriores usando os dados brutos preservados.
+        kind = _classification(p)
+        if kind in {"withdrawn", "list", "deferred"}:
+            message = {"withdrawn": "Processo oficialmente retirado de julgamento.",
+                       "list": "Processo julgado em lista, fora dos julgamentos individuais.",
+                       "deferred": "Julgamento oficialmente adiado; não há decisão desta sessão para publicar."}[kind]
+            issues.append(_issue("official_exclusion", message, "info", numero_processo=p["numeroProcesso"], classification=kind))
         elif kind == "unknown":
             issues.append(_issue("official_unknown_status", "Situação oficial ainda não permite confirmar julgamento nem exclusão.", "warning", numero_processo=p["numeroProcesso"], actual=p.get("situacaoProcesso"), coverage_status="unknown"))
     seen: dict[str, list[int]] = defaultdict(list)
@@ -332,18 +348,30 @@ def compare_official_rows(inventory: dict[str, Any], rows: list[dict[str, Any]])
         canonical = p["numeroProcesso"]
         seen[canonical].append(index)
         ctx = {"row_index": index, "numero_processo": canonical}
-        kind = p.get("classification", _classification(p))
-        if kind in {"withdrawn", "list"}:
-            issues.append(_issue("official_excluded_row", "Linha trata como julgamento individual um processo oficialmente retirado ou julgado em lista.", **ctx, classification=kind, field="disposition", expected=kind, actual="individual_row"))
+        kind = _classification(p)
+        if kind in {"withdrawn", "list", "deferred"}:
+            issues.append(_issue("official_excluded_row", "Linha trata como julgamento individual um processo oficialmente retirado, adiado ou julgado em lista.", **ctx, classification=kind, field="disposition", expected=kind, actual="individual_row"))
             continue
         if full and full != _cnj(canonical)[1]:
             issues.append(_issue("official_process_number_mismatch", "Ano, tribunal ou origem numérica divergem do CNJ oficial.", **ctx, field="numero_processo", expected=canonical, actual=numero))
         elif not full:
             issues.append(_issue("official_incomplete_process_number", "Número curto identificado; o inventário oficial fornece o CNJ completo.", "warning", **ctx, field="numero_processo", expected=canonical, actual=numero))
-        if kind != "judged":
-            continue
         def mismatch(field: str, expected: Any, actual: Any) -> None:
-            issues.append(_issue("official_field_mismatch", f"Campo {field} diverge do registro oficial do julgamento.", **ctx, field=field, expected=expected, actual=actual))
+            issues.append(_issue("official_field_mismatch", f"Campo {field} diverge do registro oficial da sessão.", **ctx, field=field, expected=expected, actual=actual))
+        composition = _official_composition(p)
+        actual = row.get("composicao")
+        if composition is not None:
+            parsed = sorted(set(_name(n) for n in actual)) if isinstance(actual, list) else []
+            if parsed != composition:
+                mismatch("composicao", [_NAME_CANONICAL[n] for n in composition], actual)
+        if kind != "judged":
+            if _norm(p.get("situacaoProcesso")) == "nao julgado":
+                final_result = _norm(row.get("resultado"))
+                if final_result and final_result not in {"suspenso por vista", "suspenso mas julgado depois", "sobrestado"}:
+                    mismatch("resultado", "sem decisão final nesta sessão", row.get("resultado"))
+                if _norm(p.get("motivoRetiradaPauta")) == "pedido de vista" and _norm(row.get("votacao")) not in {"", "suspenso"}:
+                    mismatch("votacao", "Suspenso", row.get("votacao"))
+            continue
         official_class = _class(p.get("siglaClasseJudicial")) or _class(p.get("classeJudicial"))
         if official_class and _class(row.get("classe_processo")) != official_class:
             mismatch("classe_processo", p.get("siglaClasseJudicial") or p.get("classeJudicial"), row.get("classe_processo"))
@@ -361,17 +389,11 @@ def compare_official_rows(inventory: dict[str, Any], rows: list[dict[str, Any]])
             actual_vote = "por maioria"
         if expected_vote and actual_vote != expected_vote:
             mismatch("votacao", expected_vote, row.get("votacao"))
-        composition = _official_composition(p)
-        actual = row.get("composicao")
-        if composition is not None:
-            parsed = sorted(set(_name(n) for n in actual)) if isinstance(actual, list) else []
-            if parsed != composition:
-                mismatch("composicao", [_NAME_CANONICAL[n] for n in composition], actual)
     for canonical, indexes in seen.items():
         if len(indexes) > 1:
             issues.append(_issue("official_duplicate_row", "Mais de uma linha representa o mesmo processo da sessão.", numero_processo=canonical, row_indices=indexes, expected=1, actual=len(indexes)))
     for candidates in by_core.values():
         for p in candidates:
-            if p.get("classification", _classification(p)) == "judged" and p["numeroProcesso"] not in seen:
+            if _classification(p) in {"judged", "suspended"} and p["numeroProcesso"] not in seen:
                 issues.append(_issue("official_missing_judgment", "Processo julgado individualmente não aparece nas linhas extraídas.", numero_processo=p["numeroProcesso"], field="numero_processo", expected=p["numeroProcesso"], actual=None))
     return issues

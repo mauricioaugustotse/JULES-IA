@@ -341,3 +341,15 @@ def test_payload_readback_ignores_colors_ids_text_chunking_and_multi_select_orde
                                PayloadClient(payload, actual), "fake-schema")
     assert checks[0]["status"] == "verified"
     assert set(checks[0]["checked_fields"]) == set(payload)
+def test_reconciliation_accounts_for_corrected_identity_and_citation_with_parent():
+    from tse_workflow_monitor import reconcile_video
+    analysis = {"bundles": [{"items": [{"numero_processo": "0600113-04"}, {"numero_processo": "0600484-08"}]}]}
+    rows = [{"numero_processo": "0601130-04.2026.6.20.0000"}]
+    proof = {"matches": [{"numero_processo": rows[0]["numero_processo"], "aliases": ["0600113-04"]}],
+             "exclusions": [{"code": "cited_process_number", "numero_processo": "0600484-08",
+                             "parent_numero_processo": rows[0]["numero_processo"], "evidence": ["antecedent conviction"]}]}
+    report = reconcile_video(analysis, rows, scan={"status": "complete"}, reconciliation=proof)
+    assert not report["issues"]
+    assert report["information"][0]["code"] == "cited_process_number"
+    missing_parent = reconcile_video(analysis, [], scan={"status": "complete"}, reconciliation=proof)
+    assert len([i for i in missing_parent["issues"] if i["code"] == "detail_process_missing"]) == 2

@@ -13,7 +13,6 @@ import traceback
 import urllib.parse
 import urllib.request
 import webbrowser
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -50,9 +49,12 @@ from tse_normalization import (infer_session_date_from_video_title,
                                normalize_numero_processo_display)
 
 import vistoria_queue
+import vistoria_presenter
+from vistoria_editor import EDITABLE_FIELDS, prepare_edited_item
 from tse_workflow_monitor import BatchMonitor, atomic_json, read_json, reconcile_video, verify_notion_rows, process_key
 from tse_chapter_coverage import ensure_chapter_inventory, compare_chapters
 from tse_official_session import fetch_official_session, compare_official_rows, INVENTORY_FILENAME as OFFICIAL_INVENTORY_FILENAME
+from tse_session_reconciliation import reconcile_session_rows
 
 
 LOGGER = logging.getLogger("tse_youtube_notion_batch_gui")
@@ -473,12 +475,15 @@ def process_single_video(
     progress("consultando inventario oficial da sessao")
     official_inventory = _fetch_official_for_rows(artifact_store, rows)
 
-    progress("enriquecendo via CNJ DataJud")
-    rows = enrich_preview_rows_with_cnj(
-        rows,
-        notion_schema=notion_schema,
-        logger=LOGGER,
-    )
+    progress("corrigindo identidades e dados pela sessao oficial")
+    rows, first_reconciliation = _reconcile_official_rows(
+        artifact_store, rows, official_inventory, analysis, phase="before_enrichment")
+    confirmed_numbers = {match["numero_processo"] for match in first_reconciliation.get("matches", [])}
+    fallback_rows = [row for row in rows if row.numero_processo not in confirmed_numbers]
+    if fallback_rows:
+        progress("enriquecendo pendencias via CNJ DataJud")
+        # A relatoria histórica da sessão prevalece sobre o gabinete atual do DataJud.
+        enrich_preview_rows_with_cnj(fallback_rows, notion_schema=notion_schema, logger=LOGGER)
 
     progress("enriquecendo metadados")
     rows = enrich_preview_rows_with_process_metadata(
@@ -525,7 +530,20 @@ def process_single_video(
         )
 
     progress("confrontando julgados com o inventario oficial")
+    rows, final_reconciliation = _reconcile_official_rows(
+        artifact_store, rows, official_inventory, analysis, phase="before_publish")
+    confirmed_numbers.update(match["numero_processo"] for match in final_reconciliation.get("matches", []))
+    rows = [validate_preview_row(row, notion_schema) for row in rows]
     rows, official_excluded = _apply_official_gate(artifact_store, rows, official_inventory)
+    # A identidade pode ter sido completada depois da primeira busca de páginas.
+    # Repetir a busca com o CNJ confirmado impede duplicatas nas recuperações.
+    for row in rows:
+        if row.blocked or row.numero_processo not in confirmed_numbers:
+            continue
+        match = notion_client.find_existing_row(
+            notion_schema, row.youtube_link, row.numero_processo, row.data_sessao)
+        row.page_id = match.page_id if match else ""
+        row.action = "update" if row.page_id else "create"
     # Esta e a previa exata enviada ao publicador e usada na releitura final.
     artifact_store.write_json("04h_publish_preview_rows.json", [row.model_dump(mode="json") for row in rows])
     progress("conferindo cobertura dos julgados")
@@ -590,6 +608,9 @@ def process_single_video(
             checkpoint=lambda checks: atomic_json(artifact_store.root_dir / "05b_notion_verification.json", checks),
         )
         artifact_store.write_json("05b_notion_verification.json", verification)
+        vistoria_queue.reconcile_published_items(
+            rows, publish_results, verification, video_id=video.video_id,
+            reconciliation=read_json(artifact_store.root_dir / "04i_automatic_reconciliation.json", {}))
         coverage = _video_coverage_report(
             artifact_store, analysis, rows, chapter_inventory, scan_coverage,
             results=publish_results, verification=verification, published=True,
@@ -684,12 +705,24 @@ def _apply_official_gate(artifact_store, rows, inventory):
     return [row for index, row in enumerate(rows) if index not in excluded_indexes], exclusions
 
 
+def _reconcile_official_rows(artifact_store, rows, inventory, analysis, *, phase):
+    corrected, audit = reconcile_session_rows(rows, inventory, evidence=analysis.model_dump(mode="json"))
+    filename = "04i_automatic_reconciliation.json"
+    history = {"phases": []} if phase == "before_enrichment" else read_json(artifact_store.root_dir / filename, {"phases": []})
+    history["phases"].append({"phase": phase, **audit})
+    artifact_store.write_json(filename, history)
+    LOGGER.info("Reconciliação oficial (%s): %s correções, %s citações excluídas.",
+                phase, len(audit.get("corrections", [])), len(audit.get("exclusions", [])))
+    return corrected, audit
+
+
 def _video_coverage_report(artifact_store, analysis, rows, chapters, scan, **kwargs):
     row_data = [row.model_dump(mode="json") for row in rows]
     report = reconcile_video(
         analysis.model_dump(mode="json"), row_data,
         rito=read_json(artifact_store.root_dir / "01b_rito_refinement.json", {}),
         detail=read_json(artifact_store.root_dir / "02_detail_coverage.json", {}),
+        reconciliation=read_json(artifact_store.root_dir / "04i_automatic_reconciliation.json", {}),
         scan=scan, **kwargs,
     )
     official = kwargs.get("official") or {}
@@ -710,28 +743,11 @@ def _video_coverage_report(artifact_store, analysis, rows, chapters, scan, **kwa
 
 
 def _queue_monitor_issues(video, artifact_store, report):
-    items = []
-    for issue in report.get("issues", []):
-        if issue.get("severity") == "info":
-            continue
-        if issue["code"] == "unpublished_row" and issue.get("status") in {"skipped", "blocked"}:
-            continue
-        timestamp = issue.get("start_seconds")
-        url = f"https://www.youtube.com/watch?v={video.video_id}"
-        if isinstance(timestamp, (int, float)) and timestamp >= 0:
-            url += f"&t={int(timestamp)}s"
-        message = issue["message"]
-        if issue.get("numero_processo"):
-            message += " Processo: " + str(issue["numero_processo"])
-        items.append(vistoria_queue.make_vistoria_item(
-            source="monitor", video_id=video.video_id, youtube_url=url,
-            disposition="cobertura", reasons=[message],
-            artifact_dir=str(artifact_store.root_dir), extra={"coverage_issue": issue},
-            dedupe_key=str(issue.get("code")) + ":" + str(issue.get("numero_processo", ""))
-            + ":" + str(issue.get("start_seconds", issue.get("row_index", issue.get("bundle_index", "")))),
-        ))
-    if items:
-        vistoria_queue.append_items(items)
+    rows = read_json(artifact_store.root_dir / "04h_publish_preview_rows.json", [])
+    return vistoria_queue.sync_monitor_issues(
+        report.get("issues", []), video_id=video.video_id, youtube_url=video.url,
+        artifact_dir=str(artifact_store.root_dir), rows=rows,
+        data_sessao=str(report.get("evidence", {}).get("official_session_date") or ""))
 
 
 def _build_rito_count_check(artifact_store: RunArtifacts, rows: list[Any]) -> dict[str, Any] | None:
@@ -1213,7 +1229,8 @@ def _process_video_batch(
 
 
 def _verify_after_post_publish(summaries, notion_client, notion_schema, output_queue, monitor=None):
-    """Read-only final gate: later scripts must not invalidate checked judgments."""
+    """Restore proven session facts and verify all final judgment properties."""
+    from tse_publication_repair import repair_confirmed_notion_fields
     fields = {"numero_processo", "data_sessao", "youtube_link", "classe_processo", "origem",
               "relator", "resultado", "votacao", "composicao", "pedido_vista", "eleicao"}
     final = []
@@ -1231,14 +1248,27 @@ def _verify_after_post_publish(summaries, notion_client, notion_schema, output_q
                 raise ValueError("Previa exata da publicacao indisponivel para releitura final")
             rows = [PublishPreviewRow.model_validate(row) for row in raw]
             results = summary.get("publish_results") or []
+            repairs = repair_confirmed_notion_fields(
+                rows, results, notion_client, notion_schema,
+                read_json(store.root_dir / "04i_automatic_reconciliation.json", {}),
+                checkpoint=lambda data: atomic_json(store.root_dir / "05e_automatic_post_repair.json", data))
+            store.write_json("05e_automatic_post_repair.json", repairs)
             checks = verify_notion_rows(
                 rows, results, notion_client, notion_schema, fields=fields,
                 checkpoint=lambda data: atomic_json(store.root_dir / "05c_final_notion_verification.json", data))
             store.write_json("05c_final_notion_verification.json", checks)
+            vistoria_queue.reconcile_published_items(
+                rows, results, checks, video_id=summary["video_id"],
+                reconciliation=read_json(store.root_dir / "04i_automatic_reconciliation.json", {}))
             official = read_json(store.root_dir / OFFICIAL_INVENTORY_FILENAME,
                                  {"status": "unavailable", "error": "Snapshot oficial nao encontrado na conferencia final."})
             comparison = compare_official_rows(official, raw)
             store.write_json("05d_final_official_comparison.json", comparison)
+            # Esta leitura substitui os alertas transitórios da conferência
+            # anterior; lacunas da extração/publicação continuam no relatório.
+            report["issues"] = [issue for issue in report["issues"]
+                                if issue.get("code") not in {"notion_unverified", "notion_final_unverified"}
+                                and not str(issue.get("code", "")).startswith("official_")]
             expected = sum(result.get("status") in {"created", "updated"} for result in results)
             failed = [check for check in checks if check.get("status") != "verified"]
             final.append({"video_id": summary["video_id"], "expected": expected,
@@ -1260,6 +1290,10 @@ def _verify_after_post_publish(summaries, notion_client, notion_schema, output_q
             report["status"] = "pending"
             if summary.get("status") not in {"error", "stopped"}:
                 summary["status"] = "pending"
+        else:
+            report["status"] = "verified"
+            if summary.get("status") == "pending":
+                summary["status"] = "done"
         report.setdefault("counts", {})["issues"] = len(report["issues"])
         summary["coverage"] = report
         if summary.get("artifact_dir"):
@@ -1272,6 +1306,8 @@ def _verify_after_post_publish(summaries, notion_client, notion_schema, output_q
             monitor.event(summary["video_id"], "Conferencia final apos tratamentos", status=summary.get("status", "pending"), coverage=report)
         if report["issues"]:
             output_queue.put(("status", summary["video_id"], "Pendencias", "Conferencia final exige revisao; consulte o monitor."))
+        elif summary.get("status") == "done":
+            output_queue.put(("status", summary["video_id"], "Concluido", "Páginas conferidas após os tratamentos finais."))
     return final
 
 
@@ -1347,12 +1383,12 @@ class BatchGuiApp:
             "Limpar lista": "Esvazia a lista de vídeos desta rodada.",
             "▶  Processar lote": "Processa os vídeos listados com as opções marcadas. Acompanhe a saída e a Fila de vistoria.",
             "Parar antes de publicar": "Solicita parada segura antes da próxima publicação; confira os itens pendentes no registro.",
-            "✔  Aprovar e publicar": "Publica apenas o item revisado e aprovado na Fila de vistoria.",
+            "Publicar julgamento": "Publica a proposta revisada e confere a página gravada antes de encerrar o caso.",
             "Monitor": "Mostra o andamento e as pendências do lote em execução.",
             "Retomar artifacts": "Retoma uma rodada interrompida a partir dos artefatos salvos.",
-            "Descartar item": "Remove o item selecionado da fila de publicação desta rodada.",
-            "Restaurar item": "Devolve à fila um item descartado para nova revisão.",
-            "Abrir vídeo": "Abre o vídeo selecionado no navegador para conferir o conteúdo.",
+            "Descartar caso": "Encerra o caso e seus alertas sem publicar. A decisão pode ser restaurada pelo histórico.",
+            "Restaurar": "Devolve à fila um caso descartado ou resolvido para nova revisão.",
+            "Abrir trecho": "Abre o trecho do julgamento quando o momento já foi localizado.",
         })
         self.root.after(200, self._drain_output_queue)
         self.root.after(1000, self._refresh_live_progress)
@@ -1861,164 +1897,96 @@ class BatchGuiApp:
         process_tab.rowconfigure(4, weight=1, minsize=self._piso_log + 8)
         self._ajusta_scroll_aba()
 
-        # ================= ABA 2 — FILA DE VISTORIA =================
+        # ================= FILA DE VISTORIA =================
         vistoria_tab.columnconfigure(0, weight=1)
-        vistoria_tab.rowconfigure(2, weight=3)
         vistoria_tab.rowconfigure(3, weight=1)
-
         ttk.Label(
             vistoria_tab,
-            text="Julgamentos que o fluxo NÃO publicou e aguardam a sua decisão: selecione um item para ver os "
-            "motivos completos abaixo, depois aprove (publica no Notion) ou descarte.",
-            style="Muted.TLabel",
-            wraplength=1150,
-            justify=tk.LEFT,
+            text="Uma linha por caso. Selecione para comparar o vídeo com a sessão oficial e ver o próximo passo.",
+            style="Muted.TLabel", wraplength=1150,
         ).grid(row=0, column=0, sticky="w")
 
         vistoria_actions = ttk.Frame(vistoria_tab)
         vistoria_actions.grid(row=1, column=0, sticky="ew", pady=(8, 6))
-        self.vistoria_publish_button = tip(
-            ttk.Button(
-                vistoria_actions, text="✔  Aprovar e publicar", style="Accent.TButton",
-                command=self._approve_selected_vistoria,
-            ),
-            "Publica no Notion o(s) item(ns) selecionado(s): os erros que os bloquearam viram avisos "
-            "'Aprovado em vistoria'. Só funciona para itens que carregam a linha pronta (skipped/blocked do "
-            "lote); itens informativos (duplicatas, contagem do rito) não têm o que publicar.",
+        self.vistoria_publish_button = ttk.Button(
+            vistoria_actions, text="Publicar julgamento", style="Accent.TButton",
+            command=self._approve_selected_vistoria, state=tk.DISABLED,
         )
         self.vistoria_publish_button.pack(side=tk.LEFT)
-        tip(
-            ttk.Button(vistoria_actions, text="Descartar item", command=self._reject_selected_vistoria),
-            "Fecha o(s) item(ns) selecionado(s) sem publicar (ex.: era mesmo um precedente citado, não um "
-            "julgamento). Para desfazer: escolha a visão '🗑 descartados' no filtro Situação, selecione o item "
-            "e clique em Restaurar item.",
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        tip(
-            ttk.Button(vistoria_actions, text="Restaurar item", command=self._restore_selected_vistoria),
-            "Devolve para a fila (pendente) um item descartado. Use com a visão '🗑 descartados' selecionada "
-            "no filtro Situação para localizar o item.",
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        tip(
-            ttk.Button(vistoria_actions, text="Abrir vídeo", command=self._open_selected_vistoria_video),
-            "Abre no navegador o vídeo da sessão de origem do item, já no trecho do julgamento quando houver "
-            "timestamp registrado.",
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        tip(
-            ttk.Button(vistoria_actions, text="Abrir artifacts", command=self._open_selected_vistoria_artifact),
-            "Abre no Explorer a pasta de artifacts do vídeo que gerou o item (extrações e transcrições usadas "
-            "como evidência).",
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        tip(
-            ttk.Button(vistoria_actions, text="Recarregar", command=self._reload_vistoria),
-            "Relê a fila de vistoria do disco — use após rodar um lote ou uma auditoria em paralelo.",
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        tip(
-            ttk.Label(vistoria_actions, text="Situação:"),
-            "Filtra a tabela por tipo de pendência.",
-        ).pack(side=tk.LEFT, padx=(24, 6))
-        self.vistoria_filter_var = tk.StringVar(value="Todas")
-        vistoria_filter = tip(
-            ttk.Combobox(
-                vistoria_actions, textvariable=self.vistoria_filter_var, state="readonly", width=22,
-                values=(
-                    "Todas", "⭐ prova local forte", "skipped", "blocked",
-                    "duplicata_numero", "faltante_dje", "contagem_rito", "🗑 descartados",
-                ),
-            ),
-            "Tipos de pendência (e a visão 🗑 descartados, que lista os itens já fechados para "
-            "conferência ou restauração):\n"
-            "• ⭐ prova local forte — o próprio vídeo comprova o julgamento (número citado em vários trechos "
-            "OU partes/advogados NOMEADOS no motivo), mas o item foi barrado por outra razão: FORTES candidatos "
-            "à aprovação (fundo verde, topo da lista);\n"
-            "• skipped — o fluxo descartou o item (ex.: possível precedente citado, densidade baixa);\n"
-            "• blocked — barrado por dados insuficientes/incoerentes (sem resultado, tema vazio, vista sem ministro);\n"
-            "• duplicata_numero — mesmo julgamento aparece com dois números divergentes na base;\n"
-            "• faltante_dje — consta do CSV oficial do DJE e é mencionado no vídeo, mas não tinha página;\n"
-            "• contagem_rito — a transcrição indica mais julgamentos apregoados do que linhas na base.",
+        self.vistoria_edit_button = ttk.Button(vistoria_actions, text="Corrigir dados", command=self._edit_selected_vistoria)
+        self.vistoria_edit_button.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(vistoria_actions, text="Descartar caso", command=self._reject_selected_vistoria).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(vistoria_actions, text="Restaurar", command=self._restore_selected_vistoria).pack(side=tk.LEFT, padx=(6, 0))
+        self.vistoria_video_button = ttk.Button(vistoria_actions, text="Abrir trecho", command=self._open_selected_vistoria_video)
+        self.vistoria_video_button.pack(side=tk.LEFT, padx=(18, 0))
+        self.vistoria_official_button = ttk.Button(vistoria_actions, text="Fonte oficial", command=self._open_selected_vistoria_official)
+        self.vistoria_official_button.pack(side=tk.LEFT, padx=(6, 0))
+        self.vistoria_notion_button = ttk.Button(vistoria_actions, text="Página no Notion", command=self._open_selected_vistoria_notion)
+        self.vistoria_notion_button.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(vistoria_actions, text="Pasta de evidências", command=self._open_selected_vistoria_artifact).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(vistoria_actions, text="Atualizar fila", command=self._reload_vistoria).pack(side=tk.RIGHT)
+
+        filters = ttk.Frame(vistoria_tab)
+        filters.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(filters, text="Mostrar:").pack(side=tk.LEFT, padx=(0, 6))
+        self.vistoria_filter_var = tk.StringVar(value="Precisa de decisão")
+        vistoria_filter = ttk.Combobox(
+            filters, textvariable=self.vistoria_filter_var, state="readonly", width=24,
+            values=("Precisa de decisão", "Todos os pendentes", "Só avisos", "Resolvidos e publicados", "Descartados"),
         )
         vistoria_filter.pack(side=tk.LEFT)
         vistoria_filter.bind("<<ComboboxSelected>>", lambda _e: self._reload_vistoria())
         self.vistoria_only_ts_var = tk.BooleanVar(value=False)
-        tip(
-            ttk.Checkbutton(
-                vistoria_actions, text="Só com ⏱", variable=self.vistoria_only_ts_var,
-                command=self._reload_vistoria,
-            ),
-            "Mostra apenas os itens cujo link do vídeo já tem o marcador de tempo (t=) apontando o momento do "
-            "apregoamento — os casos mais fáceis de validar visualmente. A lista sempre ordena esses primeiro.",
-        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Checkbutton(filters, text="Com trecho localizado", variable=self.vistoria_only_ts_var,
+                        command=self._reload_vistoria).pack(side=tk.LEFT, padx=(12, 0))
         self.vistoria_summary_var = tk.StringVar(value="")
-        tip(
-            ttk.Label(vistoria_actions, textvariable=self.vistoria_summary_var, style="Muted.TLabel"),
-            "Total de pendências e distribuição por situação (sem considerar o filtro).",
-        ).pack(side=tk.RIGHT)
+        ttk.Label(filters, textvariable=self.vistoria_summary_var, style="Muted.TLabel").pack(side=tk.RIGHT)
 
-        vistoria_table = ttk.Frame(vistoria_tab)
-        vistoria_table.grid(row=2, column=0, sticky="nsew")
+        panes = ttk.Panedwindow(vistoria_tab, orient=tk.VERTICAL)
+        panes.grid(row=3, column=0, sticky="nsew")
+        vistoria_table = ttk.Frame(panes)
+        panes.add(vistoria_table, weight=2)
         vistoria_table.columnconfigure(0, weight=1)
         vistoria_table.rowconfigure(0, weight=1)
-        vistoria_columns = ("data", "ts", "numero", "tema", "disp", "origem", "video")
-        self.vistoria_tree = tip(
-            ttk.Treeview(vistoria_table, columns=vistoria_columns, show="headings", height=12),
-            "Um item por julgamento candidato, ordenado com os que têm marcador de tempo (⏱) primeiro. Cores: "
-            "âmbar = skipped (descartado pelo fluxo), vermelho = blocked (dados insuficientes), azul = "
-            "informativo (duplicata/contagem). ⏱ = momento do apregoamento no vídeo (facilita a validação "
-            "visual); Processo = nº CNJ quando conhecido; Fonte = quem detectou (batch, auditoria, dje, rito). "
-            "Clique numa linha para ver os motivos completos no painel abaixo.",
+        self.vistoria_tree = ttk.Treeview(
+            vistoria_table, columns=("data", "numero", "caso", "problema", "alertas"),
+            show="headings", height=7,
         )
         self.vistoria_tree.grid(row=0, column=0, sticky="nsew")
-        self.vistoria_tree.heading("data", text="Sessão")
-        self.vistoria_tree.heading("ts", text="⏱")
-        self.vistoria_tree.heading("numero", text="Processo")
-        self.vistoria_tree.heading("tema", text="Tema")
-        self.vistoria_tree.heading("disp", text="Situação")
-        self.vistoria_tree.heading("origem", text="Fonte")
-        self.vistoria_tree.heading("video", text="Vídeo")
-        # stretch=False em todas: coluna elástica "rouba" de volta o espaço quando a
-        # janela redesenha, desfazendo o redimensionamento manual do usuário.
-        self.vistoria_tree.column("data", width=95, stretch=False)
-        self.vistoria_tree.column("ts", width=75, stretch=False, anchor=tk.CENTER)
-        self.vistoria_tree.column("numero", width=205, stretch=False)
-        self.vistoria_tree.column("tema", width=520, stretch=False)
-        self.vistoria_tree.column("disp", width=125, stretch=False)
-        self.vistoria_tree.column("origem", width=80, stretch=False)
-        self.vistoria_tree.column("video", width=110, stretch=False)
-        vistoria_scroll = ttk.Scrollbar(vistoria_table, orient=tk.VERTICAL, command=self.vistoria_tree.yview)
-        vistoria_scroll.grid(row=0, column=1, sticky="ns")
-        vistoria_xscroll = ttk.Scrollbar(vistoria_table, orient=tk.HORIZONTAL, command=self.vistoria_tree.xview)
-        vistoria_xscroll.grid(row=1, column=0, sticky="ew")
-        self.vistoria_tree.configure(yscrollcommand=vistoria_scroll.set, xscrollcommand=vistoria_xscroll.set)
+        for column, title, width in (("data", "Sessão", 95), ("numero", "Processo", 210),
+                                     ("caso", "Classe e origem", 245), ("problema", "O que falta resolver", 320),
+                                     ("alertas", "Alertas", 65)):
+            self.vistoria_tree.heading(column, text=title)
+            self.vistoria_tree.column(column, width=width, minwidth=60, stretch=column in {"caso", "problema"})
+        self.vistoria_tree.column("alertas", anchor=tk.CENTER)
+        scrollbar = ttk.Scrollbar(vistoria_table, orient=tk.VERTICAL, command=self.vistoria_tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        xscroll = ttk.Scrollbar(vistoria_table, orient=tk.HORIZONTAL, command=self.vistoria_tree.xview)
+        xscroll.grid(row=1, column=0, sticky="ew")
+        self.vistoria_tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=xscroll.set)
         self.vistoria_tree.bind("<<TreeviewSelect>>", self._show_vistoria_details)
         self.vistoria_tree.bind("<Button-3>", self._vistoria_context_menu)
         self.vistoria_tree.bind("<Control-c>", lambda _e: self._copy_tree_selection(self.vistoria_tree))
         self.vistoria_tree.bind("<Control-a>", lambda _e: self._select_all_tree(self.vistoria_tree))
-        self.vistoria_tree.tag_configure("skipped", foreground="#7a4a00")
-        self.vistoria_tree.tag_configure("blocked", foreground="#8a1f1f")
-        self.vistoria_tree.tag_configure("info", foreground="#1f3a5f")
-        self.vistoria_tree.tag_configure("strong", background="#e6f4e6", foreground="#1b5e20")
+        self.vistoria_tree.tag_configure("decision", foreground="#8a1f1f")
+        self.vistoria_tree.tag_configure("notice", foreground="#42546a")
+        self.vistoria_tree.tag_configure("closed", foreground="#296345")
 
-        details_frame = ttk.LabelFrame(vistoria_tab, text="Detalhes do item selecionado", padding=8)
-        details_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        details_frame = ttk.LabelFrame(panes, text="Evidências e próximo passo", padding=8)
+        panes.add(details_frame, weight=3)
         details_frame.columnconfigure(0, weight=1)
         details_frame.rowconfigure(0, weight=1)
-        self.vistoria_details = tip(
-            tk.Text(
-                details_frame, wrap=tk.WORD, height=6, font=("Segoe UI", 9), relief=tk.FLAT,
-                background="#fbf8f2",
-            ),
-            "Detalhes do item selecionado na tabela: processo, sessão, motivos completos do descarte/bloqueio, "
-            "ementa oficial do DJE (quando houver) e o caminho da pasta de artifacts. O texto é selecionável: "
-            "arraste o mouse e copie com Ctrl+C.",
+        self.vistoria_details = tk.Text(
+            details_frame, wrap=tk.WORD, height=15, font=("Segoe UI", 10), relief=tk.FLAT,
+            background="#fbf8f2", padx=10, pady=8,
         )
         self.vistoria_details.grid(row=0, column=0, sticky="nsew")
-        # Somente leitura SEM state=DISABLED: o usuário seleciona e copia livremente,
-        # mas qualquer tecla de edição é bloqueada.
+        self.vistoria_details.tag_configure("section", font=("Segoe UI", 10, "bold"), foreground="#234461", spacing1=8)
         self.vistoria_details.bind("<Key>", self._readonly_text_key)
         self.vistoria_details.bind("<Button-3>", self._details_context_menu)
         details_scroll = ttk.Scrollbar(details_frame, orient=tk.VERTICAL, command=self.vistoria_details.yview)
         details_scroll.grid(row=0, column=1, sticky="ns")
         self.vistoria_details.configure(yscrollcommand=details_scroll.set)
-
         self.vistoria_items: dict[str, dict[str, Any]] = {}
         self._reload_vistoria()
 
@@ -2520,82 +2488,46 @@ class BatchGuiApp:
 
     def _reload_vistoria(self) -> None:
         try:
-            items = vistoria_queue.load_items("pending")
+            pending = vistoria_presenter.group_review_items(vistoria_queue.load_items("pending"))
+            all_items = vistoria_queue.load_items(None)
         except Exception as exc:
             self._append_output(f"Falha ao carregar a fila de vistoria: {exc}\n")
             return
-        total = len(items)
-        counts = Counter(item.get("disposition", "?") for item in items)
-        with_ts_total = sum(1 for item in items if item_timestamp_seconds(item) is not None)
-        strong_total = sum(1 for item in items if item_has_strong_evidence(item))
-        selected_filter = self.vistoria_filter_var.get() if hasattr(self, "vistoria_filter_var") else "Todas"
-        showing_rejected = selected_filter.startswith("🗑")
-        if showing_rejected:
-            try:
-                items = vistoria_queue.load_items("rejected")
-            except Exception as exc:
-                self._append_output(f"Falha ao carregar descartados: {exc}\n")
-                return
-        elif selected_filter.startswith("⭐"):
-            items = [item for item in items if item_has_strong_evidence(item)]
-        elif selected_filter != "Todas":
-            items = [item for item in items if item.get("disposition") == selected_filter]
-        if getattr(self, "vistoria_only_ts_var", None) and self.vistoria_only_ts_var.get():
-            items = [item for item in items if item_timestamp_seconds(item) is not None]
-
+        decisions = [item for item in pending if not vistoria_presenter.is_notice(item)]
+        notices = [item for item in pending if vistoria_presenter.is_notice(item)]
+        selected_filter = self.vistoria_filter_var.get()
+        if selected_filter == "Resolvidos e publicados":
+            items = vistoria_presenter.group_review_items([i for i in all_items if i.get("status") in {"resolved", "published"}])
+        elif selected_filter == "Descartados":
+            items = vistoria_presenter.group_review_items([i for i in all_items if i.get("status") == "rejected"])
+        elif selected_filter == "Só avisos":
+            items = notices
+        elif selected_filter == "Todos os pendentes":
+            items = pending
+        else:
+            items = decisions
+        if self.vistoria_only_ts_var.get():
+            items = [item for item in items if vistoria_presenter.timestamp_seconds(item) is not None]
+        previous = self.vistoria_tree.selection()
         self.vistoria_items = {str(item["id"]): item for item in items}
         self.vistoria_tree.delete(*self.vistoria_tree.get_children())
-        # Prioridade: ⭐ prova local forte no topo, depois quem tem marcador de tempo;
-        # dentro de cada grupo, sessão mais RECENTE primeiro (sorts estáveis).
-        ordered = sorted(items, key=lambda x: (x.get("data_sessao") or "", x.get("id", "")), reverse=True)
-        ordered = sorted(
-            ordered,
-            key=lambda x: (
-                0 if item_has_strong_evidence(x) else 1,
-                0 if item_timestamp_seconds(x) is not None else 1,
-            ),
+        for item in items:
+            tag = "closed" if item.get("status") != "pending" else ("notice" if vistoria_presenter.is_notice(item) else "decision")
+            self.vistoria_tree.insert("", tk.END, iid=str(item["id"]), tags=(tag,), values=(
+                item.get("data_sessao", ""), vistoria_presenter.process_number(item) or "A localizar",
+                vistoria_presenter.case_title(item), vistoria_presenter.problem_label(item), item.get("alert_count", 1),
+            ))
+        self.vistoria_summary_var.set(
+            f"{len(decisions)} caso(s) precisam de decisão · {len(notices)} aviso(s) · {len(items)} exibido(s)"
         )
-
-        for item in ordered:
-            row = item.get("row") or {}
-            dje = (item.get("extra") or {}).get("dje") or {}
-            numero = vistoria_item_numero_display(item)
-            tema = (
-                row.get("tema") or dje.get("ementa") or item.get("tema_hint")
-                or "; ".join(item.get("reasons") or [])
-            )
-            disposition = item.get("disposition", "")
-            strong = item_has_strong_evidence(item)
-            tag = "strong" if strong else (disposition if disposition in ("skipped", "blocked") else "info")
-            timestamp = item_timestamp_seconds(item)
-            self.vistoria_tree.insert(
-                "",
-                tk.END,
-                iid=str(item["id"]),
-                tags=(tag,),
-                values=(
-                    item.get("data_sessao", ""),
-                    format_elapsed(timestamp) if timestamp is not None else "—",
-                    numero,
-                    ("⭐ " if strong else "") + str(tema)[:120],
-                    disposition,
-                    item.get("source", ""),
-                    item.get("video_id", ""),
-                ),
-            )
-        resumo = "  |  ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
-        if showing_rejected:
-            self.vistoria_summary_var.set(
-                f"exibindo {len(items)} descartado(s) — selecione e use 'Restaurar item'   |   pendentes: {total}"
-            )
-        else:
-            self.vistoria_summary_var.set(
-                f"{total} pendente(s)  (⭐ {strong_total} | ⏱ {with_ts_total})   {resumo}"
-                if total
-                else "Fila vazia — nada aguardando revisão."
-            )
-        self.notebook.tab(self.vistoria_tab_index, text=f"  5 · Fila de vistoria ({total})  ")
-        self.vistoria_hint_var.set(f"⚠ {total} pendência(s) aguardam sua decisão — clique aqui" if total else "")
+        self.notebook.tab(self.vistoria_tab_index, text=f"  5 · Fila de vistoria ({len(decisions)})  ")
+        self.vistoria_hint_var.set(f"{len(decisions)} caso(s) precisam de revisão — clique aqui" if decisions else "")
+        selection = next((iid for iid in previous if iid in self.vistoria_items), next(iter(self.vistoria_items), ""))
+        if selection:
+            self.vistoria_tree.selection_set(selection)
+            self.vistoria_tree.focus(selection)
+            self.vistoria_tree.see(selection)
+        self._show_vistoria_details()
 
     def _readonly_text_key(self, event):
         """Permite navegação e cópia no Text, bloqueando qualquer edição."""
@@ -2654,8 +2586,8 @@ class BatchGuiApp:
         item = self.vistoria_items.get(row_id) or {}
         row = item.get("row") or {}
         dje = (item.get("extra") or {}).get("dje") or {}
-        numero = str(row.get("numero_processo") or dje.get("numeroUnico") or item.get("numero_hint") or "")
-        link = item_video_link(item)
+        numero = vistoria_presenter.process_number(item)
+        link = vistoria_presenter.video_url(item)
         menu = tk.Menu(self.vistoria_tree, tearoff=0)
         if cell and cell != "—":
             menu.add_command(label=f'Copiar "{cell[:60]}"', command=lambda v=cell: self._copy_clip(v))
@@ -2723,27 +2655,107 @@ class BatchGuiApp:
     def _show_vistoria_details(self, _event=None) -> None:
         selected = self._selected_vistoria_items()
         self.vistoria_details.delete("1.0", tk.END)
-        if selected:
-            item = selected[0]
-            row = item.get("row") or {}
-            dje = (item.get("extra") or {}).get("dje") or {}
-            lines = [
-                f"Processo: {vistoria_item_numero_display(item) or '(sem número)'}    "
-                f"Sessão: {item.get('data_sessao') or '?'}    Situação: {item.get('disposition')}    "
-                f"Fonte: {item.get('source')}",
-            ]
-            if row.get("tema") or item.get("tema_hint"):
-                lines.append(f"Tema: {row.get('tema') or item.get('tema_hint')}")
-            if dje.get("ementa"):
-                lines.append(f"Ementa (DJE): {dje['ementa']}")
-            lines.append("")
-            lines.append("Motivos:")
-            for reason in item.get("reasons") or ["(sem motivo registrado)"]:
-                lines.append(f"  • {reason}")
-            if item.get("artifact_dir"):
-                lines.append("")
-                lines.append(f"Artifacts: {item['artifact_dir']}")
-            self.vistoria_details.insert("1.0", "\n".join(lines))
+        eligible = [item for item in selected if item.get("status") == "pending" and vistoria_queue.approval_eligibility(item)[0]]
+        self.vistoria_publish_button.configure(state=tk.NORMAL if eligible else tk.DISABLED)
+        item = selected[0] if selected else {}
+        self.vistoria_edit_button.configure(state=tk.NORMAL if len(selected) == 1 and item.get("status") == "pending" and item.get("row") else tk.DISABLED)
+        self.vistoria_video_button.configure(state=tk.NORMAL if vistoria_presenter.video_url(item) else tk.DISABLED)
+        self.vistoria_official_button.configure(state=tk.NORMAL if item.get("official_url") else tk.DISABLED)
+        page_id = item.get("published_page_id") or (item.get("row") or {}).get("page_id")
+        self.vistoria_notion_button.configure(state=tk.NORMAL if page_id else tk.DISABLED)
+        if not selected:
+            self.vistoria_details.insert("1.0", "Nenhum caso nesta visualização. Use o filtro para consultar avisos e o histórico de correções.")
+            return
+        allowed, reason = vistoria_queue.approval_eligibility(item)
+        text = vistoria_presenter.detail_text(item, "" if allowed else reason)
+        if len(selected) > 1:
+            text = f"{len(selected)} casos selecionados. Evidências do primeiro caso:\n\n" + text
+        self.vistoria_details.insert("1.0", text)
+        for index, line in enumerate(text.splitlines(), 1):
+            if line.isupper():
+                self.vistoria_details.tag_add("section", f"{index}.0", f"{index}.end")
+
+    def _edit_selected_vistoria(self) -> None:
+        selected = self._selected_vistoria_items()
+        if len(selected) != 1 or selected[0].get("status") != "pending" or not selected[0].get("row"):
+            messagebox.showinfo("Corrigir dados", "Selecione um caso pendente que tenha proposta de julgamento.")
+            return
+        item = selected[0]
+        row = item["row"]
+        window = tk.Toplevel(self.root)
+        window.title("Corrigir dados do julgamento")
+        window.geometry("1120x690")
+        window.minsize(850, 600)
+        window.transient(self.root)
+        window.columnconfigure(1, weight=1)
+        window.rowconfigure(1, weight=1)
+        ttk.Label(window, text="Edite a proposta usando as evidências ao lado. Salvar confere os dados e mantém o caso na fila.",
+                  wraplength=1050, padding=12).grid(row=0, column=0, columnspan=2, sticky="ew")
+        form = ttk.Frame(window, padding=(12, 0, 12, 10))
+        form.grid(row=1, column=0, sticky="nsew")
+        form.columnconfigure(0, weight=1)
+        controls = {}
+        for index, field in enumerate(EDITABLE_FIELDS):
+            ttk.Label(form, text=vistoria_presenter.FIELD_LABELS[field]).grid(row=index * 2, column=0, sticky="w", pady=(4, 0))
+            value = row.get(field) or ""
+            if field == "composicao":
+                editor = tk.Text(form, height=4, width=40, wrap=tk.WORD, font=("Segoe UI", 9))
+                editor.insert("1.0", "; ".join(value) if isinstance(value, list) else value)
+            else:
+                editor = ttk.Entry(form, width=45)
+                editor.insert(0, str(value))
+            editor.grid(row=index * 2 + 1, column=0, sticky="ew")
+            controls[field] = editor
+        ttk.Label(form, text="Composição: separe os nomes com ponto e vírgula.", wraplength=330,
+                  style="Muted.TLabel").grid(row=len(EDITABLE_FIELDS) * 2, column=0, sticky="w", pady=(4, 0))
+        evidence_frame = ttk.LabelFrame(window, text="Evidências registradas", padding=8)
+        evidence_frame.grid(row=1, column=1, sticky="nsew", padx=(0, 12))
+        evidence_frame.columnconfigure(0, weight=1)
+        evidence_frame.rowconfigure(0, weight=1)
+        evidence_text = tk.Text(evidence_frame, wrap=tk.WORD, font=("Segoe UI", 10), width=60)
+        evidence_text.grid(row=0, column=0, sticky="nsew")
+        allowed, explanation = vistoria_queue.approval_eligibility(item)
+        evidence_text.insert("1.0", vistoria_presenter.detail_text(item, "" if allowed else explanation))
+        evidence_text.bind("<Key>", self._readonly_text_key)
+        scrollbar = ttk.Scrollbar(evidence_frame, orient=tk.VERTICAL, command=evidence_text.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        evidence_text.configure(yscrollcommand=scrollbar.set)
+        actions = ttk.Frame(window, padding=12)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew")
+
+        def save() -> None:
+            edits = {field: ([v.strip() for v in control.get("1.0", tk.END).replace("\n", ";").split(";") if v.strip()]
+                             if field == "composicao" else control.get()) for field, control in controls.items()}
+            try:
+                patch = prepare_edited_item(item, edits)
+                vistoria_queue.update_status(item.get("member_ids") or [item["id"]], "pending", extra=patch)
+            except Exception as exc:
+                messagebox.showerror("Não foi possível salvar", str(exc), parent=window)
+                return
+            window.destroy()
+            self._reload_vistoria()
+            errors = patch["row"].get("errors") or []
+            if errors:
+                messagebox.showinfo("Proposta salva", "Os dados foram salvos. Ainda há pontos para corrigir:\n\n" + "\n".join(errors), parent=self.root)
+            else:
+                messagebox.showinfo("Proposta salva", "Dados salvos e conferidos com as evidências disponíveis. Revise a proposta no painel e use Publicar julgamento quando estiver confirmada.", parent=self.root)
+
+        ttk.Button(actions, text="Salvar correção", style="Accent.TButton", command=save).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Cancelar", command=window.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+        controls["numero_processo"].focus_set()
+
+    def _open_selected_vistoria_official(self) -> None:
+        for item in self._selected_vistoria_items():
+            if item.get("official_url"):
+                webbrowser.open(item["official_url"])
+                return
+
+    def _open_selected_vistoria_notion(self) -> None:
+        for item in self._selected_vistoria_items():
+            page_id = item.get("published_page_id") or (item.get("row") or {}).get("page_id")
+            if page_id:
+                webbrowser.open("https://www.notion.so/" + str(page_id).replace("-", ""))
+                return
 
     def _open_selected_vistoria_artifact(self) -> None:
         for item in self._selected_vistoria_items():
@@ -2761,23 +2773,22 @@ class BatchGuiApp:
         if not selected:
             messagebox.showinfo("Fila de vistoria", "Selecione ao menos um item.")
             return
-        publishable = [
-            item for item in selected
-            if item.get("row")
-            or (item.get("disposition") in ("skipped", "blocked") and item.get("artifact_dir"))
-        ]
+        publishable = [item for item in selected if item.get("status") == "pending"
+                       and vistoria_queue.approval_eligibility(item)[0]]
         if not publishable:
             messagebox.showinfo(
                 "Fila de vistoria",
-                "Os itens selecionados são apenas informativos (duplicata de número / contagem do rito / "
-                "faltante DJE): não carregam julgamento publicável por aqui. Duplicatas e contagens se "
-                "resolvem corrigindo a base; faltantes DJE são importados pelo import_dje_faltantes.py. "
-                "Use 'Descartar item' para fechá-los quando tratados.",
+                "Nenhum dos casos selecionados tem uma proposta pronta para publicar. "
+                "O painel de evidências mostra o que falta em cada caso.",
             )
             return
         if not messagebox.askyesno(
             "Aprovar e publicar",
-            f"Publicar {len(publishable)} item(ns) aprovados no Notion?",
+            f"Publicar {len(publishable)} julgamento(s) conferidos no Notion?\n\n"
+            + "\n".join(vistoria_presenter.process_number(item) or vistoria_presenter.case_title(item)
+                        for item in publishable)
+            + (f"\n\n{len(selected) - len(publishable)} caso(s) sem proposta publicável serão mantidos na fila."
+               if len(selected) > len(publishable) else ""),
         ):
             return
         self.vistoria_publish_button.configure(state=tk.DISABLED)
@@ -2793,13 +2804,18 @@ class BatchGuiApp:
             )
             schema = client.fetch_schema()
             results = vistoria_queue.publish_approved_items(items, client, schema, apply=True)
-            published_ids = [
-                str(result.get("id"))
-                for result in results
-                if result.get("status") in {"created", "updated"}
-            ]
-            if published_ids:
-                vistoria_queue.update_status(published_ids, "published")
+            for result in results:
+                if result.get("status") not in {"created", "updated"}:
+                    continue
+                if (result.get("verification") or {}).get("status") != "verified":
+                    self.output_queue.put(("log", f"Publicação de {result.get('numero_processo', '')} aguarda confirmação pela releitura. Caso mantido na fila.\n"))
+                    continue
+                item_id = str(result["id"])
+                extra = {"published_page_id": result.get("page_id", ""), "triagem": "Publicação conferida por releitura do Notion."}
+                vistoria_queue.update_status([item_id], "published", extra=extra)
+                related = [str(value) for value in result.get("member_ids", []) if str(value) != item_id]
+                if related:
+                    vistoria_queue.update_status(related, "resolved", extra=extra)
             lines = [
                 f"  {result.get('numero_processo', result.get('id', ''))}: {result.get('status')}"
                 for result in results
@@ -2815,9 +2831,13 @@ class BatchGuiApp:
         if not selected:
             messagebox.showinfo("Fila de vistoria", "Selecione ao menos um item.")
             return
-        if not messagebox.askyesno("Descartar", f"Descartar {len(selected)} item(ns) da fila?"):
+        selected = [item for item in selected if item.get("status") == "pending"]
+        if not selected:
+            messagebox.showinfo("Fila de vistoria", "Somente casos pendentes podem ser descartados.")
             return
-        vistoria_queue.update_status([str(item["id"]) for item in selected], "rejected")
+        if not messagebox.askyesno("Descartar", f"Encerrar {len(selected)} caso(s) e seus alertas sem publicar?"):
+            return
+        vistoria_queue.update_status([str(i) for item in selected for i in item.get("member_ids", [item["id"]])], "rejected")
         self._reload_vistoria()
 
     def _restore_selected_vistoria(self) -> None:
@@ -2825,17 +2845,17 @@ class BatchGuiApp:
         if not selected:
             messagebox.showinfo(
                 "Restaurar item",
-                "Selecione o item a restaurar. Dica: escolha a visão '🗑 descartados' no filtro Situação "
+                "Selecione o item a restaurar. Escolha a visão 'Descartados' no filtro Mostrar "
                 "para listar os itens fechados.",
             )
             return
         already_pending = [item for item in selected if item.get("status") == "pending"]
-        to_restore = [item for item in selected if item.get("status") != "pending"]
+        to_restore = [item for item in selected if item.get("status") in {"rejected", "resolved"}]
         if not to_restore:
-            messagebox.showinfo("Restaurar item", "O(s) item(ns) selecionado(s) já estão pendentes na fila.")
+            messagebox.showinfo("Restaurar item", "Selecione um caso descartado ou resolvido. Publicações confirmadas permanecem no histórico.")
             return
         vistoria_queue.update_status(
-            [str(item["id"]) for item in to_restore], "pending", extra={"triagem": "restaurado pelo usuário"}
+            [str(i) for item in to_restore for i in item.get("member_ids", [item["id"]])], "pending", extra={"triagem": "restaurado pelo usuário"}
         )
         self._append_output(f"Restaurado(s) para a fila: {len(to_restore)} item(ns).\n")
         if already_pending:
@@ -2844,13 +2864,13 @@ class BatchGuiApp:
 
     def _open_selected_vistoria_video(self) -> None:
         for item in self._selected_vistoria_items():
-            url = item_video_link(item)
+            url = vistoria_presenter.video_url(item)
             if not url:
                 video_id = item.get("video_id") or ""
                 url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
             if not url:
                 continue
-            if item_timestamp_seconds(item) is None:
+            if vistoria_presenter.timestamp_seconds(item) is None:
                 discovered = self._discover_vistoria_timestamp(item)
                 if discovered is not None:
                     separator = "&" if "?" in url else "?"
@@ -2864,7 +2884,7 @@ class BatchGuiApp:
         artifact_dir = Path(item.get("artifact_dir") or "")
         row = item.get("row") or {}
         dje = (item.get("extra") or {}).get("dje") or {}
-        numero = str(row.get("numero_processo") or dje.get("numeroUnico") or "")
+        numero = vistoria_presenter.process_number(item)
         digits = re.sub(r"\D", "", numero)
         if not artifact_dir.exists() or len(digits) < 9:
             return None
