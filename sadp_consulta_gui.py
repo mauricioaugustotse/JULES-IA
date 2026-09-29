@@ -20,6 +20,7 @@ import threading
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
+from conle_gui_tema import aplicar_estilo, cabecalho, dicas_por_texto, dica
 
 import sadp_lookup as sadp
 
@@ -215,7 +216,17 @@ class SadpConsultaApp:
         root.minsize(880, 480)
         # handle do lote de partes/advogados, lido pela trava de fechamento
         self._thr_detalhes: "threading.Thread | None" = None
+        cabecalho(root, "Consulta SADP", "Encontre todos os processos correspondentes ao número e confira origem, partes e publicações.")
         self._build_ui()
+        dicas_por_texto(root, {
+            "Buscar": "Consulta o SADP pelo número digitado. Local e ano servem para destacar o resultado mais provável.",
+            "Abrir no SADP": "Abre no navegador o processo selecionado na consulta oficial.",
+            "Copiar CNJ": "Copia o número CNJ do processo selecionado.",
+            "Copiar linha": "Copia os dados resumidos da linha selecionada.",
+            "Copiar link": "Copia o endereço oficial do processo selecionado.",
+            "Abrir consulta DJe": "Abre a consulta do Diário da Justiça Eletrônico no navegador.",
+            "Localizar no DJe…": "Procura publicações do processo selecionado no DJe.",
+        })
         # depois do _build_ui: a janela e dimensionada pelo que os widgets pedem
         _abrir_centralizado(root, 1180, 680)
         root.protocol("WM_DELETE_WINDOW", self._ao_fechar)
@@ -228,15 +239,18 @@ class SadpConsultaApp:
         self.var_num = tk.StringVar()
         e_num = ttk.Entry(topo, textvariable=self.var_num, width=18)
         e_num.grid(row=0, column=1, padx=(4, 14))
+        dica(e_num, "Digite o número curto do processo ou o CNJ completo. A busca pode retornar casos de origens diferentes.")
         e_num.focus_set()
         ttk.Label(topo, text="Local (município/UF):").grid(row=0, column=2, sticky="w")
         self.var_local = tk.StringVar()
         e_local = ttk.Entry(topo, textvariable=self.var_local, width=26)
         e_local.grid(row=0, column=3, padx=(4, 14))
+        dica(e_local, "Município e UF do caso, se conhecidos. Ajuda a destacar o processo correto entre resultados parecidos; não restringe a busca.")
         ttk.Label(topo, text="Ano:").grid(row=0, column=4, sticky="w")
         self.var_ano = tk.StringVar()
         e_ano = ttk.Entry(topo, textvariable=self.var_ano, width=7)
         e_ano.grid(row=0, column=5, padx=(4, 14))
+        dica(e_ano, "Ano do processo, se conhecido. Ajuda a destacar o resultado mais provável sem ocultar os demais.")
         self.btn_buscar = ttk.Button(topo, text="Buscar", command=self.buscar)
         self.btn_buscar.grid(row=0, column=6)
         ttk.Label(
@@ -257,6 +271,7 @@ class SadpConsultaApp:
         self.var_filtro = tk.StringVar()
         e_filtro = ttk.Entry(filtro, textvariable=self.var_filtro)
         e_filtro.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        dica(e_filtro, "Realça termos na lista já carregada, sem repetir a consulta ao SADP.")
         e_filtro.bind("<KeyRelease>", self._on_filtro)
 
         paned = ttk.PanedWindow(self.root, orient="vertical")
@@ -284,6 +299,7 @@ class SadpConsultaApp:
         hsb = ttk.Scrollbar(tree_wrap, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
+        dica(self.tree, "Selecione uma linha para ver partes, advogados e publicações. O realce verde indica apenas o melhor palpite; confira o processo antes de copiar ou abrir.")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
         tree_wrap.rowconfigure(0, weight=1)
@@ -713,7 +729,7 @@ class SadpConsultaApp:
             row=st["row"], column=0, columnspan=3, sticky="w", pady=(0, 10))
         st["row"] += 1
 
-        def campo(rotulo: str, valor: str, dica: str = "", copiavel: bool = True) -> None:
+        def campo(rotulo: str, valor: str, ajuda_campo: str = "", copiavel: bool = True) -> None:
             row = st["row"]
             ttk.Label(frm, text=rotulo + ":", font=("Segoe UI", 9, "bold")).grid(
                 row=row, column=0, sticky="nw", padx=(0, 8), pady=3)
@@ -725,31 +741,33 @@ class SadpConsultaApp:
                 ent.insert(0, valor or "—")
                 ent.configure(state="readonly")
                 ent.grid(row=row, column=1, sticky="ew", pady=3)
+                dica(ent, f"Valor de {rotulo.lower()} para localizar a publicação na consulta oficial. Clique em Copiar para usá-lo no site.")
                 btn = ttk.Button(frm, text="Copiar", width=8,
                                  command=lambda: self._copiar_valor(valor, status, rotulo))
                 btn.grid(row=row, column=2, padx=(6, 0), pady=3)
+                dica(btn, f"Copia o valor de {rotulo.lower()} para a área de transferência.")
                 if not valor:
                     btn.configure(state="disabled")
             else:
                 ttk.Label(frm, text=valor).grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
             st["row"] += 1
-            if dica:
-                ttk.Label(frm, text=dica, foreground="#888").grid(
+            if ajuda_campo:
+                ttk.Label(frm, text=ajuda_campo, foreground="#888").grid(
                     row=st["row"], column=1, columnspan=2, sticky="w")
                 st["row"] += 1
 
         campo("Tribunal", "Tribunal Superior Eleitoral", copiavel=False)
         campo("Nº de edição", edicao)
         campo("Ano", ano)
-        campo("Termo de busca", cnj, dica="alternativa à edição — pode não casar no texto")
+        campo("Termo de busca", cnj, ajuda_campo="alternativa à edição — pode não casar no texto")
         dica_ref = ("para anotação; a publicação está na página " + pagina + " da edição") if pagina else "para anotação"
-        campo("Referência", ref_anotacao, dica=dica_ref)
+        campo("Referência", ref_anotacao, ajuda_campo=dica_ref)
 
         barra = ttk.Frame(frm)
         barra.grid(row=st["row"], column=0, columnspan=3, sticky="ew", pady=(12, 0))
-        ttk.Button(barra, text="Abrir consulta DJe (TSE)",
-                   command=lambda: webbrowser.open(sadp.DJE_CONSULTA_URL + "?trib=tse")).pack(side="left")
-        ttk.Button(barra, text="Fechar", command=win.destroy).pack(side="right")
+        dica(ttk.Button(barra, text="Abrir consulta DJe (TSE)",
+                   command=lambda: webbrowser.open(sadp.DJE_CONSULTA_URL + "?trib=tse")), "Abre a consulta oficial do DJe. Cole os dados acima e resolva o captcha para localizar a publicação.").pack(side="left")
+        dica(ttk.Button(barra, text="Fechar", command=win.destroy), "Fecha esta ajuda sem alterar os resultados da busca.").pack(side="right")
         st["row"] += 1
         ttk.Label(frm, textvariable=status, foreground="#1a7a1a").grid(
             row=st["row"], column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -801,10 +819,7 @@ class SadpConsultaApp:
 
 def main() -> None:
     root = tk.Tk()
-    try:
-        ttk.Style().theme_use("vista")  # tema nativo do Windows quando disponível
-    except tk.TclError:
-        pass
+    aplicar_estilo(root)
     SadpConsultaApp(root)
     root.mainloop()
 

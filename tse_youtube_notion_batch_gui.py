@@ -17,6 +17,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from conle_gui_tema import centralizar_janela
 import tkinter as tk
 from typing import Any, Callable
 
@@ -397,7 +398,7 @@ class Tooltip:
 
 def tip(widget, text: str):
     """Anexa um tooltip e devolve o próprio widget (uso inline na construção da UI)."""
-    Tooltip(widget, text)
+    widget._conle_tooltip = Tooltip(widget, text)
     return widget
 
 
@@ -1278,12 +1279,8 @@ class BatchGuiApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("TSE YouTube → Notion — lote de vídeos")
-        # cabe na tela (inclusive com escala do Windows) e abre encostada no topo,
-        # senão o rodapé (progresso + aviso de vistoria) nasce atrás da barra de tarefas
-        larg = min(1280, self.root.winfo_screenwidth() - 40)
-        alt = min(840, self.root.winfo_screenheight() - 110)
-        x = max((self.root.winfo_screenwidth() - larg) // 2, 0)
-        self.root.geometry(f"{larg}x{alt}+{x}+8")
+        # A área útil exclui a barra de tarefas mesmo com vários monitores.
+        centralizar_janela(self.root, 1280, 840)
         self.root.minsize(1000, 640)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1342,6 +1339,21 @@ class BatchGuiApp:
         self.progress_text_var = tk.StringVar(value=self.idle_status_text)
 
         self._build_ui()
+        from conle_gui_tema import dicas_por_texto
+        dicas_por_texto(self.root, {
+            "Adicionar link": "Inclui um vídeo do TSE na lista desta rodada após conferir o endereço.",
+            "Colar da área": "Lê links de vídeo copiados para a área de transferência e os inclui na lista.",
+            "Remover selecionado": "Retira da lista o vídeo selecionado, sem apagar artefatos de rodadas anteriores.",
+            "Limpar lista": "Esvazia a lista de vídeos desta rodada.",
+            "▶  Processar lote": "Processa os vídeos listados com as opções marcadas. Acompanhe a saída e a Fila de vistoria.",
+            "Parar antes de publicar": "Solicita parada segura antes da próxima publicação; confira os itens pendentes no registro.",
+            "✔  Aprovar e publicar": "Publica apenas o item revisado e aprovado na Fila de vistoria.",
+            "Monitor": "Mostra o andamento e as pendências do lote em execução.",
+            "Retomar artifacts": "Retoma uma rodada interrompida a partir dos artefatos salvos.",
+            "Descartar item": "Remove o item selecionado da fila de publicação desta rodada.",
+            "Restaurar item": "Devolve à fila um item descartado para nova revisão.",
+            "Abrir vídeo": "Abre o vídeo selecionado no navegador para conferir o conteúdo.",
+        })
         self.root.after(200, self._drain_output_queue)
         self.root.after(1000, self._refresh_live_progress)
 
@@ -1386,13 +1398,10 @@ class BatchGuiApp:
         self.root.destroy()
 
     def _build_ui(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("vista")
-        except tk.TclError:
-            pass
+        from conle_gui_tema import aplicar_estilo
+        style = aplicar_estilo(self.root)
         self.root.option_add("*Font", ("Segoe UI", 10))
-        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"), foreground="#1f3a5f")
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"), foreground="#2c4f22")
         style.configure("Treeview", rowheight=24, font=("Segoe UI", 9))
         style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
         style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"), padding=(14, 6))
@@ -1409,7 +1418,7 @@ class BatchGuiApp:
         header = ttk.Frame(main)
         header.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(header, text="TSE YouTube → Notion — lote de vídeos",
-                  font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
+                  style="Cab.TLabel").pack(side=tk.LEFT)
         notion_link = ttk.Label(
             header, text="abrir base no Notion ↗", foreground="#0b5cad", cursor="hand2",
             font=("Segoe UI", 9, "underline"),
@@ -1736,8 +1745,8 @@ class BatchGuiApp:
                                self.root.winfo_screenheight() - 110)
                 else:
                     alvo = self._altura_sem_avancado or self.root.winfo_height()
-                self.root.geometry(
-                    f"{self.root.winfo_width()}x{max(self.root.minsize()[1], alvo)}")
+                centralizar_janela(
+                    self.root, self.root.winfo_width(), max(self.root.minsize()[1], alvo))
                 self.root.update_idletasks()
             self._ajusta_scroll_aba()
 
