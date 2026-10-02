@@ -220,3 +220,94 @@ def test_pydantic_rows_are_preserved_as_models():
     assert isinstance(output[0], Row)
     assert source.numero_processo == "0600957-40"
     assert output[0].numero_processo == "0600957-40.2026.6.07.0000"
+
+
+def maceio_case():
+    source = row(numero_processo="0601652-32.2026.6.00.0000", numero_origem_video="0601652-32.2026.6.00.0000",
+                 classe_processo="PA", origem="Maceió/AL", relator="Min. Ricardo Villas Bôas Cueva", resultado="Procedente",
+                 analise_do_conteudo_juridico="O relator, Min. Ricardo Villas Bôas Cueva, deferiu o pedido. O precedente de Ricardo Villas Bôas Cueva foi citado.")
+    p = process("0601652-32.2026.6.02.0000", relator="NUNES MARQUES", siglaClasseJudicial="PA", origem="MACEIÓ - AL",
+                proclamacaoDecisao="O Tribunal, por unanimidade, deferiu o pedido.")
+    return source, p, evidence("PA 060165232", ["0601652-32"])
+
+
+def test_invalid_suffix_and_relator_repaired_only_with_independent_short_scan_class_and_origin():
+    source, p, proof = maceio_case()
+    output, audit = reconcile_session_rows([source], inventory(p), evidence=proof)
+    fixed = output[0]
+    assert (fixed["numero_processo"], fixed["relator"], fixed["resultado"]) == (p["numeroProcesso"], "Min. Nunes Marques", "Deferido")
+    assert "O relator, Min. Nunes Marques," in fixed["analise_do_conteudo_juridico"]
+    assert "O precedente de Ricardo Villas Bôas Cueva foi citado." in fixed["analise_do_conteudo_juridico"]
+    assert audit["matches"][0]["method"] == "invalid_cnj_suffix"
+    again, repeat = reconcile_session_rows(output, inventory(p), evidence=proof)
+    assert again == output
+    assert not repeat["corrections"]
+
+
+@pytest.mark.parametrize("failure", ["no_scan", "wrong_core", "full_scan", "wrong_date", "wrong_position", "wrong_class", "wrong_origin", "sparse_origin", "ambiguous"])
+def test_scan_fallback_refuses_missing_or_conflicting_independent_evidence(failure):
+    source, p, proof = maceio_case()
+    if failure == "no_scan":
+        proof = {}
+    elif failure == "wrong_core":
+        proof["session"]["judgments"][0]["mentioned_process_numbers"] = ["0601729-67"]
+    elif failure == "full_scan":
+        proof["session"]["judgments"][0]["mentioned_process_numbers"] = [source["numero_processo"]]
+    elif failure == "wrong_date":
+        proof["session"]["data_sessao"] = "2026-09-17"
+    elif failure == "wrong_position":
+        source["source_start_seconds"] += 1
+    elif failure == "wrong_class":
+        source["classe_processo"] = "RO"
+    elif failure == "wrong_origin":
+        source["origem"] = "Natal/RN"
+    elif failure == "sparse_origin":
+        p["origem"] = None
+    inv = inventory(p, p) if failure == "ambiguous" else inventory(p)
+    output, audit = reconcile_session_rows([source], inv, evidence=proof)
+    assert output == [source]
+    assert not audit["matches"]
+
+
+def institutional_case():
+    source = row(numero_processo="", numero_origem_video="", classe_processo="", relator="", partes=[], tipo_registro="Julgamento 1")
+    proof = evidence("Eleição de Corregedor-Geral Eleitoral")
+    proof["session"]["judgments"][0]["mentioned_process_numbers"] = []
+    proof["bundles"][0]["items"][0] = {"analise_do_conteudo_juridico": "O TSE realizou a eleição interna para o cargo de Corregedor-Geral Eleitoral."}
+    return source, proof
+
+
+def test_proven_internal_election_is_excluded_and_numbering_closed_with_audit():
+    source, proof = institutional_case()
+    judgment = row(tipo_registro="Julgamento 2", source_start_seconds=8000)
+    output, audit = reconcile_session_rows([source, judgment], inventory(process()), evidence=proof)
+    assert len(output) == 1
+    assert output[0]["tipo_registro"] == "Julgamento 1"
+    assert audit["counts"]["excluded_institutional"] == 1
+    assert audit["counts"]["excluded_citations"] == audit["counts"]["unresolved"] == 0
+    assert audit["exclusions"][0]["row"] == source
+    again, repeat = reconcile_session_rows(output, inventory(process()), evidence=proof)
+    assert again == output
+    assert not repeat["corrections"]
+
+
+@pytest.mark.parametrize("failure", ["class", "number", "mentions", "original_number", "no_original_text", "wrong_date", "wrong_position"])
+def test_internal_election_exclusion_preserves_possible_processes_and_requires_original_evidence(failure):
+    source, proof = institutional_case()
+    if failure == "class":
+        source["classe_processo"] = "PA"
+    elif failure == "number":
+        source["numero_processo"] = "0601130-04"
+    elif failure == "mentions":
+        proof["session"]["judgments"][0]["mentioned_process_numbers"] = ["0601130-04"]
+    elif failure == "original_number":
+        proof["bundles"][0]["items"][0]["numero_processo"] = "0601130-04"
+    elif failure == "no_original_text":
+        proof["bundles"][0]["items"][0]["analise_do_conteudo_juridico"] = "Pedido administrativo julgado."
+    elif failure == "wrong_date":
+        proof["session"]["data_sessao"] = "2026-09-17"
+    else:
+        source["source_start_seconds"] += 1
+    output, audit = reconcile_session_rows([source], inventory(process()), evidence=proof)
+    assert len(output) == 1
+    assert not audit["exclusions"]

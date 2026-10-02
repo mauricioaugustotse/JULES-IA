@@ -82,6 +82,11 @@ def reconcile_video(
             aliases = match.get("aliases", []) + [match.get("original_numero_processo"), match.get("numero_origem_video")]
             row_keys.update(process_key(alias) for alias in aliases if process_key(alias))
         for exclusion in phase.get("exclusions", []):
+            if (exclusion.get("code") == "institutional_act" and exclusion.get("evidence")
+                    and phase.get("status") == "complete"
+                    and phase.get("session_date") == (official or {}).get("session_date")):
+                information.append({**exclusion, "severity": "info", "message": exclusion.get("reason", "Ato institucional sem julgamento.")})
+                continue
             if (exclusion.get("code") != "cited_process_number"
                     or not exclusion.get("evidence")
                     or process_key(exclusion.get("parent_numero_processo")) not in row_keys):

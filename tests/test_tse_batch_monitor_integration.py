@@ -151,6 +151,31 @@ def test_title_enriched_date_is_used_for_fresh_official_query(tmp_path, monkeypa
     assert calls == [DAY]
 
 
+def test_empty_rows_fetch_exact_session_from_authoritative_video_title(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(gui, "fetch_youtube_title", lambda video: "Sessão Plenária - 1 de Outubro 2026")
+    monkeypatch.setattr(gui, "fetch_official_session", lambda day, store: calls.append(day) or {"status": "available", "expected_count": 0})
+    store = gui.RunArtifacts(tmp_path)
+    actual = gui._fetch_official_for_rows(store, [], "https://youtube.com/watch?v=QSHitmlkMNY")
+    assert actual["status"] == "available"
+    assert calls == ["2026-10-01"]
+    assert store.read_json("00_session_date_evidence.json")["source"] == "youtube_title"
+
+
+@pytest.mark.parametrize("title", ["", "Sessão Plenária", "Eleições 2026"])
+def test_empty_rows_without_title_date_cannot_invent_session(tmp_path, monkeypatch, title):
+    monkeypatch.setattr(gui, "fetch_youtube_title", lambda video: title)
+    monkeypatch.setattr(gui, "fetch_official_session", lambda *a: pytest.fail("Invented date"))
+    assert gui._fetch_official_for_rows(gui.RunArtifacts(tmp_path), [], "https://youtube.com/watch?v=QSHitmlkMNY")["status"] == "unavailable"
+
+
+def test_conflicting_row_dates_cannot_be_overridden_by_title_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(gui, "fetch_youtube_title", lambda *a: pytest.fail("Title overrides conflicting rows"))
+    monkeypatch.setattr(gui, "fetch_official_session", lambda *a: pytest.fail("Invented date"))
+    rows = [preview(), preview(data_sessao="2026-10-01")]
+    assert gui._fetch_official_for_rows(gui.RunArtifacts(tmp_path), rows, "https://youtube.com/watch?v=QSHitmlkMNY")["status"] == "unavailable"
+
+
 def test_chapter_absence_is_informational_only_with_available_official_evidence(tmp_path):
     analysis = SimpleNamespace(model_dump=lambda **kw: {})
     store = gui.RunArtifacts(tmp_path)

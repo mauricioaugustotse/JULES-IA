@@ -75,6 +75,20 @@ def _identity_support(row: dict[str, Any], process: dict[str, Any]) -> list[str]
     return support
 
 
+def _scan_identity_support(row: dict, process: dict, evidence: dict) -> list[str] | None:
+    """An independently scanned short number can repair an invalid suffix/relator."""
+    bundle, scan = _bundle_evidence(row, evidence)
+    core = _cnj(process.get("numeroProcesso"))[0]
+    short_numbers = [_cnj(n) for n in scan.get("mentioned_process_numbers", [])]
+    official_class = _class(process.get("siglaClasseJudicial")) or _class(process.get("classeJudicial"))
+    if (not bundle or not scan or (core, "") not in short_numbers
+            or not official_class or _class(row.get("classe_processo")) != official_class
+            or not process.get("origem") or _norm(row.get("origem")) != _norm(process["origem"])):
+        return None
+    return ["mesma sessão", "núcleo CNJ confirmado independentemente na varredura",
+            "classe coincidente", "origem coincidente"]
+
+
 def _match_identity(row: dict[str, Any], processes: list[dict], evidence: dict) -> tuple[dict | None, str, list[str]]:
     core, full = _cnj(row.get("numero_processo"))
     exact = [p for p in processes if full and _cnj(p.get("numeroProcesso"))[1] == full]
@@ -91,6 +105,8 @@ def _match_identity(row: dict[str, Any], processes: list[dict], evidence: dict) 
         if not full:
             return same_core[0], "unique_short_cnj", ["núcleo CNJ único na sessão"]
         support = _identity_support(row, same_core[0])
+        if not support:
+            support = _scan_identity_support(row, same_core[0], evidence)
         if support:
             return same_core[0], "invalid_cnj_suffix", ["CNJ extraído reprova no dígito verificador", *support]
         return None, "insufficient_evidence", []
@@ -158,6 +174,42 @@ def _suspension_text(text: str, official_vote: str) -> str:
     if _SUSPENSION_NOTE not in text:
         text = (text + "\n\n" + _SUSPENSION_NOTE).strip()
     return text
+
+
+def _relator_reference_text(text: str, old: str, new: str) -> str:
+    """Correct an explicit main-relator attribution, preserving other mentions."""
+    old_canonical = _NAME_CANONICAL.get(_name(old))
+    if not old_canonical or old_canonical == new:
+        return text
+    old_name = re.sub(r"^Min\.\s+", "", old_canonical)
+    pattern = r"(\b(?:o|a)\s+relator(?:a)?[\s,]+)(?:Min(?:istro|istra)?\.?\s+)?" + re.escape(old_name) + r"\b"
+    return re.sub(pattern, lambda m: m[1] + new, text, flags=re.IGNORECASE)
+
+
+def _institutional_evidence(index: int, row: dict, evidence: dict) -> dict | None:
+    """Exclude only a positively identified internal election without a case."""
+    if any(row.get(k) for k in ("numero_processo", "numero_origem_video", "classe_processo", "partes", "relator")):
+        return None
+    bundle, scan = _bundle_evidence(row, evidence)
+    item_index = row.get("source_item_index")
+    items = bundle.get("items") or []
+    if not isinstance(item_index, int) or not 1 <= item_index <= len(items):
+        return None
+    item = items[item_index - 1]
+    if any(item.get(k) for k in ("numero_processo", "classe_processo", "partes", "relator")):
+        return None
+    titles = [_norm(b.get("title_hint")) for b in (bundle, scan)]
+    original = _norm(item.get("analise_do_conteudo_juridico"))
+    if (not scan or scan.get("mentioned_process_numbers")
+            or not all("eleicao" in title and "corregedor geral eleitoral" in title for title in titles)
+            or "eleicao interna" not in original or "cargo de corregedor geral eleitoral" not in original):
+        return None
+    return {"row_index": index, "original_row_index": index, "numero_processo": "",
+            "code": "institutional_act", "status": "automatic_exclusion", "classification": "institutional",
+            "reason": "Eleição interna de Corregedor-Geral Eleitoral, sem processo ou julgamento individual.",
+            "evidence": ["mesma sessão e trecho do vídeo", "varredura e detalhe identificam eleição interna",
+                         "texto original descreve eleição para cargo do Tribunal", "nenhum número, classe, parte ou relator processual"],
+            "row": deepcopy(row)}
 
 
 def _citation_evidence(index: int, rows: list[dict], matches: dict[int, dict], evidence: dict, official_cores: set[str]) -> dict | None:
@@ -259,6 +311,12 @@ def reconcile_session_rows(rows: list[Any], inventory: dict[str, Any], *, eviden
         canonical_relator = _NAME_CANONICAL.get(_name(process.get("relator")))
         if canonical_relator:
             confirmed_fields.append("relator")
+            old_relator = row.get("relator")
+            for field in ("analise_do_conteudo_juridico", "raciocinio_juridico", "punchline"):
+                original = str(row.get(field) or "")
+                corrected = _relator_reference_text(original, old_relator, canonical_relator)
+                if original != corrected:
+                    change(index, field, corrected, "Referência explícita ao relator corrigida pelo registro oficial.")
             change(index, "relator", canonical_relator, "Relator do processo na sessão oficial.")
         official_class = _class(process.get("siglaClasseJudicial")) or _class(process.get("classeJudicial"))
         if official_class in _CLASSES and _class(row.get("classe_processo")) != official_class:
@@ -308,11 +366,23 @@ def reconcile_session_rows(rows: list[Any], inventory: dict[str, Any], *, eviden
     for index in range(len(data)):
         if index in matched or _row_date(data[index]) != requested:
             continue
-        exclusion = _citation_evidence(index, data, matched, evidence, official_cores)
+        exclusion = (_institutional_evidence(index, data[index], evidence)
+                     or _citation_evidence(index, data, matched, evidence, official_cores))
         if exclusion:
             excluded.add(index)
             audit["exclusions"].append(exclusion)
     audit["unresolved"] = [i for i in audit["unresolved"] if i["row_index"] not in excluded]
+
+    # Only proven exclusions close gaps; blocked judgments retain their position.
+    removed_numbers = {int(m[1]) for i in excluded
+                       if (m := re.fullmatch(r"Julgamento\s+(\d+)", str(data[i].get("tipo_registro") or "")))}
+    for index, row in enumerate(data):
+        match = re.fullmatch(r"Julgamento\s+(\d+)", str(row.get("tipo_registro") or ""))
+        if index not in excluded and _row_date(row) == requested and match:
+            number = int(match[1])
+            shift = sum(n < number for n in removed_numbers)
+            if shift:
+                change(index, "tipo_registro", f"Julgamento {number - shift}", "Sequência recomposta após exclusões comprovadas.")
 
     # Only discard official blockers that a fresh comparison proves resolved.
     issues = compare_official_rows(inventory, data)
@@ -342,6 +412,8 @@ def reconcile_session_rows(rows: list[Any], inventory: dict[str, Any], *, eviden
     output = [data[i] if isinstance(rows[i], dict) else rows[i].model_copy(update=data[i], deep=True)
               for i in range(len(rows)) if i not in excluded]
     audit["counts"] = {"input": len(rows), "output": len(output), "matched": len(matched),
-                       "corrected_fields": len(audit["corrections"]), "excluded_citations": len(excluded),
+                       "corrected_fields": len(audit["corrections"]),
+                       "excluded_citations": sum(e["code"] == "cited_process_number" for e in audit["exclusions"]),
+                       "excluded_institutional": sum(e["code"] == "institutional_act" for e in audit["exclusions"]),
                        "unresolved": len(audit["unresolved"])}
     return output, audit

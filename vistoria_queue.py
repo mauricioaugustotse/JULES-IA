@@ -326,6 +326,28 @@ def reconcile_published_items(
     phases = (reconciliation or {}).get("phases", [reconciliation or {}])
     for phase in phases:
         for exclusion in phase.get("exclusions", []):
+            if exclusion.get("code") == "institutional_act":
+                payload = exclusion.get("row") or {}
+                day = payload.get("data_sessao")
+                if (phase.get("status") != "complete" or not day or phase.get("session_date") != day
+                        or not exclusion.get("evidence")
+                        or any(payload.get(k) for k in ("numero_processo", "numero_origem_video", "classe_processo", "partes", "relator"))
+                        or not payload.get("source_bundle_index") or not payload.get("source_item_index")
+                        or not isinstance(payload.get("source_start_seconds"), (int, float))
+                        or payload["source_start_seconds"] < 0):
+                    continue
+                candidate = {"row": payload, "data_sessao": day}
+                for old in existing:
+                    if (old.get("status") != "pending" or old.get("source") not in {"batch", "monitor"}
+                            or old["id"] in patches or not _same_candidate(old, candidate)):
+                        continue
+                    patches[old["id"]] = {
+                        "id": old["id"], "status": "resolved", "resolution_kind": "institutional_exclusion",
+                        "automatic_exclusion": exclusion,
+                        "resolution_note": exclusion.get("reason", "Ato institucional sem julgamento individual."),
+                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    }
+                continue
             if exclusion.get("code") != "cited_process_number" or not exclusion.get("evidence"):
                 continue
             parent_number = _digits(exclusion.get("parent_numero_processo"))

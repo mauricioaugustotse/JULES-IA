@@ -267,3 +267,46 @@ def test_citation_resolution_preserves_explicit_decision(tmp_path, status):
     assert queue.reconcile_published_items([row()], results, checks, video_id="video", queue_file=path,
                                            reconciliation=citation_audit(citation)) == 0
     assert queue.load_items(None, path)[0]["status"] == status
+
+
+def institutional_audit(candidate):
+    return {"status": "complete", "session_date": candidate.data_sessao,
+            "exclusions": [{"code": "institutional_act", "row": candidate.model_dump(mode="json"),
+                            "reason": "Eleição interna sem processo.", "evidence": ["Varredura e detalhe originais confirmam eleição interna."]}]}
+
+
+def test_institutional_exclusion_closes_only_its_pending_candidate_with_history(tmp_path):
+    path = tmp_path / "queue.jsonl"
+    ceremony = row(numero_processo="", classe_processo="", relator="")
+    original = item(ceremony)
+    queue.append_items([original, item(row(source_start_seconds=3000))], path)
+    assert queue.reconcile_published_items([], [], [], video_id="video", queue_file=path,
+                                           reconciliation=institutional_audit(ceremony)) == 1
+    assert len(queue.load_items("pending", path)) == 1
+    resolved = queue.load_items("resolved", path)[0]
+    assert resolved["resolution_kind"] == "institutional_exclusion"
+    assert resolved["reasons"] == original["reasons"]
+    assert queue.reconcile_published_items([], [], [], video_id="video", queue_file=path,
+                                           reconciliation=institutional_audit(ceremony)) == 0
+
+
+@pytest.mark.parametrize("failure", ["approved", "rejected", "published", "no_evidence", "wrong_date", "unavailable", "number", "class", "no_position"])
+def test_institutional_resolution_preserves_decisions_and_requires_anchored_audit(tmp_path, failure):
+    path = tmp_path / "queue.jsonl"
+    ceremony = row(numero_processo="", classe_processo="", relator="")
+    original = item(ceremony)
+    queue.append_items([original], path)
+    audit = institutional_audit(ceremony)
+    if failure in {"approved", "rejected", "published"}:
+        queue.update_status([original["id"]], failure, queue_file=path)
+    elif failure == "no_evidence":
+        audit["exclusions"][0]["evidence"] = []
+    elif failure == "wrong_date":
+        audit["session_date"] = "2026-10-01"
+    elif failure == "unavailable":
+        audit["status"] = "unavailable"
+    else:
+        field, value = {"number": ("numero_processo", "0601130-04"), "class": ("classe_processo", "PA"), "no_position": ("source_bundle_index", 0)}[failure]
+        audit["exclusions"][0]["row"][field] = value
+    assert queue.reconcile_published_items([], [], [], video_id="video", queue_file=path, reconciliation=audit) == 0
+    assert queue.load_items(None, path)[0]["status"] == (failure if failure in {"approved", "rejected", "published"} else "pending")

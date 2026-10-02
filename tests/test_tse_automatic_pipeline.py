@@ -87,11 +87,11 @@ def pipeline(tmp_path, monkeypatch):
         return results
     monkeypatch.setattr(gui, "publish_preview_rows", publish)
 
-    def run(rows, client=None):
+    def run(rows, client=None, *, evidence=None):
         client = client or MemoryNotion()
         original = [row.model_copy(deep=True) for row in rows]
         monkeypatch.setattr(gui, "build_preview_rows", lambda *args, **kwargs: deepcopy(original))
-        payload = {
+        payload = evidence or {
             "session": {"data_sessao": DAY, "composicao": PANEL,
                         "judgments": [{"title_hint": "0600957-40", "start_seconds": 7290,
                                        "mentioned_process_numbers": [row.numero_processo for row in original]}]},
@@ -184,3 +184,40 @@ def test_automatic_rerun_closes_previously_blocked_candidate_after_verification(
     published = gui.vistoria_queue.load_items("published")[0]
     assert published["row"]["numero_processo"] == CNJ
     assert published["published_page_id"] == "created-0"
+
+
+def test_internal_election_removed_before_enrichment_publication_and_review(pipeline):
+    ceremony = candidate(numero_processo="", numero_origem_video="", classe_processo="", relator="", partes=[],
+                         tipo_registro="Julgamento 1", source_start_seconds=7000, source_bundle_index=1)
+    main = candidate(tipo_registro="Julgamento 2", source_bundle_index=2)
+    original_text = "O Tribunal realizou a eleição interna para o cargo de Corregedor-Geral Eleitoral."
+    payload = {
+        "session": {"data_sessao": DAY, "judgments": [
+            {"title_hint": "Eleição de Corregedor-Geral Eleitoral", "start_seconds": 7000, "mentioned_process_numbers": []},
+            {"title_hint": "0600957-40", "start_seconds": 7290, "mentioned_process_numbers": ["0600957-40"]}]},
+        "bundles": [
+            {"title_hint": "Eleição de Corregedor-Geral Eleitoral", "start_seconds": 7000,
+             "items": [{"analise_do_conteudo_juridico": original_text}]},
+            {"title_hint": "0600957-40", "start_seconds": 7290, "items": [main.model_dump(mode="json")]}],
+    }
+    old = gui.vistoria_queue.make_vistoria_item(source="batch", video_id=VIDEO, youtube_url=ceremony.youtube_link,
+                                              disposition="blocked", reasons=["Sem número"], row=ceremony.model_dump(mode="json"))
+    gui.vistoria_queue.append_items([old])
+    summary, client, store = pipeline([ceremony, main], evidence=payload)
+    assert len(client.written) == 1
+    assert client.written[0].tipo_registro == "Julgamento 1"
+    assert summary["coverage"]["status"] == "verified"
+    assert any(i.get("code") == "institutional_act" for i in summary["coverage"]["information"])
+    assert gui.vistoria_queue.load_items("pending") == []
+    assert gui.vistoria_queue.load_items("resolved")[0]["resolution_kind"] == "institutional_exclusion"
+
+
+def test_official_session_without_individual_judgments_finishes_without_false_review(pipeline, monkeypatch):
+    inv = {"status": "available", "session_date": DAY, "processes": [], "expected_count": 0,
+           "counts": {"judged": 0, "withdrawn": 0, "list": 0, "unknown": 0}}
+    monkeypatch.setattr(gui, "_fetch_official_for_rows", lambda *args: inv)
+    summary, client, store = pipeline([], evidence={"session": {"data_sessao": DAY}, "bundles": []})
+    assert client.written == []
+    assert summary["coverage"]["status"] == "verified"
+    assert summary["created"] == summary["updated"] == summary["blocked"] == 0
+    assert gui.vistoria_queue.load_items("pending") == []

@@ -40,6 +40,7 @@ from tse_youtube_notion_core import (
     enrich_preview_rows_with_youtube_chapters,
     enrich_preview_rows_with_session_date_from_title,
     extract_youtube_video_id,
+    fetch_youtube_title,
     normalize_youtube_link,
     publish_preview_rows,
     require_youtube_transcript_api,
@@ -473,7 +474,7 @@ def process_single_video(
     )
 
     progress("consultando inventario oficial da sessao")
-    official_inventory = _fetch_official_for_rows(artifact_store, rows)
+    official_inventory = _fetch_official_for_rows(artifact_store, rows, video.url)
 
     progress("corrigindo identidades e dados pela sessao oficial")
     rows, first_reconciliation = _reconcile_official_rows(
@@ -656,9 +657,18 @@ def process_single_video(
     return summary
 
 
-def _fetch_official_for_rows(artifact_store, rows):
+def _fetch_official_for_rows(artifact_store, rows, youtube_url=None):
     dates = {str(getattr(row, "data_sessao", "") or "")[:10] for row in rows}
     try:
+        if not rows and youtube_url:
+            video_id = extract_youtube_video_id(youtube_url)
+            title = fetch_youtube_title(video_id) if video_id else ""
+            day = infer_session_date_from_video_title(title)
+            artifact_store.write_json("00_session_date_evidence.json",
+                                      {"source": "youtube_title", "video_id": video_id,
+                                       "title": title, "session_date": day})
+            if day:
+                dates = {day}
         if len(dates) != 1 or not next(iter(dates), ""):
             raise ValueError("Data ausente ou divergente")
         return fetch_official_session(next(iter(dates)), artifact_store)
