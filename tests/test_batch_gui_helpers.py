@@ -147,3 +147,28 @@ def test_chamada_sem_stop_event_segue_publicando(tmp_path, monkeypatch, gui_sem_
     )
     assert chamadas == [1]
     assert resumo["publish_skipped_by_stop"] is False
+
+
+def test_saved_preview_matches_compacted_notion_numbering(tmp_path, monkeypatch, gui_sem_rede):
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent))
+    from test_tse_publish_journal import make_row, FakeNotion
+    from test_tse_youtube_notion_core import make_schema
+    rows = [make_row(1, errors=["Identificação conflitante."]), make_row(2)]
+    monkeypatch.setattr(gui, "build_preview_rows", lambda *a, **kw: rows)
+    monkeypatch.setattr(gui, "_fetch_official_for_rows", lambda *a: {
+        "status": "unavailable", "processes": [], "excluded": [], "counts": {}})
+    monkeypatch.setattr(gui, "_apply_official_gate", lambda store, rows, inventory: (rows, []))
+    notion = FakeNotion([{"id": "page-published"}])
+    gui.process_single_video(
+        gui.VideoInput(position=1, video_id="abc123", url="https://youtu.be/abc123"),
+        artifact_store=gui.RunArtifacts(tmp_path), notion_client=notion,
+        notion_schema=make_schema(), gemini_api_key="fake",
+        options=gui.BatchOptions(model="m", news_model="m", publish=True, with_news=False,
+                                 continue_on_error=False),
+        progress=lambda message: None, analysis=_AnaliseFalsa(),
+    )
+    saved = gui.read_json(tmp_path / "04h_publish_preview_rows.json")
+    journal = gui.read_json(tmp_path / "05_publish_journal.json")
+    assert [item["status"] for item in journal] == ["blocked", "created"]
+    assert saved[1]["tipo_registro"] == notion.writes[0][1].tipo_registro == "Julgamento 1"

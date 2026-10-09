@@ -170,6 +170,8 @@ def test_revalidation_block_does_not_fall_back_to_direct_create(monkeypatch):
 
 def test_approved_retry_uses_existing_page():
     notion = FakeNotionClient()
+    notion._request = lambda *a, **kw: {"id": "page-123"}
+    notion._extract_property_text = lambda page, schema, name: "Julgamento 2" if name == "tipo_registro" else ""
     proposal = item(row(numero_processo="0600249-07", origem="Brasília/DF"))
     result = queue.publish_approved_items([proposal], notion, make_schema(), apply=True)
     assert result[0]["status"] == "updated"
@@ -185,6 +187,8 @@ def test_publication_returns_readback_for_exact_written_row(monkeypatch):
         return [{"status": "verified", "page_id": results[0]["page_id"]}]
     monkeypatch.setattr(tse_workflow_monitor, "verify_notion_rows", verify)
     notion = FakeNotionClient()
+    notion._request = lambda *a, **kw: {"id": "page-123"}
+    notion._extract_property_text = lambda page, schema, name: "Julgamento 2" if name == "tipo_registro" else ""
     proposal = item(row(numero_processo="0600249-07", origem="Brasília/DF"))
     result = queue.publish_approved_items([proposal], notion, make_schema(), apply=True)
     assert result[0]["verification"]["status"] == "verified"

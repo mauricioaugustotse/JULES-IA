@@ -97,6 +97,16 @@ Dentro de `artifacts/tse_youtube_notion/batch_gui/<lote>/`:
 - `batch_summary.json`: contagem separada de concluídos, pendentes, erros,
   interrompidos e vídeos não processados.
 
+A fila de vistoria é recarregada ao finalizar o lote e acompanha alterações do
+arquivo a cada dois segundos. O filtro e a seleção são preservados. O contador
+da aba mostra os casos pendentes de decisão, mesmo durante o processamento.
+
+A etiqueta `tipo_registro` enumera os registros publicados: itens bloqueados ou
+descartados não reservam números. Ao publicar pela vistoria, uma proposta nova
+recebe o próximo número disponível na data; a revisão de uma página existente
+preserva sua etiqueta. A prévia salva acompanha a numeração enviada ao Notion,
+que também é conferida na releitura final.
+
 Pendências também entram na fila de vistoria. Reprocessar em um **novo lote**
 refaz a varredura; retomar um cache com cobertura comprovadamente incompleta
  exige primeiro reprocessar a sessão. A auditoria preparatória da execução de

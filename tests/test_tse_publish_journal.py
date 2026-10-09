@@ -84,7 +84,7 @@ def test_journal_covers_nonwrites_and_preserves_original_indexes(schema):
     assert [entry["row_index"] for entry in journal] == [0, 1, 2]
     assert len(notion.writes) == 1
     assert notion.writes[0][0] == "update"
-    assert rows[2].tipo_registro == "Julgamento 2"
+    assert rows[2].tipo_registro == "Julgamento 1"
     assert results == [{key: value for key, value in event.items() if key != "row_index"} for event in journal]
 
 
@@ -102,6 +102,27 @@ def test_publish_without_callback_retains_result_shape(schema):
             "warnings": row.warnings,
         }
     ]
+
+
+def test_blocked_candidates_leave_no_numbering_gaps_and_retry_is_stable(schema):
+    rows = [make_row(n, errors=["Identificação conflitante."] if n in {1, 4, 5} else [])
+            for n in range(1, 7)]
+    for _ in range(2):
+        notion = FakeNotion([{"id": f"page-{n}"} for n in range(3)])
+        results = core.publish_preview_rows(rows, notion, schema)
+        assert [r["status"] for r in results] == ["blocked", "created", "created", "blocked", "blocked", "created"]
+        assert [row.tipo_registro for _, row in notion.writes] == [
+            "Julgamento 1", "Julgamento 2", "Julgamento 3"]
+
+
+def test_numbering_is_scoped_to_video_and_date(schema):
+    rows = [make_row(1, errors=["Identificação conflitante."]), make_row(2),
+            make_row(6, youtube_link="https://youtu.be/another1234"),
+            make_row(4, data_sessao="2026-06-24")]
+    notion = FakeNotion([{"id": f"page-{n}"} for n in range(3)])
+    core.publish_preview_rows(rows, notion, schema)
+    assert [row.tipo_registro for _, row in notion.writes] == [
+        "Julgamento 1", "Julgamento 6", "Julgamento 4"]
 
 
 @pytest.mark.parametrize("action", ["create", "update"])

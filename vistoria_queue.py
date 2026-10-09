@@ -571,11 +571,13 @@ def rebuild_row_from_artifacts(item: dict[str, Any]) -> Optional[PublishPreviewR
 def next_judgment_number_for_dates(
     client: NotionSessoesClient, schema: NotionDataSourceSchema, dates: set[str]
 ) -> dict[str, int]:
-    """Maior N de "Julgamento N" por data (uma varredura da base)."""
+    """Maior N publicado, consultando apenas as datas que serão alteradas."""
     highest: dict[str, int] = {data: 0 for data in dates if data}
     if not highest:
         return {}
-    for page in client.query_data_source():
+    date_filter = {"or": [{"property": "data_sessao", "date": {"equals": day}}
+                          for day in sorted(highest)]}
+    for page in client.query_data_source(date_filter):
         data = (client._extract_property_text(page, schema, "data_sessao") or "")[:10]
         if data not in highest:
             continue
@@ -664,16 +666,9 @@ def publish_approved_items(
                 }
             )
         return results
-    # Linhas reconstruídas recebem o próximo "Julgamento N" livre da data — o N
-    # original do vídeo pode colidir com julgamentos já publicados da sessão.
-    rebuilt_dates = {row.data_sessao for _, row, rebuilt in publishable if rebuilt and row.data_sessao}
-    if rebuilt_dates:
-        highest = next_judgment_number_for_dates(notion_client, notion_schema, rebuilt_dates)
-        counters: dict[str, int] = {}
-        for _, row, rebuilt in publishable:
-            if rebuilt and row.data_sessao in highest:
-                counters[row.data_sessao] = counters.get(row.data_sessao, 0) + 1
-                row.tipo_registro = f"Julgamento {highest[row.data_sessao] + counters[row.data_sessao]}"
+    # Toda criação recebe o próximo número livre, mesmo quando a proposta já
+    # estava salva na fila: bloqueios do lote não reservam etiquetas no Notion.
+    highest: dict[str, int] = {}
     for item, row, _rebuilt in publishable:
         disposition, reasons = assess_row_publishability(row)
         if disposition == "publish":
@@ -683,13 +678,29 @@ def publish_approved_items(
                 )
                 row.action = "update" if match else "create"
                 row.page_id = match.page_id if match else ""
+                existing_number = ""
+                if match:
+                    page = notion_client._request("GET", f"/pages/{match.page_id}")
+                    existing_number = notion_client._extract_property_text(page, notion_schema, "tipo_registro")
+                if re.fullmatch(r"Julgamento\s+\d+", existing_number):
+                    row.tipo_registro = existing_number
+                else:
+                    if row.data_sessao not in highest:
+                        highest.update(next_judgment_number_for_dates(
+                            notion_client, notion_schema, {row.data_sessao}))
+                    row.tipo_registro = f"Julgamento {highest[row.data_sessao] + 1}"
                 publish_results = publish_preview_rows([row], notion_client, notion_schema)
                 merged = dict(publish_results[0]) if publish_results else {"status": "erro", "errors": ["sem resultado"]}
                 if merged.get("status") in {"created", "updated"}:
+                    if row.data_sessao in highest:
+                        highest[row.data_sessao] = max(highest[row.data_sessao], int(row.tipo_registro.split()[-1]))
                     from tse_workflow_monitor import verify_notion_rows
                     checks = verify_notion_rows([row], [merged], notion_client, notion_schema)
                     merged["verification"] = checks[0] if checks else {"status": "unverified", "error": "Sem releitura da página."}
             except Exception as exc:
+                # Uma resposta perdida pode esconder uma escrita concluída.
+                # Consulte o Notion de novo antes de atribuir outro número.
+                highest.pop(row.data_sessao, None)
                 merged = {"numero_processo": row.numero_processo, "status": "erro",
                           "errors": [str(exc)[:1000]], "warnings": list(row.warnings)}
         else:

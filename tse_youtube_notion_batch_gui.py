@@ -587,6 +587,10 @@ def process_single_video(
         def record_result(event: dict[str, Any]) -> None:
             journal.append(event)
             atomic_json(artifact_store.root_dir / "05_publish_journal.json", journal)
+            # O publicador compacta a numeração após avaliar os bloqueios.
+            # Salva as linhas enviadas para a releitura final e a retomada.
+            atomic_json(artifact_store.root_dir / "04h_publish_preview_rows.json",
+                        [row.model_dump(mode="json") for row in rows])
             progress(f"publicando no Notion: {len(journal)}/{len(rows)} registros")
 
         atomic_json(artifact_store.root_dir / "05_publish_journal.json", journal)
@@ -1242,7 +1246,7 @@ def _verify_after_post_publish(summaries, notion_client, notion_schema, output_q
     """Restore proven session facts and verify all final judgment properties."""
     from tse_publication_repair import repair_confirmed_notion_fields
     fields = {"numero_processo", "data_sessao", "youtube_link", "classe_processo", "origem",
-              "relator", "resultado", "votacao", "composicao", "pedido_vista", "eleicao"}
+              "relator", "resultado", "votacao", "composicao", "pedido_vista", "eleicao", "tipo_registro"}
     final = []
     for summary in summaries:
         if not (summary.get("created", 0) + summary.get("updated", 0)):
@@ -1402,6 +1406,7 @@ class BatchGuiApp:
         })
         self.root.after(200, self._drain_output_queue)
         self.root.after(1000, self._refresh_live_progress)
+        self.root.after(2000, self._poll_vistoria_queue)
 
     @staticmethod
     def _find_last_batch() -> tuple[Path | None, str]:
@@ -1998,6 +2003,7 @@ class BatchGuiApp:
         details_scroll.grid(row=0, column=1, sticky="ns")
         self.vistoria_details.configure(yscrollcommand=details_scroll.set)
         self.vistoria_items: dict[str, dict[str, Any]] = {}
+        self._vistoria_loaded_stamp = None
         self._reload_vistoria()
 
     def _add_link(self) -> None:
@@ -2353,6 +2359,7 @@ class BatchGuiApp:
                     self.batch_artifact_dir = str(item[1])
                 elif event == "batch_done":
                     summary = item[1]
+                    self._reload_vistoria()
                     # O resumo tem de carregar TUDO que precisa de atencao: em 20/08/2026
                     # um video saiu com 7 julgamentos a menos (verdict "verificar") e o
                     # relations morreu — e o resumo dizia "4 concluidos, 0 com erro".
@@ -2496,8 +2503,28 @@ class BatchGuiApp:
 
     # ----- fila de vistoria -----
 
+    @staticmethod
+    def _vistoria_queue_stamp() -> tuple[int, int] | None:
+        try:
+            stat = vistoria_queue.QUEUE_FILE.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def _poll_vistoria_queue(self) -> None:
+        # O monitor e os tratamentos finais também escrevem na fila fora da GUI.
+        # Só refaz a árvore quando o arquivo muda, preservando seleção e filtro.
+        try:
+            if self._vistoria_queue_stamp() != self._vistoria_loaded_stamp:
+                self._reload_vistoria()
+        except OSError as exc:
+            LOGGER.warning("Falha ao acompanhar a fila de vistoria: %s", exc)
+        finally:
+            self.root.after(2000, self._poll_vistoria_queue)
+
     def _reload_vistoria(self) -> None:
         try:
+            stamp = self._vistoria_queue_stamp()
             pending = vistoria_presenter.group_review_items(vistoria_queue.load_items("pending"))
             all_items = vistoria_queue.load_items(None)
         except Exception as exc:
@@ -2538,6 +2565,7 @@ class BatchGuiApp:
             self.vistoria_tree.focus(selection)
             self.vistoria_tree.see(selection)
         self._show_vistoria_details()
+        self._vistoria_loaded_stamp = stamp
 
     def _readonly_text_key(self, event):
         """Permite navegação e cópia no Text, bloqueando qualquer edição."""

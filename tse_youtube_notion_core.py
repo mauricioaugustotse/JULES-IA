@@ -10399,14 +10399,12 @@ def rows_from_editor_records(
 def _renumber_judgments_after_skips(
     assessed: list[tuple[PublishPreviewRow, str]],
 ) -> None:
-    """Fecha os buracos de numeração deixados por itens descartados (skipped).
+    """Fecha lacunas de itens que não serão publicados (skipped/blocked).
 
-    Um item skipped não é julgamento da sessão (ex.: número identificado como
-    precedente citado): os "Julgamento N" seguintes do mesmo vídeo/dia descem
-    uma posição para a sequência publicada sair contínua. Itens blocked
-    preservam o número (o julgamento existiu; pode ser publicado depois na
-    posição que reservou) e lotes sem skip não são renumerados — publicações
-    avulsas/parciais (scripts de manutenção) ficam intactas.
+    A etiqueta enumera as páginas publicadas, sem reservar posições para
+    propostas ainda em revisão. A vistoria atribui o próximo número disponível
+    ao publicar uma proposta recuperada. Lotes sem exclusões mantêm os números
+    recebidos, inclusive nas atualizações avulsas de manutenção.
     """
 
     def group_key(row: PublishPreviewRow) -> tuple[str, str]:
@@ -10419,23 +10417,21 @@ def _renumber_judgments_after_skips(
         digits = re.search(r"\d+", value)
         return int(digits.group(0)) if digits else None
 
-    skipped_by_group: dict[tuple[str, str], list[int]] = {}
+    grouped: dict[tuple[str, str], list[tuple[PublishPreviewRow, str, int]]] = {}
     for row, disposition in assessed:
         number = judgment_number(row)
-        if disposition == "skipped" and number is not None:
-            skipped_by_group.setdefault(group_key(row), []).append(number)
-    if not skipped_by_group:
-        return
-
-    for row, disposition in assessed:
-        if disposition == "skipped":
+        if number is not None:
+            grouped.setdefault(group_key(row), []).append((row, disposition, number))
+    for entries in grouped.values():
+        if not any(disposition in {"skipped", "blocked"} for _, disposition, _ in entries):
             continue
-        number = judgment_number(row)
-        if number is None:
-            continue
-        shift = sum(1 for skipped in skipped_by_group.get(group_key(row), []) if skipped < number)
-        if shift:
-            row.tipo_registro = f"Julgamento {number - shift}"
+        # Usa a ordem das linhas, já ordenadas pela sessão. A base é preservada
+        # em lotes parciais; repetir a publicação não compacta os números de novo.
+        number = min(original for _, _, original in entries)
+        for row, disposition, _ in entries:
+            if disposition not in {"skipped", "blocked"}:
+                row.tipo_registro = f"Julgamento {number}"
+                number += 1
 
 
 def publish_preview_rows(

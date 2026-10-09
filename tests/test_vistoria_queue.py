@@ -77,7 +77,8 @@ def test_append_load_update_roundtrip(tmp_path):
     assert vistoria_queue.append_items([item], queue_file) == 0
 
 
-def test_publish_approved_items_clears_block_with_audit_warning():
+def test_publish_approved_items_clears_block_with_audit_warning(monkeypatch):
+    monkeypatch.setattr(vistoria_queue, "next_judgment_number_for_dates", lambda c, s, dates: {d: 0 for d in dates})
     schema = make_schema()
     notion = FakeNotionClient()
     row = _row(
