@@ -1,8 +1,9 @@
 """Atualiza a relation `materia_semelhante` vinculando entre si os varios julgamentos do MESMO
 processo (mesmo CNJ canonico) em sessoes/datas distintas (ex.: Julgamento 1 suspenso por vista +
 Julgamento 2 conclusivo). Mesma logica de `audit_notion_sessoes_round2.build_relation_targets`:
-agrupa por canonicalize_numero_processo, exclui pares que sao a MESMA sessao (mesmo video_id E
-mesma data_sessao). MESCLA com os vinculos ja existentes (nao apaga). dry-run por padrao.
+agrupa por CNJ completo com DV valido e exclui pares da mesma sessao. Preserva vinculos
+manuais fora do escopo e identidades incertas; corrige colisoes do antigo numero curto.
+dry-run por padrao.
 
 Uso:
   python fill_materia_semelhante.py            # dry-run
@@ -17,7 +18,14 @@ from typing import Any
 
 from audit_notion_sessoes_round2 import notion_request_with_retry
 from local_secrets import get_secret
-from tse_normalization import canonicalize_numero_processo, extract_youtube_video_id
+from notion_process_relations import (
+    ProcessRelationRecord,
+    build_full_cnj_relation_targets,
+    full_cnj_relation_key,
+    index_relation_records,
+    reconcile_process_relations,
+)
+from tse_normalization import extract_youtube_video_id
 from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, NotionSessoesClient
 
 LOGGER = logging.getLogger("fill_materia_semelhante")
@@ -47,38 +55,33 @@ def main() -> int:
     def t(p, f):
         return client._extract_property_text(p, schema, f)
 
-    # agrupa por CNJ canonico
+    # A identidade completa evita colisoes entre anos, tribunais e zonas.
     groups: dict[str, list[dict]] = collections.defaultdict(list)
     for p in pages:
-        canon = canonicalize_numero_processo(t(p, "numero_processo"))
-        if canon and len(canon) >= 10:  # ignora numeros muito curtos/ambiguos
+        canon = full_cnj_relation_key(t(p, "numero_processo"))
+        if canon:
             groups[canon].append(p)
 
     meta = {p["id"]: (extract_youtube_video_id(t(p, "youtube_link")), (t(p, "data_sessao") or "")[:10]) for p in pages}
+    indexed = index_relation_records(
+        ProcessRelationRecord(p["id"], t(p, "numero_processo"), *meta[p["id"]]) for p in pages
+    )
+    proposed = build_full_cnj_relation_targets(indexed.values())
 
     changes: list[dict[str, Any]] = []
     stats = collections.Counter()
     stats["grupos_multi"] = sum(1 for g in groups.values() if len(g) >= 2)
     for canon, grp in groups.items():
-        if len(grp) < 2:
-            continue
-        ids = [p["id"] for p in grp]
         for p in grp:
-            vid_p, data_p = meta[p["id"]]
-            alvos = [
-                q_id for q_id in ids
-                if q_id != p["id"] and (meta[q_id][0] != vid_p or meta[q_id][1] != data_p)
-            ]
-            if not alvos:
-                continue
             atual = relation_ids(p)
-            novo = list(dict.fromkeys(atual + alvos))  # MESCLA preservando ordem, sem duplicar
+            novo = reconcile_process_relations(indexed[p["id"]], atual, proposed.get(p["id"], []), indexed)
             if set(novo) == set(atual):
                 stats["ja_ok"] += 1
                 continue
             stats["atualizadas"] += 1
             rec = {"page_id": p["id"], "cnj": canon, "numero": t(p, "numero_processo"),
-                   "antes": len(atual), "depois": len(novo), "adicionados": sorted(set(novo) - set(atual))}
+                   "antes": len(atual), "depois": len(novo), "adicionados": sorted(set(novo) - set(atual)),
+                   "removidos": sorted(set(atual) - set(novo))}
             if args.apply:
                 try:
                     built = client._build_property_value(schema, RELATION_FIELD, novo)

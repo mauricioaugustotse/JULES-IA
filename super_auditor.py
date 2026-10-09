@@ -13,6 +13,13 @@ from typing import Any, Literal
 from openai import APIError, OpenAI
 from pydantic import BaseModel, Field
 
+from notion_process_relations import (
+    ProcessRelationRecord,
+    build_full_cnj_relation_targets,
+    index_relation_records,
+    reconcile_process_relations,
+)
+
 from tse_backfill_2025_notion import (
     BACKFILL_ROOT,
     ExistingPageRecord,
@@ -480,36 +487,19 @@ def _target_fields_for_record(
 
 
 def build_global_relation_targets(grouped_by_year: dict[int, dict[str, list[ExistingPageRecord]]]) -> dict[str, list[str]]:
-    records_by_process: dict[str, list[ExistingPageRecord]] = defaultdict(list)
-    for grouped in grouped_by_year.values():
-        for records in grouped.values():
-            for record in records:
-                canonical = canonicalize_numero_processo(record.row.numero_processo)
-                if canonical:
-                    records_by_process[canonical].append(record)
-    relation_targets: dict[str, list[str]] = {}
-    for records in records_by_process.values():
-        unique_records: list[ExistingPageRecord] = []
-        seen_page_ids: set[str] = set()
-        for record in records:
-            if record.page_id and record.page_id not in seen_page_ids:
-                seen_page_ids.add(record.page_id)
-                unique_records.append(record)
-        if len(unique_records) < 2:
-            continue
-        for record in unique_records:
-            related_ids = [
-                candidate.page_id
-                for candidate in unique_records
-                if candidate.page_id != record.page_id
-                and (
-                    candidate.video_id != record.video_id
-                    or candidate.row.data_sessao != record.row.data_sessao
-                )
-            ]
-            if related_ids:
-                relation_targets[record.page_id] = dedupe_preserve_order(related_ids)
-    return relation_targets
+    records = [record for grouped in grouped_by_year.values() for group in grouped.values() for record in group]
+    indexed = index_relation_records(
+        ProcessRelationRecord(record.page_id, record.row.numero_processo, record.video_id, record.row.data_sessao)
+        for record in records
+    )
+    proposed = build_full_cnj_relation_targets(indexed.values())
+    current_by_page: dict[str, list[str]] = defaultdict(list)
+    for record in records:
+        current_by_page[record.page_id].extend(record.row.materia_semelhante)
+    return {
+        page_id: reconcile_process_relations(record, dedupe_preserve_order(current_by_page[page_id]), proposed.get(page_id, []), indexed)
+        for page_id, record in indexed.items()
+    }
 
 
 def _truncate_text(value: str, limit: int = 5000) -> str:
@@ -797,7 +787,7 @@ def main() -> None:
                     artifact_context,
                     focus=args.focus,
                 )
-                deterministic_relations = relation_targets.get(record.page_id, [])
+                deterministic_relations = relation_targets.get(record.page_id, record.row.materia_semelhante)
                 if not target_fields and (args.focus != "all" or deterministic_relations == record.row.materia_semelhante):
                     continue
                 stats["candidates"] += 1

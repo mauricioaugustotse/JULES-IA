@@ -24,6 +24,12 @@ from audit_notion_sessoes import (
     weak_theme_reason,
 )
 from local_secrets import get_secret
+from notion_process_relations import (
+    ProcessRelationRecord,
+    build_full_cnj_relation_targets,
+    index_relation_records,
+    reconcile_process_relations,
+)
 from tse_normalization import (
     canonicalize_numero_processo,
     dedupe_preserve_order,
@@ -834,34 +840,15 @@ def add_partes_change(change_set: PageChangeSet) -> None:
 
 
 def build_relation_targets(records: list[PageRecord]) -> dict[str, list[str]]:
-    groups: dict[str, list[PageRecord]] = defaultdict(list)
-    for record in records:
-        canonical = canonicalize_numero_processo(record.row.numero_processo)
-        if canonical:
-            groups[canonical].append(record)
-    targets_by_page: dict[str, list[str]] = {}
-    for group in groups.values():
-        unique_records: list[PageRecord] = []
-        seen_page_ids: set[str] = set()
-        for record in sorted(group, key=sort_key_for_judgment):
-            if record.page_id and record.page_id not in seen_page_ids:
-                seen_page_ids.add(record.page_id)
-                unique_records.append(record)
-        if len(unique_records) < 2:
-            continue
-        for record in unique_records:
-            targets = [
-                candidate.page_id
-                for candidate in unique_records
-                if candidate.page_id != record.page_id
-                and (
-                    candidate.video_id != record.video_id
-                    or candidate.row.data_sessao != record.row.data_sessao
-                )
-            ]
-            if targets:
-                targets_by_page[record.page_id] = dedupe_preserve_order(targets)
-    return targets_by_page
+    return build_full_cnj_relation_targets(
+        _process_relation_record(record) for record in sorted(records, key=sort_key_for_judgment)
+    )
+
+
+def _process_relation_record(record: PageRecord) -> ProcessRelationRecord:
+    return ProcessRelationRecord(
+        record.page_id, record.row.numero_processo, record.video_id, record.row.data_sessao
+    )
 
 
 def add_relation_changes(
@@ -869,20 +856,22 @@ def add_relation_changes(
     schema: NotionDataSourceSchema,
     relation_targets: dict[str, list[str]],
 ) -> None:
+    indexed = index_relation_records(_process_relation_record(item.record) for item in change_sets.values())
     for page_id, targets in relation_targets.items():
         change_set = change_sets[page_id]
         for property_name in sorted(RELATION_FIELDS):
             if property_name not in schema.properties:
                 continue
             current = extract_relation_ids(change_set.record.page, property_name)
-            if same_relation_set(current, targets):
+            desired = reconcile_process_relations(indexed[page_id], current, targets, indexed)
+            if same_relation_set(current, desired):
                 continue
             change_set.add(
                 property_name,
                 property_name,
                 current,
-                targets,
-                "relation robustecida para vincular sessoes distintas do mesmo numero de processo",
+                desired,
+                "sessoes vinculadas por CNJ completo valido; vinculos fora do escopo preservados",
                 confidence="high",
             )
 

@@ -1,7 +1,7 @@
 """#5: re-computa a relation 'materia_semelhante' (liga registros do MESMO processo = mesmo
 CNJ-20 canonico, em video/data diferentes). Como o SADP completou muitos CNJ-20, mais registros
-agora podem ser ligados. Conservador: so liga quando ha >=2 registros do mesmo processo em
-contextos distintos (video ou data diferente). Atualiza so onde a relation difere.
+agora podem ser ligados. Usa CNJ completo com DV valido e preserva vinculos manuais fora
+do escopo e identidades incertas. Corrige colisoes confirmadas do antigo numero curto.
 
 Uso:
   python materia_semelhante_update.py            # dry-run
@@ -17,7 +17,14 @@ from typing import Any
 
 from audit_notion_sessoes_round2 import notion_request_with_retry
 from local_secrets import get_secret
-from tse_normalization import canonicalize_numero_processo, dedupe_preserve_order, extract_youtube_video_id
+from notion_process_relations import (
+    ProcessRelationRecord,
+    build_full_cnj_relation_targets,
+    full_cnj_relation_key,
+    index_relation_records,
+    reconcile_process_relations,
+)
+from tse_normalization import extract_youtube_video_id
 from tse_youtube_notion_core import DEFAULT_NOTION_DATA_SOURCE_ID, NotionSessoesClient
 
 LOGGER = logging.getLogger("materia_semelhante_update")
@@ -48,39 +55,38 @@ def main() -> int:
 
     recs = []
     for p in pages:
-        canonical = canonicalize_numero_processo(t(p, "numero_processo"))
-        if not canonical:
-            continue
-        recs.append({"page_id": p["id"], "canonical": canonical,
+        number = t(p, "numero_processo")
+        canonical = full_cnj_relation_key(number)
+        recs.append({"page_id": p["id"], "canonical": canonical, "numero": number,
                      "video_id": extract_youtube_video_id(t(p, "youtube_link") or ""),
                      "data": t(p, "data_sessao"), "cur": _rel_ids(p, "materia_semelhante")})
 
     by_proc: dict[str, list[dict]] = defaultdict(list)
     for r in recs:
-        by_proc[r["canonical"]].append(r)
+        if r["canonical"]:
+            by_proc[r["canonical"]].append(r)
 
-    desired: dict[str, list[str]] = {}
-    for proc, group in by_proc.items():
-        uniq, seen = [], set()
-        for r in group:
-            if r["page_id"] not in seen:
-                seen.add(r["page_id"]); uniq.append(r)
-        if len(uniq) < 2:
-            continue
-        for r in uniq:
-            related = [o["page_id"] for o in uniq if o["page_id"] != r["page_id"]
-                       and (o["video_id"] != r["video_id"] or o["data"] != r["data"])]
-            if related:
-                desired[r["page_id"]] = dedupe_preserve_order(related)
+    indexed = index_relation_records(
+        ProcessRelationRecord(r["page_id"], r["numero"], r["video_id"], r["data"]) for r in recs
+    )
+    proposed = build_full_cnj_relation_targets(indexed.values())
+    desired = {
+        r["page_id"]: reconcile_process_relations(indexed[r["page_id"]], r["cur"], proposed.get(r["page_id"], []), indexed)
+        for r in recs
+    }
 
-    changes, stats = [], {"com_cnj": len(recs), "grupos_multi": sum(1 for g in by_proc.values() if len(g) >= 2),
-                          "paginas_com_relacao": len(desired), "a_atualizar": 0, "applied": 0, "falhas": 0}
+    changes, stats = [], {"com_cnj": sum(bool(r["canonical"]) for r in recs), "grupos_multi": sum(1 for g in by_proc.values() if len(g) >= 2),
+                          "paginas_com_relacao": sum(bool(v) for v in desired.values()), "a_atualizar": 0, "applied": 0, "falhas": 0}
     cur_by_id = {r["page_id"]: r["cur"] for r in recs}
     for page_id, related in desired.items():
         if set(related) == set(cur_by_id.get(page_id, [])):
             continue
         stats["a_atualizar"] += 1
-        changes.append({"page_id": page_id, "old_n": len(cur_by_id.get(page_id, [])), "new_n": len(related)})
+        current = cur_by_id.get(page_id, [])
+        changes.append({"page_id": page_id, "old_n": len(current), "new_n": len(related),
+                        "before": current, "after": related,
+                        "added": sorted(set(related) - set(current)),
+                        "removed": sorted(set(current) - set(related))})
         if args.apply:
             try:
                 notion_request_with_retry(client, "PATCH", f"/pages/{page_id}",

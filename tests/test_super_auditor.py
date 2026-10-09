@@ -133,11 +133,11 @@ def test_build_global_relation_targets_only_links_distinct_sessions():
     grouped = {
         2025: {
             "video-a": [
-                make_record("page-1", "video-a", "2025-03-01", "0600001-01.2025.6.00.0000"),
-                make_record("page-2", "video-a", "2025-03-01", "0600001-01.2025.6.00.0000"),
+                make_record("page-1", "video-a", "2025-03-01", "0600508-68.2018.6.14.0000"),
+                make_record("page-2", "video-a", "2025-03-01", "0600508-68.2018.6.14.0000"),
             ],
             "video-b": [
-                make_record("page-3", "video-b", "2025-03-08", "0600001-01.2025.6.00.0000"),
+                make_record("page-3", "video-b", "2025-03-08", "0600508-68.2018.6.14.0000"),
             ],
         }
     }
