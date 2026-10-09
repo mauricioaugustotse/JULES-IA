@@ -40,6 +40,17 @@ def test_distinct_appeals_remain_ambiguous():
     assert _official_decision(p) == ('', '')
 
 
+def test_invalid_cnj_cannot_cross_an_unrecognized_class_in_joint_judgment():
+    row={'numero_processo':'0601915-02.2018.6.13.0000','data_sessao':'2019-09-10',
+         'classe_processo':'REspe','origem':'Belo Horizonte/MG','relator':'Min. Tarcísio Vieira de Carvalho Neto'}
+    process={'numeroProcesso':'0601915-02.2018.6.00.0000','siglaClasseJudicial':'AC',
+             'origem':'BELO HORIZONTE - MG','relator':'TARCISIO VIEIRA DE CARVALHO NETO',
+             'situacaoProcesso':'Julgado'}
+    out,audit=reconcile_session_rows([row],{'status':'available','session_date':'2019-09-10','processes':[process]})
+    assert out[0]['numero_processo']==row['numero_processo']
+    assert not audit['matches']
+
+
 @pytest.mark.parametrize('status,reason,recover', [
     ('Não julgado', 'Pedido de Vista', True), ('Julgado', None, True),
     ('Não julgado', 'Adiado', False), ('Retirado de julgamento', None, False),

@@ -58,12 +58,16 @@ def _bundle_evidence(row: dict[str, Any], evidence: dict[str, Any]) -> tuple[dic
     return bundle, scans[0] if len(scans) == 1 else {}
 
 
-def _identity_support(row: dict[str, Any], process: dict[str, Any]) -> list[str] | None:
+def _identity_support(row: dict[str, Any], process: dict[str, Any], *, allow_missing_class: bool = False) -> list[str] | None:
     """OCR repair needs an explicit matching relator; other known fields must agree."""
     if not _name(row.get("relator")) or _name(row.get("relator")) != _name(process.get("relator")):
         return None
     support = ["mesma sessão", "relator coincidente"]
     official_class = _class(process.get("siglaClasseJudicial")) or _class(process.get("classeJudicial"))
+    if not official_class and not (allow_missing_class and not process.get("siglaClasseJudicial") and not process.get("classeJudicial")):
+        # Unknown classes cannot silently satisfy a class agreement. In a joint
+        # judgment an AC and a REspEl can share parties, origin and relator.
+        return None
     if official_class:
         if _class(row.get("classe_processo")) != official_class:
             return None
@@ -124,7 +128,7 @@ def _match_identity(row: dict[str, Any], processes: list[dict], evidence: dict) 
     for p in processes:
         if _cnj(p.get("numeroProcesso"))[0] not in repaired_cores:
             continue
-        support = _identity_support(row, p)
+        support = _identity_support(row, p, allow_missing_class=True)
         if support:
             candidates.append((p, support))
     if len(candidates) == 1:

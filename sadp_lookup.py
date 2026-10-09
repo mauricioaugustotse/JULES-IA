@@ -19,7 +19,7 @@ Rode `python sadp_lookup.py --pilot N` para um piloto read-only em N casos incom
 """
 from __future__ import annotations
 
-import argparse, re, time, unicodedata
+import argparse, json, re, time, unicodedata
 import requests
 
 SADP_BASE = "https://sadp-consulta.tse.jus.br/consulta"  # SPA (link para navegador)
@@ -27,6 +27,94 @@ SADP_API = "https://sadp-consulta-api.tse.jus.br/sadp-consulta/rest/v1"
 SITUACOES_RESOLVIDO = ("decidido", "transitado", "baixado", "arquivado", "julgado")
 SITUACOES_PENDENTE = ("distribuido", "concluso", "vista", "pauta", "redistribu", "suspenso", "diligencia")
 _CNJ_RE = re.compile(r"^\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}$")
+SADP_PAGE_SIZE = 50  # maximo aceito pela API (size=200 tambem retorna 50)
+SADP_MAX_PAGES = 200  # teto explicito; nunca retorna um subconjunto como busca completa
+
+
+class SADPQueryError(RuntimeError):
+    """Consulta incompleta/indisponivel, distinta de uma busca valida sem resultados."""
+
+    def __init__(self, reason: str, *, url: str, page: int, retrieved: int,
+                 expected_total: int | None = None, max_pages: int = SADP_MAX_PAGES):
+        self.audit = {"reason": reason, "url": url, "page": page,
+                      "retrieved": retrieved, "expected_total": expected_total,
+                      "max_pages": max_pages, "complete": False}
+        super().__init__(f"SADP: {reason} (pagina {page}, recebidos {retrieved}, "
+                         f"esperados {expected_total}, limite {max_pages} paginas)")
+
+
+def _fetch_all_pages(session: requests.Session, url: str, list_key: str, *,
+                     max_pages: int = SADP_MAX_PAGES) -> list[dict]:
+    """Pagina o contrato oficial page/size, exigindo contagem e metadados coerentes.
+
+    Qualquer falha invalida a consulta inteira: candidatos incompletos podem tornar
+    um match ambiguo artificialmente unico. O erro inclui os limites e o progresso.
+    """
+    rows: list[dict] = []
+    expected: tuple[int, int, int] | None = None
+    seen_pages: set[str] = set()
+    identity_key = {"listaProcessos": "numeroProtocolo", "listaAndamentos": "sqAndamento"}.get(list_key)
+    seen_identities: set[str] = set()
+
+    def fail(reason: str, page: int) -> SADPQueryError:
+        return SADPQueryError(reason, url=url, page=page, retrieved=len(rows),
+                              expected_total=expected[0] if expected else None,
+                              max_pages=max_pages)
+
+    if max_pages < 1:
+        raise fail("limite de paginas invalido", 0)
+    for page in range(max_pages):
+        if page:
+            time.sleep(0.15)
+        try:
+            response = session.get(url, params={"page": page, "size": SADP_PAGE_SIZE}, timeout=45)
+            if response.status_code != 200:
+                raise fail(f"HTTP {response.status_code}", page)
+            payload = response.json()
+        except SADPQueryError:
+            raise
+        except Exception as exc:
+            raise fail(f"falha de transporte/JSON: {type(exc).__name__}", page) from exc
+        if not isinstance(payload, dict) or payload.get("sucesso") is not True:
+            raise fail("resposta sem sucesso confirmado", page)
+        items = payload.get(list_key)
+        if not isinstance(items, list) or any(not isinstance(it, dict) for it in items):
+            raise fail("lista de resultados invalida", page)
+        metadata = [payload.get(k) for k in ("totalElements", "totalPages", "page", "size")]
+        if any(type(v) is not int or v < 0 for v in metadata):
+            raise fail("metadados de paginacao invalidos", page)
+        total, pages, actual_page, size = metadata
+        if actual_page != page or size < 1 or len(items) > size:
+            raise fail("pagina/tamanho divergente do contrato", page)
+        if pages != (total + size - 1) // size:
+            raise fail("total de paginas incoerente", page)
+        current = (total, pages, size)
+        if expected is not None and current != expected:
+            raise fail("inventario mudou durante a paginacao", page)
+        expected = current
+        if pages > max_pages:
+            raise fail("consulta excede o limite de paginas", page)
+        fingerprint = json.dumps(items, ensure_ascii=False, sort_keys=True)
+        if items and fingerprint in seen_pages:
+            raise fail("pagina repetida pela API", page)
+        seen_pages.add(fingerprint)
+        if identity_key:
+            for item in items:
+                identity = item.get(identity_key)
+                if identity is None or not str(identity).strip():
+                    continue
+                identity = str(identity).strip()
+                if identity in seen_identities:
+                    raise fail(f"registro repetido pela API: {identity_key}={identity}", page)
+                seen_identities.add(identity)
+        rows.extend(items)
+        if page + 1 >= pages:
+            if len(rows) != total:
+                raise fail("total de resultados incompleto", page)
+            return rows
+        if len(items) != size:
+            raise fail("pagina intermediaria incompleta", page)
+    raise fail("consulta excede o limite de paginas", max_pages)
 
 
 def make_session() -> requests.Session:
@@ -59,17 +147,7 @@ def _rec_from_item(it: dict) -> dict:
 
 
 def _listar(session: requests.Session, url: str) -> list[dict]:
-    try:
-        r = session.get(url, params={"size": 200}, timeout=45)
-    except Exception:
-        return []
-    if r.status_code != 200:
-        return []
-    try:
-        payload = r.json()
-    except Exception:
-        return []
-    return [_rec_from_item(it) for it in payload.get("listaProcessos") or []]
+    return [_rec_from_item(it) for it in _fetch_all_pages(session, url, "listaProcessos")]
 
 
 def search_number(session: requests.Session, num: str, tribunal: str = "tse") -> list[dict]:
@@ -167,7 +245,13 @@ def fetch_detail(session: requests.Session, nprot: str, tribunal: str = "tse") -
         nome = str(parte.get("nomeParte") or "").strip()
         if not nome:
             continue
-        if parte.get("advogado") or str(parte.get("descricaoParte") or "").upper().startswith("ADVOGAD"):
+        # Em LT, ADVOGADO INDICADO e parte da lista, nao patrono. A API informa
+        # advogado=false nesses registros; o prefixo ADVOGAD confundia os papeis.
+        role = _fold(parte.get("descricaoParte") or "")
+        patrono = parte.get("advogado") is True or (
+            "advogado" not in parte and re.fullmatch(r"advogad[oa]s?(?:\([oa]\))?", role)
+        )
+        if patrono:
             out["advogados"].append(nome)
         else:
             out["partes"].append(nome)
@@ -228,14 +312,21 @@ def fetch_detail_e_publicacoes(session: requests.Session, nprot: str, tribunal: 
     if not det:
         return {}  # falha de rede/protocolo -> falsy, para a GUI sinalizar e permitir retry
     try:
-        r = session.get(f"{SADP_API}/{tribunal}/andamentos/listar/numeroProtocolo/{nprot}", timeout=45)
-        andamentos = (r.json() or {}).get("listaAndamentos") or [] if r.status_code == 200 else []
-    except Exception:
-        andamentos = []
+        andamentos = _fetch_all_pages(
+            session, f"{SADP_API}/{tribunal}/andamentos/listar/numeroProtocolo/{nprot}", "listaAndamentos"
+        )
+    except SADPQueryError as exc:
+        # A GUI so cacheia ok=true. Assim uma indisponibilidade de andamentos
+        # continua recuperavel, sem fingir que o processo nao tem publicacoes.
+        det.update({"publicacoes_dje": [], "ok": False,
+                    "andamentos_complete": False, "andamentos_error": exc.audit})
+        return det
     texto = " ".join(
         f"{a.get('descricaoAndamento') or ''} {a.get('complemento') or ''}" for a in andamentos
     )
     det["publicacoes_dje"] = parse_publicacoes_dje(texto)
+    det["andamentos_complete"] = True
+    det["andamentos_count"] = len(andamentos)
     det["ok"] = True
     return det
 
