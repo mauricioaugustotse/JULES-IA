@@ -39,7 +39,8 @@ _CLASS_ALIASES = {
     "tutantant": "tutantant", "tutela antecipada antecedente": "tutantant",
     "tutcautant": "tutcautant", "tutela cautelar antecedente": "tutcautant",
     "rot": "rot", "ro": "rot", "ro el": "rot", "recurso ordinario eleitoral": "rot", "recurso ordinario": "rot",
-    "pc": "pc", "prestacao de contas": "pc",
+    "pc": "pc", "pc pp": "pc", "prestacao de contas": "pc",
+    "rp": "rp", "representacao": "rp", "inst": "inst", "instrucao": "inst",
     "pet": "pet", "peticao": "pet",
     "aije": "aije", "acao de investigacao judicial eleitoral": "aije",
     "ed": "ed", "embargos de declaracao": "ed",
@@ -64,7 +65,7 @@ def _class(value: Any) -> str | None:
     # Incidentes mantêm a classe de origem no cadastro oficial. Só removemos
     # prefixos processuais conhecidos; AREspE continua distinto de REspE.
     text = _norm(value)
-    text = re.sub(r"^(?:(?:ref|agr|agrg|ed)\s+)+", "", text)
+    text = re.sub(r"^(?:(?:ref|agr|agrg|ed)(?:\s+no\s+a)?\s+)+", "", text)
     return _CLASS_ALIASES.get(text)
 
 
@@ -205,6 +206,8 @@ def _result(value: Any) -> str:
         return "aprovado"
     if text in {"desprovido", "nao provido", "negado provimento", "nego provimento"}:
         return "desprovido"
+    if text in {"parcialmente provido", "parcial provimento", "provido em parte"}:
+        return "parcialmente provido"
     if text in {"provido", "dou provimento"}:
         return "provido"
     if text in {"nao conhecido", "nao conhecida", "nao conheco"}:
@@ -245,6 +248,17 @@ def _official_decision(process: dict[str, Any]) -> tuple[str, str]:
         and not re.search(r"\b(?:parcialmente|em parte|parte conhecida)\b", text)
     ):
         return "desprovido", voting
+    # A preliminary issue and the merits of the SAME appeal have separate votes.
+    # Restrict this exception to an explicit merits clause and one appellate
+    # disposition, so it cannot borrow the outcome of a different appellant.
+    merits = re.search(
+        r"\bno merito por (maioria|unanimidade) (?:deu lhe|deu) parcial provimento\b", text)
+    if merits and len(re.findall(r"\b(?:parcial provimento|negou provimento|deu provimento)\b", text)) == 1:
+        return "parcialmente provido", {"maioria": "por maioria", "unanimidade": "unanime"}[merits[1]]
+    # Refusal to endorse a denial is not an endorsement. The subsequent grant
+    # of urgent relief is the positive outcome of this interlocutory judgment.
+    if re.search(r"\bnao referendou a decisao nao concessiva da liminar e deferiu o pedido de tutela de urgencia\b", text):
+        return "deferido", voting
     # A process may have distinct interlocutory and merits outcomes.
     if ("agravo" in text and "recurso especial" in text) or "no merito" in text or "parcialmente" in text or "em parte" in text:
         return "", voting
@@ -255,7 +269,7 @@ def _official_decision(process: dict[str, Any]) -> tuple[str, str]:
         (r"\baprovou\b", "aprovado"), (r"\bnegou provimento\b", "desprovido"),
         (r"\bdeu provimento\b", "provido"),
         (r"\bnao conheceu\b", "nao conhecido"),
-        (r"\breferendou\b", "referendada"),
+        (r"(?<!nao )\breferendou\b", "referendada"),
         (r"\bjulgou improcedente\b", "improcedente"),
         (r"\bjulgou procedente\b", "procedente"),
         (r"\bdeterminou (?:a devolucao|o retorno)\b", "devolvido"),

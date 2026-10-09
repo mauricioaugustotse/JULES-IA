@@ -44,7 +44,7 @@ def test_repair_is_journaled_before_write_selective_verified_and_idempotent():
     assert checkpoints[0][0][0]["status"] == "planned"
     assert checkpoints[0][1] == 0
     assert events[0]["status"] == "applied"
-    assert set(client.writes[0]["properties"]) == {"resultado"}
+    assert set(client.writes[0]["properties"]) == {"resultado", "punchline"}
     assert verify_notion_rows([row], [result], client, None, fields={"resultado"})[0]["status"] == "verified"
     assert repair_confirmed_notion_fields([row], [result], client, None, audit) == []
     assert len(client.writes) == 1
@@ -60,3 +60,11 @@ def test_absent_proof_wrong_session_and_archived_page_never_written():
     client.page["archived"] = True
     assert repair_confirmed_notion_fields([row], [result], client, None, audit)[0]["status"] == "error"
     assert not client.writes
+
+
+def test_unconfirmed_prose_is_preserved():
+    row, result, audit = context()
+    audit["matches"][0]["confirmed_fields"] = ["resultado"]
+    client = Notion()
+    repair_confirmed_notion_fields([row], [result], client, None, audit)
+    assert set(client.writes[0]["properties"]) == {"resultado"}

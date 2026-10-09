@@ -44,6 +44,11 @@ avançar; o arquivo não é um serviço independente que reinicia o workflow.
   antes da publicação. Caches antigos incompletos também não são aceitos.
 - Os capítulos da descrição do YouTube formam um inventário independente.
   Processos ausentes da varredura ganham janelas para análise do próprio vídeo.
+- O inventário oficial também é consultado antes do detalhamento, com data
+  obtida do título do vídeo. Um trecho marcado como lista volta à análise se
+  houver uma única identidade oficial de julgamento individual ou vista.
+  A reversão da exclusão e eventual correção da data ficam documentadas em
+  `01d_official_scan_recovery.json`, preservando a varredura anterior.
 - A pauta oficial do TSE é consultada para a data da sessão. O monitor compara
   processos individuais julgados, CNJ completo, classe, resultado, votação,
   relator, origem e composição, quando esses dados são publicados. Retiradas e
@@ -153,3 +158,28 @@ de auditoria. Evidências em
 `artifacts/tse_youtube_notion/batch_gui/20260929_153718_906300/automatic_repair_20260929/`.
 O painel `resolution_monitor.html` registra a situação atual; o lote original
 permanece preservado.
+
+## Sessões de 6 e 8/10/2026
+
+A recuperação dirigida criou duas páginas (LT do TRE-BA e embargos nas contas
+do União Brasil) e corrigiu oito páginas existentes. Os dez registros individuais
+do inventário oficial foram conferidos no Notion, com links para as respectivas
+certidões. A LT de Natal já estava publicada como `0601075-11.2026.6.00.0000`;
+a pendência com CNJ inválido era uma extração duplicada de trecho sobreposto.
+
+O fluxo passou a reconhecer duplicações com CNJ inválido e evidência temporal e
+contextual suficiente. Para LT devolvida, uma identidade corrompida pode ser
+recuperada quando o detalhe original confirma origem, relator e desfecho e há
+uma única correspondência oficial. CNJ completo válido de outro processo não é
+substituído por semelhança. Resultado parcial no mérito e sua votação são
+separados de decisões preliminares; textos expressamente contraditórios ao
+dispositivo oficial recebem correção auditada e proteção após os tratamentos.
+
+A fila destes vídeos passou de sete para dois itens: `0601560-60` e
+`0600814-85.2022.6.00.0000` continuam sem prova de julgamento autônomo. Não foram
+publicados nem descartados como precedentes por mera ausência no inventário.
+Relatório, replay e valores anteriores estão em
+`artifacts/monitor_repair_20261009/RELATORIO_FINAL.md`. A resolução do monitor
+mantém o estado `verified_with_pending`. Foram executados 445 testes no ambiente
+Windows; uma nova execução integral da GUI com estas alterações ainda precisa
+ser observada.

@@ -348,7 +348,7 @@ def reconcile_published_items(
                         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                     }
                 continue
-            if exclusion.get("code") != "cited_process_number" or not exclusion.get("evidence"):
+            if exclusion.get("code") not in {"cited_process_number", "duplicate_extraction"} or not exclusion.get("evidence"):
                 continue
             parent_number = _digits(exclusion.get("parent_numero_processo"))
             cited_number = _digits(exclusion.get("numero_processo"))
@@ -368,10 +368,10 @@ def reconcile_published_items(
                 if old["id"] in patches or not _same_candidate(old, candidate):
                     continue
                 patches[old["id"]] = {
-                    "id": old["id"], "status": "resolved", "resolution_kind": "verified_citation",
+                    "id": old["id"], "status": "resolved", "resolution_kind": "verified_duplicate" if exclusion.get("code") == "duplicate_extraction" else "verified_citation",
                     "parent_page_id": page_id, "parent_numero_processo": parent["numero_processo"],
                     "verification": check, "automatic_exclusion": exclusion,
-                    "resolution_note": "Número citado dentro de outro julgamento; processo principal "
+                    "resolution_note": ("Extração duplicada do mesmo trecho; processo principal " if exclusion.get("code") == "duplicate_extraction" else "Número citado dentro de outro julgamento; processo principal ")
                                        + parent["numero_processo"] + " confirmado no Notion (" + page_id + ").",
                     "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 }

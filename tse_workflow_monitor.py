@@ -87,7 +87,7 @@ def reconcile_video(
                     and phase.get("session_date") == (official or {}).get("session_date")):
                 information.append({**exclusion, "severity": "info", "message": exclusion.get("reason", "Ato institucional sem julgamento.")})
                 continue
-            if (exclusion.get("code") != "cited_process_number"
+            if (exclusion.get("code") not in {"cited_process_number", "duplicate_extraction"}
                     or not exclusion.get("evidence")
                     or process_key(exclusion.get("parent_numero_processo")) not in row_keys):
                 continue

@@ -7,7 +7,8 @@ from tse_workflow_monitor import _field_matches, _property_value
 
 
 SESSION_FIELDS = {"numero_processo", "data_sessao", "relator", "composicao",
-                  "classe_processo", "origem", "resultado", "votacao", "pedido_vista"}
+                  "classe_processo", "origem", "resultado", "votacao", "pedido_vista",
+                  "punchline", "analise_do_conteudo_juridico", "raciocinio_juridico"}
 
 
 def repair_confirmed_notion_fields(rows, results, client, schema, reconciliation, *, checkpoint=None):

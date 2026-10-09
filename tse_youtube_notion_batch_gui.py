@@ -432,6 +432,9 @@ def process_single_video(
     progress("conferindo inventario de capitulos")
     chapter_inventory = ensure_chapter_inventory(artifact_store, video.url)
     if analysis is None:
+        # Consult the independently dated inventory before honoring scan exclusions.
+        # The later reconciliation still refreshes and validates every final row.
+        _fetch_official_for_rows(artifact_store, [], video.url)
         progress("analisando video")
         extractor = GeminiSessionExtractor(
             api_key=gemini_api_key,

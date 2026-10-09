@@ -20,12 +20,12 @@ _RESULTS = {
     "indeferido": "Indeferido", "deferido": "Deferido", "aprovado": "Aprovada",
     "desprovido": "Desprovido", "provido": "Provido", "nao conhecido": "Não conhecido",
     "referendada": "Referendada", "improcedente": "Improcedente", "procedente": "Procedente",
-    "devolvido": "Devolvida",
+    "devolvido": "Devolvida", "parcialmente provido": "Provido em parte",
 }
 _CLASSES = {
     "lt": "Lista Tríplice", "pa": "PA", "rot": "RO", "rve": "RvE",
     "respe": "REspEl", "arespe": "AREspE", "pc": "PC", "pet": "Pet",
-    "aije": "AIJE", "cst": "CTA", "ed": "ED",
+    "aije": "AIJE", "cst": "CTA", "ed": "ED", "rp": "Rp", "inst": "Instrução",
 }
 _SUSPENSION_NOTE = "O julgamento não foi concluído nesta sessão; o voto do relator não constitui decisão final do colegiado."
 
@@ -130,6 +130,29 @@ def _match_identity(row: dict[str, Any], processes: list[dict], evidence: dict) 
     if len(candidates) == 1:
         p, support = candidates[0]
         return p, "single_extra_zero", ["um zero excedente no número original do vídeo", *support]
+    # A corrupted number can be unrelated to the number spoken in a short
+    # administrative judgment. Only the original detail, before grounding, may
+    # establish this narrow match: same LT, city, relator and explicit devolution.
+    item_index = row.get("source_item_index")
+    items = bundle.get("items") or []
+    original = items[item_index - 1] if isinstance(item_index, int) and 1 <= item_index <= len(items) else {}
+    if (not candidates and bundle and scan and _class(row.get("classe_processo")) == "lt"
+            and "lista triplice" in _norm(original.get("analise_do_conteudo_juridico"))
+            and _norm(original.get("resultado_final")) == "devolvida"):
+        contextual = []
+        for process in processes:
+            support = _identity_support(row, process)
+            if (support and _class(process.get("siglaClasseJudicial")) == "lt"
+                    and _classification(process) == "judged"
+                    and _official_decision(process)[0] == "devolvido"
+                    and _name(original.get("relator")) == _name(process.get("relator"))
+                    and _norm(original.get("origem")) == _norm(process.get("origem"))):
+                contextual.append((process, support))
+        if len(contextual) == 1:
+            p, support = contextual[0]
+            return p, "unique_lt_devolution_context", [*support,
+                "detalhe original do vídeo confirma origem, relator e devolução da lista",
+                "único julgamento oficial com essa identidade administrativa e desfecho"]
     return None, "ambiguous" if len(candidates) > 1 else "unmatched", []
 
 
@@ -252,6 +275,56 @@ def _citation_evidence(index: int, rows: list[dict], matches: dict[int, dict], e
     }
 
 
+def _overlapping_duplicate(index, rows, matches, evidence, processes):
+    """An invalid identity can duplicate the same overlapping physical excerpt.
+
+    This excludes the redundant extraction, never converts a valid foreign CNJ.
+    Require a unique official identity, concordant context and substantial shared
+    narrative. Mere proximity, absence from a database or thematic similarity is
+    insufficient.
+    """
+    row = rows[index]
+    _, full = _cnj(row.get("numero_processo"))
+    if not full or _valid_full_cnj(full) or row.get("source_item_index") != 1:
+        return None
+    bundle, scan = _bundle_evidence(row, evidence)
+    if not bundle or not scan:
+        return None
+    candidates = [p for p in processes if _identity_support(row, p)
+                  and _classification(p) in {"judged", "suspended"}]
+    if len(candidates) != 1:
+        return None
+    parents = [i for i, p in matches.items() if p["numeroProcesso"] == candidates[0]["numeroProcesso"]]
+    if len(parents) != 1:
+        return None
+    parent_index = parents[0]
+    parent = rows[parent_index]
+    other, other_scan = _bundle_evidence(parent, evidence)
+    if not other or not other_scan or parent.get("source_item_index") != 1:
+        return None
+    start, end = bundle.get("start_seconds"), bundle.get("end_seconds")
+    a, b = other.get("start_seconds"), other.get("end_seconds")
+    if not all(isinstance(v, (int, float)) for v in (start, end, a, b)):
+        return None
+    shortest = min(end - start, b - a)
+    if shortest <= 0 or abs(start - a) > 15 or min(end, b) - max(start, a) < .75 * shortest:
+        return None
+    words = [set(re.findall(r"[a-z]{5,}", _norm(r.get("analise_do_conteudo_juridico"))))
+             for r in (row, parent)]
+    common = words[0] & words[1]
+    if len(common) < 25 or len(common) < .65 * min(map(len, words)):
+        return None
+    return {"row_index": index, "original_row_index": index,
+            "numero_processo": row.get("numero_processo"), "code": "duplicate_extraction",
+            "status": "automatic_exclusion", "classification": "duplicate",
+            "parent_row_index": parent_index, "parent_numero_processo": parent["numero_processo"],
+            "reason": "Extração duplicada do mesmo trecho, com CNJ inválido; preservada a linha de identidade oficial confirmada.",
+            "evidence": ["CNJ duplicado reprova no dígito verificador", "única identidade oficial com classe, origem e relator coincidentes",
+                         "inícios separados por até 15 segundos", "sobreposição de pelo menos 75% do trecho menor",
+                         "narrativa substancialmente coincidente", "linha principal confirmada na mesma sessão"],
+            "row": deepcopy(row)}
+
+
 def reconcile_session_rows(rows: list[Any], inventory: dict[str, Any], *, evidence: Any = None) -> tuple[list[Any], dict[str, Any]]:
     """Return copied rows and a JSON audit; indexes refer to the original inputs.
 
@@ -348,12 +421,35 @@ def reconcile_session_rows(rows: list[Any], inventory: dict[str, Any], *, eviden
         elif _classification(process) == "judged":
             result, voting = _official_decision(process)
             disposition = _norm(str(process.get("proclamacaoDecisao") or "").split("\n\n", 1)[0])
-            if "por unanimidade" in disposition and "por maioria" in disposition:
+            if "por unanimidade" in disposition and "por maioria" in disposition and result != "parcialmente provido":
                 # More than one appellant/disposition: preserve the extracted
                 # main appeal rather than protecting a result from another one.
                 result, voting = "", ""
-            elif re.search(r"\bparcial (?:provimento|procedencia)\b", disposition):
+            elif result != "parcialmente provido" and re.search(r"\bparcial (?:provimento|procedencia)\b", disposition):
                 result = ""
+            # Do not let prose invert the party's real result even when the
+            # appeal label (Desprovido) is itself correct. Only explicit assertions
+            # about maintaining the opposite registration outcome qualify.
+            official_text = str(process.get("proclamacaoDecisao") or "").split("\n\n", 1)[0].strip()
+            registration = re.search(r"\bmanter o (deferimento|indeferimento) do registro", disposition)
+            for field in ("punchline", "analise_do_conteudo_juridico", "raciocinio_juridico"):
+                prose = _norm(row.get(field))
+                conflict = False
+                if registration:
+                    opposite = "indeferimento" if registration[1] == "deferimento" else "deferimento"
+                    conflict = bool(re.search(r"\b(?:manteve o|mantendo o|manutencao do) " + opposite + r" (?:do registro|da candidatura)\b", prose))
+                historical = re.search(r"\b(?:inicialmente|anteriormente|voto vencido|decisao recorrida|tre(?: [a-z]{2})? manteve)\b", prose)
+                if historical:
+                    conflict = False  # Do not erase a correctly described prior vote/decision.
+                if result == "parcialmente provido" and not historical:
+                    states_partial = re.search(r"\b(?:parcial provimento|parcialmente provido|provido em parte)\b", prose)
+                    if not states_partial:
+                        conflict |= bool(re.search(r"\b(?:negou provimento|concluiu pelo desprovimento)\b", prose))
+                        if "afastar a causa de inelegibilidade" in disposition:
+                            conflict |= bool(re.search(r"\b(?:manutencao da inelegibilidade|mantendo a inelegibilidade)\b", prose))
+                if conflict:
+                    confirmed_fields.append(field)
+                    change(index, field, official_text, "Síntese contradizia o desfecho oficial; substituída pela proclamação, com texto anterior preservado nesta auditoria.")
             if result in _RESULTS:
                 confirmed_fields.append("resultado")
                 change(index, "resultado", _RESULTS[result], "Dispositivo inequívoco da proclamação oficial.")
@@ -367,7 +463,8 @@ def reconcile_session_rows(rows: list[Any], inventory: dict[str, Any], *, eviden
         if index in matched or _row_date(data[index]) != requested:
             continue
         exclusion = (_institutional_evidence(index, data[index], evidence)
-                     or _citation_evidence(index, data, matched, evidence, official_cores))
+                     or _citation_evidence(index, data, matched, evidence, official_cores)
+                     or _overlapping_duplicate(index, data, matched, evidence, processes))
         if exclusion:
             excluded.add(index)
             audit["exclusions"].append(exclusion)
@@ -414,6 +511,7 @@ def reconcile_session_rows(rows: list[Any], inventory: dict[str, Any], *, eviden
     audit["counts"] = {"input": len(rows), "output": len(output), "matched": len(matched),
                        "corrected_fields": len(audit["corrections"]),
                        "excluded_citations": sum(e["code"] == "cited_process_number" for e in audit["exclusions"]),
+                       "excluded_duplicates": sum(e["code"] == "duplicate_extraction" for e in audit["exclusions"]),
                        "excluded_institutional": sum(e["code"] == "institutional_act" for e in audit["exclusions"]),
                        "unresolved": len(audit["unresolved"])}
     return output, audit

@@ -5455,6 +5455,21 @@ class GeminiSessionExtractor:
             self.artifact_store.write_json("01_session_windows.json", session.model_dump(mode="json"))
 
         session = self._add_missing_chapter_windows(session)
+        # A list label in the scan must not hide a separately recorded vista.
+        from tse_official_recovery import recover_ignored_windows
+        if (self.artifact_store.exists("00_official_session_inventory.json")
+                and self.artifact_store.exists("00_session_date_evidence.json")):
+            date_evidence = self.artifact_store.read_json("00_session_date_evidence.json")
+            if date_evidence.get("video_id") == extract_youtube_video_id(normalized_url):
+                recovered, recovery = recover_ignored_windows(
+                    session.model_dump(mode="json"),
+                    self.artifact_store.read_json("00_official_session_inventory.json"),
+                    confirmed_date=date_evidence.get("session_date"),
+                )
+                if recovery["corrections"] or recovery.get("date_correction"):
+                    self.artifact_store.write_json("01_session_windows.before_official_recovery.json", session.model_dump(mode="json"))
+                self.artifact_store.write_json("01d_official_scan_recovery.json", recovery)
+                session = SessionExtraction.model_validate(recovered)
         self.artifact_store.write_json("01_session_windows.json", session.model_dump(mode="json"))
         bundles: list[JudgmentBundleExtraction] = []
         detail_report: dict[str, Any] = {"schema_version": 1, "status": "incomplete", "blocks": []}
