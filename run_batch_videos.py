@@ -39,6 +39,9 @@ def main() -> int:
     options = BatchOptions(
         model=args.model, news_model=args.news_model,
         with_news=not args.no_news, publish=not args.no_publish, continue_on_error=True,
+        # inteiro teor e andamento (PJe) dos julgamentos publicados: so enfileira e sobe o
+        # trabalhador em segundo plano; --no-publish nao publica, entao nao ha o que enfileirar
+        pje_andamento=not args.no_publish,
     )
     q: "queue.Queue" = queue.Queue()
     stop = threading.Event()

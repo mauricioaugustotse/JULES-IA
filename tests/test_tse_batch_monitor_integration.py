@@ -222,6 +222,41 @@ def test_failed_internal_postpublish_script_is_exposed(tmp_path, monkeypatch, of
     assert json.loads((tmp_path / "monitor_status.json").read_text())["status"] == "pending"
 
 
+def _video_publicado(*a, **kw):
+    return {"video_id": "gY6-5zPrFlo", "rows_extracted": 1, "created": 1, "updated": 0,
+            "blocked": 0, "skipped": 0, "coverage": {"status": "verified", "issues": []}}
+
+
+def test_pje_andamento_enfileira_o_lote_publicado(tmp_path, monkeypatch, offline_batch):
+    chamadas = []
+    monkeypatch.setattr(gui, "process_single_video", _video_publicado)
+    monkeypatch.setattr(gui, "_verify_after_post_publish", lambda *a: [])
+    monkeypatch.setattr(gui, "_gf_run_pje_andamento",
+                        lambda script, raiz, q: chamadas.append((script, raiz)) or 0)
+    summary = run(tmp_path, replace(offline_batch, pje_andamento=True))
+    assert chamadas == [(offline_batch.pje_script, tmp_path)]
+    assert summary["post_publish"]["pje"] == 0
+    assert "falhas" not in summary["post_publish"]
+
+
+def test_pje_andamento_desligado_por_padrao_e_sem_publicar(tmp_path, monkeypatch, offline_batch):
+    monkeypatch.setattr(gui, "process_single_video", _video_publicado)
+    monkeypatch.setattr(gui, "_verify_after_post_publish", lambda *a: [])
+    monkeypatch.setattr(gui, "_gf_run_pje_andamento", lambda *a: pytest.fail("Enfileirou sem pedir"))
+    assert not gui.BatchOptions(model="m", news_model="m", with_news=False, publish=True,
+                                continue_on_error=True).pje_andamento
+    run(tmp_path, offline_batch)
+    run(tmp_path / "b", replace(offline_batch, pje_andamento=True, publish=False))
+
+
+def test_falha_do_pje_andamento_aparece_no_resumo(tmp_path, monkeypatch, offline_batch):
+    monkeypatch.setattr(gui, "process_single_video", _video_publicado)
+    monkeypatch.setattr(gui, "_verify_after_post_publish", lambda *a: [])
+    monkeypatch.setattr(gui, "_gf_run_pje_andamento", lambda *a: 1)
+    summary = run(tmp_path, replace(offline_batch, pje_andamento=True))
+    assert summary["post_publish"]["falhas"] == ["pje"]
+
+
 def test_successful_final_readback_replaces_transient_verification_alert(tmp_path, monkeypatch):
     store = gui.RunArtifacts(tmp_path)
     store.write_json("04h_publish_preview_rows.json", [preview().model_dump(mode="json")])

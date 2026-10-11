@@ -165,6 +165,16 @@ class BatchOptions:
     # Confronto dos CSVs com a base de sessoes: "pendente" (alcanca as paginas novas),
     # "forcar" (tudo), "nao".
     enriquecer_sessoes: str = "pendente"
+    # Inteiro teor e andamento (PJe) dos julgamentos publicados pelo lote (11/10/2026). Os perfis
+    # de IA do Notion nao acessam o PJe; sem o link do documento na propria pagina eles deixavam
+    # "link a completar". A etapa so ENFILEIRA as paginas e sobe o trabalhador do ProjetoConversor
+    # em segundo plano (uma consulta por minuto, limite do WAF do PJe): o lote nao espera por ela.
+    # Default False de proposito: quem liga e o chamador que publica de verdade (a GUI, em
+    # _options(), e o run_batch_videos.py). Os testes montam BatchOptions com publish=True e
+    # videos simulados — com True aqui, a suite enfileiraria paginas falsas e subiria o
+    # trabalhador real desta maquina.
+    pje_andamento: bool = False
+    pje_script: str = r"C:\Users\mauri\ProjetoConversor\pje_andamento.py"
 
 
 @dataclass(frozen=True)
@@ -943,6 +953,24 @@ def _gf_run_relations(script: str, output_queue: "queue.Queue[tuple[str, Any]]",
                              timeout=14400)
 
 
+def _gf_run_pje_andamento(script: str, run_root: Path,
+                          output_queue: "queue.Queue[tuple[str, Any]]") -> Any:
+    """Enfileira os julgamentos publicados pelo lote e sobe o trabalhador do PJe (ProjetoConversor).
+
+    Retorna em segundos: o trabalhador roda DESTACADO, sem janela, e sobrevive ao fechamento
+    desta GUI. Ele consulta o PJe no ritmo do WAF (>= 60 s por processo) e grava em cada pagina
+    da base de sessoes o link do acordao (ou, enquanto ele nao sai, da certidao de julgamento) e
+    o andamento posterior. Mesmo Python global do _gf_run_relations: o .venv-win nao tem as
+    dependencias do ProjetoConversor.
+    """
+    if not Path(script).exists():
+        output_queue.put(("log", f"[pje] script nao encontrado: {script}\n"))
+        return "script ausente"
+    cmd = [_gf_python_com_playwright(), "-X", "utf8", script, "enfileirar-lote", str(run_root),
+           "--disparar", "--aplicar"]
+    return _gf_run_streaming(cmd, "pje", Path(script).parent, output_queue, timeout=600)
+
+
 def process_video_batch(
     videos: list[VideoInput], options: BatchOptions,
     output_queue: "queue.Queue[tuple[str, Any]]", stop_event: threading.Event,
@@ -1158,6 +1186,13 @@ def _process_video_batch(
             post_publish["relations"] = _gf_run_relations(
                 options.relations_script, output_queue, options.relations_etapas,
                 options.relations_max_idade_horas)
+
+        # Por ultimo e so com pagina publicada: o trabalhador precisa dos page_ids que o
+        # 05_publish_results.json de cada video registra. Ele roda depois, em segundo plano.
+        if options.pje_andamento and publicou:
+            output_queue.put(("status", "__post__",
+                              "Pos-publicacao: inteiro teor e andamento (PJe) na fila...", ""))
+            post_publish["pje"] = _gf_run_pje_andamento(options.pje_script, run_root, output_queue)
         output_queue.put(("status", "__post__", "Pos-publicacao concluida.", ""))
         output_queue.put(("etapas_mudou", None))
 
@@ -1168,6 +1203,7 @@ def _process_video_batch(
     # dje_base 2 = outra ingestao em curso, 3 = nada a fazer.
     _POST_OK: dict[str, set] = {
         "dje_sessoes": {0, 4}, "dje": {0, 4}, "dje_base": {0, 2, 3}, "relations": {0},
+        "pje": {0},
     }
     post_publish_falhas = sorted(
         etapa_nome for etapa_nome, codigo in post_publish.items()
@@ -2136,6 +2172,9 @@ class BatchGuiApp:
             ingerir_dje=bool(self.ingerir_dje_var.get()),
             enriquecer_sessoes=("nao" if self.pular_sessoes_var.get()
                                 else "forcar" if self.forcar_sessoes_var.get() else "pendente"),
+            # Sem caixa na tela: so muda de rodada a rodada o que o usuario decide, e esta etapa
+            # nao tem o que decidir (so roda quando o lote publicou, e roda em segundo plano).
+            pje_andamento=True,
         )
 
     def _start_batch(self) -> None:
