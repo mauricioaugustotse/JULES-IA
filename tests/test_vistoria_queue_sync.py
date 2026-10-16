@@ -168,7 +168,10 @@ def test_revalidation_block_does_not_fall_back_to_direct_create(monkeypatch):
     assert not notion.created
 
 
-def test_approved_retry_uses_existing_page():
+def test_approved_retry_uses_existing_page(monkeypatch):
+    import tse_youtube_notion_core as eligibility_core
+    # This test isolates publication bookkeeping; eligibility is tested separately.
+    monkeypatch.setattr(eligibility_core, "video_debate_issues", lambda row: [])
     notion = FakeNotionClient()
     notion._request = lambda *a, **kw: {"id": "page-123"}
     notion._extract_property_text = lambda page, schema, name: "Julgamento 2" if name == "tipo_registro" else ""
@@ -180,6 +183,9 @@ def test_approved_retry_uses_existing_page():
 
 
 def test_publication_returns_readback_for_exact_written_row(monkeypatch):
+    import tse_youtube_notion_core as eligibility_core
+    # This test isolates publication bookkeeping; eligibility is tested separately.
+    monkeypatch.setattr(eligibility_core, "video_debate_issues", lambda row: [])
     import tse_workflow_monitor
     seen = []
     def verify(rows, results, client, schema):

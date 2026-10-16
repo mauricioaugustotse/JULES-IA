@@ -626,7 +626,9 @@ def test_validate_preview_row_keeps_specific_municipality_from_model():
     assert validate_preview_row(row, None).origem == "Belém/PA"
 
 
-def test_assess_publishability_allows_judged_case_without_number():
+def test_assess_publishability_allows_judged_case_without_number(monkeypatch):
+    # Isolate this pre-existing invariant; the video eligibility policy has its own regression suite.
+    monkeypatch.setattr(core, "video_debate_issues", lambda row: [])
     # Caso antigo/administrativo (consulta) efetivamente julgado, SEM numero de processo:
     # numero ausente NAO bloqueia mais; publica porque passa pelas guardas de ruido.
     row = PublishPreviewRow(
@@ -1661,7 +1663,9 @@ def test_collect_missing_multiselect_options_collects_new_labels_once():
     }
 
 
-def test_create_row_preseeds_new_partes_and_advogados_in_default_schema():
+def test_create_row_preseeds_new_partes_and_advogados_in_default_schema(monkeypatch):
+    # Isolate this pre-existing invariant; the video eligibility policy has its own regression suite.
+    monkeypatch.setattr(core, "video_debate_issues", lambda row: [])
     class RecordingClient(NotionSessoesClient):
         def __init__(self):
             # pre-semeio de options e OPT-IN (default da flag agora e False por seguranca);
@@ -1704,7 +1708,9 @@ def test_create_row_preseeds_new_partes_and_advogados_in_default_schema():
     }
 
 
-def test_create_row_preseeds_missing_select_options_for_relator_and_pedido_vista():
+def test_create_row_preseeds_missing_select_options_for_relator_and_pedido_vista(monkeypatch):
+    # Isolate this pre-existing invariant; the video eligibility policy has its own regression suite.
+    monkeypatch.setattr(core, "video_debate_issues", lambda row: [])
     class RecordingClient(NotionSessoesClient):
         def __init__(self):
             super().__init__(api_key="token", data_source_id="fake-ds")
@@ -1935,7 +1941,9 @@ def test_update_row_skips_schema_normalization_when_no_new_multiselect_option_ex
     assert client.preseeded_options is None
 
 
-def test_create_row_skips_schema_normalization_when_post_write_is_disabled():
+def test_create_row_skips_schema_normalization_when_post_write_is_disabled(monkeypatch):
+    # Isolate this pre-existing invariant; the video eligibility policy has its own regression suite.
+    monkeypatch.setattr(core, "video_debate_issues", lambda row: [])
     class RecordingClient(NotionSessoesClient):
         def __init__(self):
             super().__init__(
@@ -2726,7 +2734,9 @@ def test_grounding_rationale_is_inconclusive():
     )
 
 
-def test_publish_preview_rows_renumbers_sequence_after_skipped_item():
+def test_publish_preview_rows_renumbers_sequence_after_skipped_item(monkeypatch):
+    # Isolate this pre-existing invariant; the video eligibility policy has its own regression suite.
+    monkeypatch.setattr(core, "video_debate_issues", lambda row: [])
     schema = make_schema()
     notion = FakeNotionClient()
 
@@ -2763,7 +2773,9 @@ def test_publish_preview_rows_renumbers_sequence_after_skipped_item():
     ]
 
 
-def test_publish_preview_rows_keeps_numbers_when_nothing_is_skipped():
+def test_publish_preview_rows_keeps_numbers_when_nothing_is_skipped(monkeypatch):
+    # Isolate this pre-existing invariant; the video eligibility policy has its own regression suite.
+    monkeypatch.setattr(core, "video_debate_issues", lambda row: [])
     schema = make_schema()
     notion = FakeNotionClient()
     partial = PublishPreviewRow(
@@ -5899,10 +5911,11 @@ def _row_evento_de_pauta(**kw):
     return PublishPreviewRow(**base)
 
 
-def test_votacao_sozinha_nao_cria_linha():
+def test_votacao_sozinha_nao_cria_linha(monkeypatch):
+    # Isolate this pre-existing invariant; the video eligibility policy has its own regression suite.
+    monkeypatch.setattr(core, "video_debate_issues", lambda row: [])
     """O bloco de 11 s em que o presidente leu a pauta saiu com votacao 'Suspenso' e nada mais —
     e a votacao sozinha bastava para criar a linha."""
-    import tse_youtube_notion_core as core
     row = core.validate_preview_row(_row_evento_de_pauta(tema="Fraude à cota de gênero", votacao="Suspenso"), make_schema())
     disposicao, motivos = core.assess_row_publishability(row)
     assert disposicao == "blocked" and any("Resultado/votação insuficientes" in m for m in motivos)

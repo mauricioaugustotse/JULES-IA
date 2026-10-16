@@ -150,6 +150,9 @@ def test_chamada_sem_stop_event_segue_publicando(tmp_path, monkeypatch, gui_sem_
 
 
 def test_saved_preview_matches_compacted_notion_numbering(tmp_path, monkeypatch, gui_sem_rede):
+    import tse_youtube_notion_core as eligibility_core
+    # This test isolates publication bookkeeping; eligibility is tested separately.
+    monkeypatch.setattr(eligibility_core, "video_debate_issues", lambda row: [])
     from pathlib import Path
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent))
     from test_tse_publish_journal import make_row, FakeNotion

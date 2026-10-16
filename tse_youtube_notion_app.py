@@ -215,7 +215,9 @@ def render_preview() -> None:
         st.warning("Nenhuma extração disponível. Informe uma URL e clique em Analisar.")
         return
 
-    df = pd.DataFrame(preview_records)
+    provenance = [record.get("video_debate_evidence") for record in preview_records]
+    df = pd.DataFrame([{k: v for k, v in record.items() if k != "video_debate_evidence"}
+                       for record in preview_records])
     edited_df = st.data_editor(
         df,
         use_container_width=True,
@@ -233,7 +235,10 @@ def render_preview() -> None:
         },
         key="preview_editor_grid",
     )
-    st.session_state["preview_records"] = edited_df.to_dict("records")
+    edited_records = edited_df.to_dict("records")
+    for record, evidence in zip(edited_records, provenance):
+        record["video_debate_evidence"] = evidence
+    st.session_state["preview_records"] = edited_records
 
     total_rows = len(st.session_state["preview_records"])
     blocked_rows = sum(1 for record in st.session_state["preview_records"] if record.get("blocked"))

@@ -5,6 +5,12 @@ import pytest
 import tse_youtube_notion_core as core
 
 
+@pytest.fixture(autouse=True)
+def isolate_publication_journal_from_video_policy(monkeypatch):
+    # Synthetic journal tests isolate persistence and numbering, not extraction.
+    monkeypatch.setattr(core, "video_debate_issues", lambda row: [])
+
+
 def make_row(number=1, **overrides):
     values = {
         "tema": "Propaganda eleitoral antecipada em rede social",

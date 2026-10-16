@@ -510,7 +510,9 @@ def reconcile_session_rows(rows: list[Any], inventory: dict[str, Any], *, eviden
         if kept_warnings != (data[index].get("warnings") or []):
             change(index, "warnings", kept_warnings, "Avisos superados pela reconciliação oficial.")
 
-    output = [data[i] if isinstance(rows[i], dict) else rows[i].model_copy(update=data[i], deep=True)
+    # Revalidate serialized rows so nested video provenance remains a typed
+    # model. model_copy(update=...) would leave that evidence as a plain dict.
+    output = [data[i] if isinstance(rows[i], dict) else type(rows[i]).model_validate(data[i])
               for i in range(len(rows)) if i not in excluded]
     audit["counts"] = {"input": len(rows), "output": len(output), "matched": len(matched),
                        "corrected_fields": len(audit["corrections"]),

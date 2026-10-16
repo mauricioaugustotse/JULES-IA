@@ -19,6 +19,7 @@ import requests
 from pydantic import BaseModel, Field, ValidationError
 
 from local_secrets import get_secret, load_local_secrets
+from tse_video_debate import VideoDebateEvidence, video_debate_issues
 from tse_normalization import (
     CNJ_ELECTORAL_UF_BY_CODE,
     STATE_NAME_KEYS,
@@ -4520,6 +4521,7 @@ class PublishPreviewRow(BaseModel):
     source_start_seconds: int = -1
     source_bundle_index: int = -1
     source_item_index: int = -1
+    video_debate_evidence: VideoDebateEvidence | None = None
     force_clear_title: bool = False
     clear_properties: list[str] = Field(default_factory=list)
 
@@ -4568,6 +4570,9 @@ class PublishPreviewRow(BaseModel):
             "warnings": "\n".join(self.warnings),
             "errors": "\n".join(self.errors),
             "blocked": self.blocked,
+            # Hidden provenance survives editorial round-trips; ordinary fields
+            # and an official document cannot manufacture video eligibility.
+            "video_debate_evidence": self.video_debate_evidence.model_dump() if self.video_debate_evidence else None,
         }
 
     @classmethod
@@ -4601,6 +4606,7 @@ class PublishPreviewRow(BaseModel):
             noticias_gerais=parse_multi_value_text(record.get("noticias_gerais", "")),
             page_id=str(record.get("page_id", "") or ""),
             action=str(record.get("action", "") or "create"),
+            video_debate_evidence=record.get("video_debate_evidence"),
             warnings=split_csv_like_text(str(record.get("warnings", "") or "").replace("\n", ", ")),
             errors=split_csv_like_text(str(record.get("errors", "") or "").replace("\n", ", ")),
         )
@@ -8267,6 +8273,21 @@ class NotionSessoesClient:
         self.base_url = "https://api.notion.com/v1"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        video_row = kwargs.pop("_video_debate_row", None)
+        if method.upper() == "POST" and path.rstrip("/") == "/pages":
+            # Also closes the direct-POST route used by old certificate-only
+            # backfill scripts. This client creates session judgment pages only.
+            if not isinstance(video_row, PublishPreviewRow):
+                raise RuntimeError("Nova página bloqueada: use create_row com evidência do debate no vídeo.")
+            issues = video_debate_issues(video_row)
+            props = (kwargs.get("json") or {}).get("properties", {})
+            number = "".join(t.get("text", {}).get("content", "") for t in props.get("numero_processo", {}).get("rich_text", []))
+            if (number != video_row.numero_processo
+                    or props.get("youtube_link", {}).get("url") != video_row.youtube_link
+                    or (props.get("data_sessao", {}).get("date") or {}).get("start") != video_row.data_sessao):
+                issues.append("Payload diverge da linha com evidência do vídeo.")
+            if issues:
+                raise RuntimeError("Nova página bloqueada: " + " ".join(issues))
         response: requests.Response | None = None
         # 6 tentativas com backoff ate ~30 s (total ~60 s): as rajadas de
         # ConnectionResetError 10054 / 504 do Notion duram MINUTOS (medido em
@@ -8389,6 +8410,10 @@ class NotionSessoesClient:
         *,
         page_id: str = "",
     ) -> dict[str, Any]:
+        if not page_id:
+            issues = video_debate_issues(row)
+            if issues:
+                raise RuntimeError("Nova inclusão bloqueada: " + " ".join(issues))
         prepared_schema = self._prepare_row_schema(schema, row)
         if page_id:
             payload = {"properties": self.build_properties_payload(prepared_schema, row)}
@@ -8408,7 +8433,7 @@ class NotionSessoesClient:
         coracao = suggest_deputado_icon(row)
         if coracao:
             payload["icon"] = {"type": "emoji", "emoji": coracao}
-        return self._request("POST", "/pages", json=payload)
+        return self._request("POST", "/pages", json=payload, _video_debate_row=row)
 
     def _write_row_with_schema_recovery(
         self,
@@ -9609,7 +9634,7 @@ def assess_row_publishability(row: PublishPreviewRow) -> tuple[str, list[str]]:
         return "blocked", list(row.errors)
 
     if row.action != "update":
-        create_issues: list[str] = []
+        create_issues: list[str] = video_debate_issues(row)
         # Numero AUSENTE nao bloqueia mais: casos antigos/administrativos (consultas, PA)
         # efetivamente julgados muitas vezes nao tem numero CNJ. Eles publicam SE passarem
         # pelas guardas de ruido abaixo (resultado/votacao + relator/composicao + densidade
@@ -9930,6 +9955,20 @@ def build_preview_rows(
                 source_start_seconds=bundle.start_seconds,
                 source_bundle_index=bundle_index,
                 source_item_index=item_index,
+                video_debate_evidence=VideoDebateEvidence(
+                    video_id=extract_youtube_video_id(youtube_url) or "",
+                    session_date=authoritative_session_date or item_session_date or "",
+                    start_seconds=bundle.start_seconds,
+                    end_seconds=bundle.end_seconds,
+                    numero_processo=bundle.items[item_index - 1].numero_processo,
+                    title_hint="\n".join(filter(None, (bundle.title_hint, bundle.ignore_reason))),
+                    analysis_excerpt="\n".join(
+                        str(getattr(bundle.items[item_index - 1], field, "") or "")
+                        for field in ("tema", "punchline", "analise_do_conteudo_juridico", "raciocinio_juridico")
+                    ),
+                    source_bundle_index=bundle_index,
+                    source_item_index=item_index,
+                ),
             )
             row = validate_preview_row(row, notion_schema)
             if _looks_like_non_judgment_item(row):

@@ -78,6 +78,9 @@ def test_append_load_update_roundtrip(tmp_path):
 
 
 def test_publish_approved_items_clears_block_with_audit_warning(monkeypatch):
+    import tse_youtube_notion_core as eligibility_core
+    # This test isolates publication bookkeeping; eligibility is tested separately.
+    monkeypatch.setattr(eligibility_core, "video_debate_issues", lambda row: [])
     monkeypatch.setattr(vistoria_queue, "next_judgment_number_for_dates", lambda c, s, dates: {d: 0 for d in dates})
     schema = make_schema()
     notion = FakeNotionClient()

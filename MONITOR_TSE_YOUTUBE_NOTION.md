@@ -6,6 +6,19 @@ janela que já estava aberta antes da atualização precisa ser reaberta.
 
 ## Correções automáticas e vistoria
 
+Novas inclusões exigem evidência extraída da análise do próprio vídeo, com
+início e fim do trecho, identificação do item debatido e link para esse trecho.
+Certidões, SJUR e DJe conferem identidade e resultado; não tornam elegível um
+processo que conste apenas de lista coletiva, leitura de ata ou anúncio de pauta.
+Lista tríplice discutida individualmente continua elegível. Processos julgados
+conjuntamente precisam estar identificados no trecho analisado.
+
+A prova acompanha a prévia e a vistoria, inclusive após edição dos dados. Sem
+ela, a criação fica bloqueada antes de qualquer escrita; scripts antigos que
+enviem `POST /pages` diretamente também são bloqueados. Reparos de metadados em
+páginas existentes continuam possíveis. Uma prévia antiga sem prova precisa ser
+reconstruída dos arquivos originais de análise do vídeo antes de nova inclusão.
+
 O fluxo reconcilia as linhas com o inventário oficial **antes do enriquecimento
 e novamente antes da publicação**. CNJ curto ou com um zero excedente é corrigido
 quando existe uma única correspondência sustentada pelo número original do vídeo
