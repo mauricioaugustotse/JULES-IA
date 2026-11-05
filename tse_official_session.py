@@ -98,7 +98,16 @@ def _issue(code: str, message: str, severity: str = "error", **extra: Any) -> di
     return {"code": code, "kind": code, "source": "tse_official_session", "severity": severity, "message": message, **extra}
 
 
+def _placeholder_decision(process: dict[str, Any]) -> bool:
+    # Historical API entry0000002-64 on27Aug2020 literally says
+    # "Proclamação teste 1.". Identity may still be real (own signed PA verified),
+    # but this placeholder cannot establish a judgment or recover a scan exclusion.
+    return re.fullmatch(r"proclamacao teste(?: ?\d+)?", _norm(process.get("proclamacaoDecisao"))) is not None
+
+
 def _classification(process: dict[str, Any]) -> str:
+    if _placeholder_decision(process):
+        return "unknown"
     status = _norm(process.get("situacaoProcesso"))
     reason = _norm(process.get("motivoRetiradaPauta"))
     if status == "nao julgado" and reason == "adiado":
@@ -335,7 +344,10 @@ def compare_official_rows(inventory: dict[str, Any], rows: list[dict[str, Any]])
                        "deferred": "Julgamento oficialmente adiado; não há decisão desta sessão para publicar."}[kind]
             issues.append(_issue("official_exclusion", message, "info", numero_processo=p["numeroProcesso"], classification=kind))
         elif kind == "unknown":
-            issues.append(_issue("official_unknown_status", "Situação oficial ainda não permite confirmar julgamento nem exclusão.", "warning", numero_processo=p["numeroProcesso"], actual=p.get("situacaoProcesso"), coverage_status="unknown"))
+            if _placeholder_decision(p):
+                issues.append(_issue("official_placeholder_decision", "Inventário contém proclamação de teste; conferir ata ou peça própria antes de confirmar o julgamento.", "warning", numero_processo=p["numeroProcesso"], actual=p.get("proclamacaoDecisao"), coverage_status="unknown"))
+            else:
+                issues.append(_issue("official_unknown_status", "Situação oficial ainda não permite confirmar julgamento nem exclusão.", "warning", numero_processo=p["numeroProcesso"], actual=p.get("situacaoProcesso"), coverage_status="unknown"))
     seen: dict[str, list[int]] = defaultdict(list)
     for index, row in enumerate(rows):
         numero = str(row.get("numero_processo") or "")
