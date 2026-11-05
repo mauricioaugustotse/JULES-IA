@@ -6,12 +6,18 @@ acórdão vira uma fonte local: `textoEmenta` + `textoDecisao` da página do DJe
 mesmo material que o `..\\fill_inteiro_teor.py` extrai do CSV — sem SJUR, sem CSV de
 1,2 GB, sem captcha. Gravamos com o cortador vigente, então o formato já sai novo.
 
-QUAL ACÓRDÃO GRAVAR — a data é o juiz:
-  1. `dataDecisao` == data da sessão -> é o acórdão DAQUELE julgamento. Critério
-     inequívoco (mesmo processo, mesmo dia) e o único aceito por padrão;
+QUAL ACÓRDÃO GRAVAR — conferir data, resultado e fase:
+  Antes da seleção por data, exige CNJ completo idêntico e tribunal TSE na fonte.
+  Uma relation existente ou a coincidência do número curto não prova identidade.
+  1. `dataDecisao` == data da sessão -> exige também resultado reconhecido e
+     compatibilidade da fase de embargos. Mesmo processo e dia podem ter duas
+     sessões distintas, como as tutelas e desistências de 28/10/2022;
   2. janela [-5,+60]d -> SÓ com `--janela`, e ainda assim exige que o RESULTADO do
      dispositivo bata com a etiqueta da página e que não seja acórdão de embargos;
   3. qualquer outra distância -> nunca.
+
+  Acórdãos diferentes que continuam compatíveis exigem revisão da certidão;
+  a ordem dos resultados da consulta não autoriza escolher o primeiro.
 
 LIÇÃO QUE CUSTOU A PRIMEIRA VERSÃO (25/08): o gate original aceitava até 180d quando o
 dispositivo concordava com a etiqueta `votacao` (unanimidade x maioria). Isso NÃO separa
@@ -42,6 +48,8 @@ import fill_inteiro_teor as fit  # noqa: E402
 from import_dje_faltantes import resultado_votacao_from_dispositivo  # noqa: E402
 import NOTION_relatoriodeIA_v2 as report  # noqa: E402
 import requests  # noqa: E402
+from dje_identity import same_full_electoral_cnj  # noqa: E402
+from dje_document_selection import choose_document  # noqa: E402
 
 DS_SESSOES = "2eb72195-5c64-80ea-9cd5-000b0e01745d"
 REL_SES = "Related to DJe (sess\u00e3o de julgamento)"
@@ -99,25 +107,8 @@ def eh_embargos(dispositivo):
 
 def escolher(acordaos, data_sessao, resultado_pagina, classe_pagina=""):
     """Devolve (acordao, motivo) ou (None, motivo_da_recusa)."""
-    ds = dt(data_sessao)
-    if not ds or not acordaos:
-        return None, "sem_data_ou_sem_acordao"
-    cand = [(a, (dt(a["data"]) - ds).days) for a in acordaos if dt(a["data"])]
-    if not cand:
-        return None, "acordao_sem_data"
-    exata = [a for a, d in cand if d == 0]
-    if exata:
-        return exata[0], "data_exata"
-    if not JANELA:
-        return None, "sem_acordao_no_dia_{:+d}d".format(min((d for _, d in cand), key=abs))
-    # com --janela: o RESULTADO tem de bater; a votacao nao separa fase nenhuma
-    for a, d in sorted([(a, d) for a, d in cand if -5 <= d <= 60], key=lambda x: abs(x[1])):
-        res, _ = resultado_votacao_from_dispositivo(a.get("decisao") or "")
-        pagina_e_ed = classe_pagina.upper().startswith("ED")
-        if res and resultado_pagina and res == resultado_pagina and \
-                (pagina_e_ed or not eh_embargos(a.get("decisao"))):
-            return a, "janela_{:+d}d_resultado_confere".format(d)
-    return None, "janela_sem_confirmacao"
+    return choose_document(acordaos, data_sessao, resultado_pagina, classe_pagina,
+                           resultado_votacao_from_dispositivo, allow_window=JANELA)
 
 
 def main():
@@ -182,10 +173,19 @@ def main():
             except Exception:
                 continue
             pp = pg["properties"]
+            # A relation is not proof of identity: old links matched only the
+            # nine-digit core and imported another year's/court's proceedings.
+            if not same_full_electoral_cnj(a["numero"], txt(pp.get("numeroUnico"))):
+                stats["recusado_identidade_processo"] += 1
+                continue
+            if txt(pp.get("siglaTribunalJE")) != "TSE":
+                stats["recusado_tribunal_documento"] += 1
+                continue
             tipo = txt(pp.get("descricaoTipoDecisao"))
             if not (tipo or "").lower().startswith("ac"):
                 continue
             acordaos.append({"id": pid, "data": txt(pp.get("dataDecisao"))[:10],
+                             "classe": txt(pp.get("siglaClasse")),
                              "ementa": txt(pp.get("textoEmenta")),
                              "decisao": txt(pp.get("textoDecisao"))})
         if not acordaos:
