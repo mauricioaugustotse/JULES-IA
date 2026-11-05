@@ -47,12 +47,12 @@ def test_same_core_different_year_court_and_origin_does_not_link():
     assert "unknown" not in target
 
 
-def test_reconciliation_removes_only_confirmed_collisions_and_preserves_manual_links():
+def test_reconciliation_does_not_remove_links_based_only_on_number_metadata():
     indexed = index_relation_records(records())
     current = ["riachinho", "manual", "unknown", "outside-loaded-scope"]
     proposed = build_full_cnj_relation_targets(indexed.values())
     assert reconcile_process_relations(indexed["iran-1"], current, proposed["iran-1"], indexed) == [
-        "manual", "unknown", "outside-loaded-scope", "iran-2"
+        "riachinho", "manual", "unknown", "outside-loaded-scope", "iran-2"
     ]
     assert reconcile_process_relations(indexed["unknown"], current, ["iran-1"], indexed) == current
 
@@ -63,6 +63,14 @@ def test_missing_session_context_does_not_create_or_remove_a_relation():
     indexed = index_relation_records([left, right])
     assert build_full_cnj_relation_targets(indexed.values()) == {"left": [], "right": []}
     assert reconcile_process_relations(left, ["right"], [], indexed) == ["right"]
+
+
+def test_same_date_and_video_do_not_authorize_removing_distinct_phase_links():
+    left = ProcessRelationRecord("merits", IRAN, "same-video", "2018-12-11")
+    right = ProcessRelationRecord("embargos", IRAN, "same-video", "2018-12-11")
+    indexed = index_relation_records([left, right])
+    assert build_full_cnj_relation_targets(indexed.values()) == {"merits": [], "embargos": []}
+    assert reconcile_process_relations(left, ["embargos"], [], indexed) == ["embargos"]
 
 
 def test_conflicting_copies_of_a_page_do_not_authorize_changes():
@@ -98,9 +106,9 @@ def test_round2_preserves_each_column_and_does_not_cross_link_the_core_collision
     }})
     targets = build_relation_targets([item.record for item in changed.values()])
     add_relation_changes(changed, schema, targets)
-    assert changed["iran-1"].changes["materia_semelhante"].new == ["manual", "unknown", "external", "iran-2"]
+    assert changed["iran-1"].changes["materia_semelhante"].new == ["riachinho", "manual", "unknown", "external", "iran-2"]
     assert changed["iran-1"].changes["materia_semelhante1"].new == ["other-manual", "iran-2"]
-    assert changed["riachinho"].changes["materia_semelhante"].new == ["unknown"]
+    assert not changed["riachinho"].changes
     assert not changed["unknown"].changes
 
 
@@ -118,9 +126,9 @@ def test_super_auditor_preserves_unknown_and_out_of_scope_relations():
                                  row=SimpleNamespace(numero_processo=item.numero_processo, data_sessao=item.data_sessao, materia_semelhante=current))
         grouped.setdefault(int(item.data_sessao[:4]), {}).setdefault(item.video_id, []).append(record)
     targets = build_global_relation_targets(grouped)
-    assert targets["iran-1"] == ["manual", "unknown", "external", "iran-2"]
+    assert targets["iran-1"] == ["riachinho", "manual", "unknown", "external", "iran-2"]
     assert targets["iran-2"] == ["iran-1"]
-    assert targets["riachinho"] == ["unknown"]
+    assert targets["riachinho"] == ["iran-1", "unknown"]
     assert targets["unknown"] == ["external"]
 
 
@@ -168,13 +176,12 @@ def test_cli_payloads_separate_full_identities_without_clearing_unconfirmed_link
     monkeypatch.setattr("sys.argv", [module_name, "--apply"])
     assert module.main() == 0
     assert writes == {
-        "iran-1": ["manual", "unknown", "external", "iran-2"],
+        "iran-1": ["riachinho", "manual", "unknown", "external", "iran-2"],
         "iran-2": ["iran-1"],
-        "riachinho": [],
     }
     if module_name == "materia_semelhante_update":
         report = json.loads(next(tmp_path.glob("*/changes.json")).read_text(encoding="utf-8"))
         first = next(item for item in report if item["page_id"] == "iran-1")
         assert first["before"] == ["riachinho", "manual", "unknown", "external"]
         assert first["after"] == writes["iran-1"]
-        assert first["removed"] == ["riachinho"]
+        assert first["removed"] == []

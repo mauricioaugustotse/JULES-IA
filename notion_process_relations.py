@@ -39,13 +39,6 @@ def distinct_session(left: ProcessRelationRecord, right: ProcessRelationRecord) 
     )
 
 
-def _same_session(left: ProcessRelationRecord, right: ProcessRelationRecord) -> bool:
-    return bool(
-        left.video_id and right.video_id and left.video_id == right.video_id
-        and left.data_sessao and right.data_sessao and left.data_sessao == right.data_sessao
-    )
-
-
 def index_relation_records(records: Iterable[ProcessRelationRecord]) -> dict[str, ProcessRelationRecord]:
     indexed: dict[str, ProcessRelationRecord] = {}
     for record in records:
@@ -80,29 +73,18 @@ def reconcile_process_relations(
     proposed: list[str],
     indexed: dict[str, ProcessRelationRecord],
 ) -> list[str]:
-    """Preserve manual/out-of-scope links and remove confirmed legacy collisions.
+    """Preserve existing links and add only complete-CNJ session matches.
 
-    The previous automatic grouping discarded everything after sequence + DV.
-    Only links with that same short prefix and different valid full identities
-    can be removed as collisions. Other process links may be intentional manual
-    references. Unknown targets/identities are never grounds for removal.
+    Valid checksums do not prove that the number was assigned to the right page.
+    Equal date/video metadata can also describe distinct procedural phases.
+    Removing existing links therefore requires a separate source-reviewed plan.
     """
     key = full_cnj_relation_key(record.numero_processo)
     if not key:
         return list(current)
-    retained = []
-    for target_id in current:
-        target = indexed.get(target_id)
-        target_key = full_cnj_relation_key(target.numero_processo) if target else ""
-        if target_key:
-            if target_key[:9] == key[:9] and target_key != key:
-                continue
-            if target_key == key and (target_id == record.page_id or _same_session(record, target)):
-                continue
-        retained.append(target_id)
     additions = []
     for target_id in proposed:
         target = indexed.get(target_id)
         if target and target_id != record.page_id and full_cnj_relation_key(target.numero_processo) == key and distinct_session(record, target):
             additions.append(target_id)
-    return dedupe_preserve_order(retained + additions)
+    return dedupe_preserve_order(current + additions)

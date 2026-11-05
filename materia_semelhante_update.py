@@ -1,7 +1,7 @@
 """#5: re-computa a relation 'materia_semelhante' (liga registros do MESMO processo = mesmo
 CNJ-20 canonico, em video/data diferentes). Como o SADP completou muitos CNJ-20, mais registros
-agora podem ser ligados. Usa CNJ completo com DV valido e preserva vinculos manuais fora
-do escopo e identidades incertas. Corrige colisoes confirmadas do antigo numero curto.
+agora podem ser ligados. Usa CNJ completo com DV valido e preserva vinculos existentes.
+Remocoes dependem de revisao individual com fontes, inclusive quando o DV e valido.
 
 Uso:
   python materia_semelhante_update.py            # dry-run

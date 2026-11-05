@@ -2,7 +2,7 @@
 processo (mesmo CNJ canonico) em sessoes/datas distintas (ex.: Julgamento 1 suspenso por vista +
 Julgamento 2 conclusivo). Mesma logica de `audit_notion_sessoes_round2.build_relation_targets`:
 agrupa por CNJ completo com DV valido e exclui pares da mesma sessao. Preserva vinculos
-manuais fora do escopo e identidades incertas; corrige colisoes do antigo numero curto.
+existentes; remocoes dependem de revisao individual com fontes.
 dry-run por padrao.
 
 Uso:
