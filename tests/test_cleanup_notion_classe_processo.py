@@ -6,6 +6,32 @@ from cleanup_notion_classe_processo import (
 from tse_youtube_notion_core import PublishPreviewRow
 
 
+def test_classe_cleanup_distingue_agravo_no_rms_do_ms_originario() -> None:
+    row = PublishPreviewRow(
+        numero_processo="0001448-61.2014.6.27.0000",
+        analise_do_conteudo_juridico=(
+            "O julgamento e de agravo regimental no recurso em mandado de seguranca "
+            "do Google contra cobranca de astreintes. A origem era mandado de seguranca no TRE."
+        ),
+    )
+    proposal = infer_classe_processo_for_cleanup(row)
+    assert proposal is not None and proposal.value == "AgRg-RMS"
+    assert should_apply_proposal("RMS", proposal)[:2] == (True, "AgRg-RMS")
+
+
+def test_classe_cleanup_reconhece_sigla_rms_no_agravo() -> None:
+    row = PublishPreviewRow(analise_do_conteudo_juridico="O TSE desproveu o agravo regimental no RMS 1448-61.")
+    proposal = infer_classe_processo_for_cleanup(row)
+    assert proposal is not None and proposal.value == "AgRg-RMS"
+    assert should_apply_proposal("AgRg-RMS", proposal)[:2] == (False, "AgRg-RMS")
+
+
+def test_classe_cleanup_preserva_agravo_em_ms_originario() -> None:
+    row = PublishPreviewRow(analise_do_conteudo_juridico="Agravo regimental em mandado de seguranca originario, julgado pelo TSE.")
+    proposal = infer_classe_processo_for_cleanup(row)
+    assert proposal is not None and proposal.value == "AgRg-MS"
+
+
 def test_classe_cleanup_infere_rpp_sem_transformar_mencao_a_adi_em_classe() -> None:
     row = PublishPreviewRow(
         numero_processo="0000843-68",

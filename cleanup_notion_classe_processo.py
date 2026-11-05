@@ -29,6 +29,7 @@ APPELLATE_OR_INCIDENT_CLASSES = {
     "AgRg-REspe",
     "AgRg-RO",
     "AgRg-MS",
+    "AgRg-RMS",
     "AgRg-PC",
     "AgRg-AR",
     "AgRg-HC",
@@ -179,6 +180,8 @@ def infer_classe_processo_for_cleanup(row: PublishPreviewRow) -> ClasseProposal 
         return _proposal("AgRg-REspe", "agravo regimental em recurso especial eleitoral", raw)
     if _has(text, r"\b(agravo regimental|agravo interno|agrg)\b.*\b(recurso ordinario(?: eleitoral)?|ro)\b"):
         return _proposal("AgRg-RO", "agravo regimental em recurso ordinario", raw)
+    if _has(text, r"\b(agravo regimental|agravo interno|agrg)\b.*\b(recurso em mandado de seguranca|rms)\b"):
+        return _proposal("AgRg-RMS", "agravo regimental em recurso em mandado de seguranca", raw)
     if _has(text, r"\b(agravo regimental|agravo interno|agrg)\b.*\bmandado de seguranca\b"):
         return _proposal("AgRg-MS", "agravo regimental em mandado de seguranca", raw)
     if _has(text, r"\b(agravo regimental|agravo interno|agrg)\b.{0,140}\b(?:em|na|nos autos da)?\s*prestacao de contas\b|\bprestacao de contas\b.{0,140}\b(agravo regimental|agravo interno|agrg)\b"):
@@ -306,6 +309,8 @@ def should_apply_proposal(current: str, proposal: ClasseProposal | None) -> tupl
     if current == "PC" and candidate in {"AgRg-PC", "ED-PC"}:
         return True, candidate, f"{proposal.reason}; torna incidente processual explicito", proposal.confidence, proposal.evidence
     if current == "MS" and candidate == "AgRg-MS":
+        return True, candidate, f"{proposal.reason}; torna incidente processual explicito", proposal.confidence, proposal.evidence
+    if current == "RMS" and candidate == "AgRg-RMS":
         return True, candidate, f"{proposal.reason}; torna incidente processual explicito", proposal.confidence, proposal.evidence
     if current == "Lista Tríplice" and candidate == "ED-Lista Tríplice":
         return True, candidate, f"{proposal.reason}; torna incidente processual explicito", proposal.confidence, proposal.evidence
