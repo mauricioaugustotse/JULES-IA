@@ -31,3 +31,14 @@ artifacts/
 # Checkpoints de execucao do kit de manutencao (mesma natureza de artifacts/):
 # listas de page_id ja processados, reescritas a cada rodada.
 manutencao_sessoes/.estado/
+
+# Capturas de saida de comandos na raiz (04/11/2026): logs das rodadas, stdout/stderr e codigos
+# de saida. Sao regeneraveis, nao servem ao outro PC e inflavam a lista de diferencas do espelho.
+/*.log
+/*.err
+/*.out
+/*.exit
+/*.stdout
+/*.stderr
+# "> NUL" no Git Bash cria um arquivo de verdade com esse nome
+/NUL
